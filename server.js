@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import cookieParser from 'cookie-parser';
 import express from 'express';
 import jwt from 'jsonwebtoken';
@@ -667,8 +669,14 @@ const RefundSchema = new mongoose.Schema({
 }, { timestamps: true });
 const Refund = mongoose.model('Refund', RefundSchema);
 
+const frontendBuildPath = fileURLToPath(new URL('.', import.meta.url));
 app.use(express.json({ limit: '32kb' }));
 app.use(cookieParser());
+app.get(/^\/[\w-]+-[\w-]{8}\.(?:js|css)$/, (req, res, next) => {
+  return res.sendFile(path.join(frontendBuildPath, path.basename(req.path)), (error) => {
+    if (error) next();
+  });
+});
 
 const requireSession = (req, res, next) => {
   (async () => {
@@ -6777,6 +6785,11 @@ app.post('/api/custom-orders/:id/ordered', requireSession, requireDatabase, asyn
   ).lean();
   if (!customOrder) return res.status(409).json({ message: 'This accepted custom order is no longer available.' });
   return res.json({ customOrder });
+});
+
+app.use((req, res, next) => {
+  if (req.method !== 'GET' || req.path === '/api' || req.path.startsWith('/api/')) return next();
+  return res.sendFile(path.join(frontendBuildPath, 'app.html'));
 });
 
 app.listen(port, () => console.log(`Auth server listening on http://localhost:${port}`));

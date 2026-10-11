@@ -9,7 +9,7 @@ const SOCIAL_LINKS = {
   facebook: '',
   instagram: '',
   youtube: 'https://www.youtube.com/@ArduinoProjectMakers',
-  linkedin: '',
+  linkedin: 'https://www.linkedin.com/in/ankit-bhattacharya-1a40a8442/',
   twitter: '',
 };
 
