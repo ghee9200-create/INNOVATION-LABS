@@ -10,7 +10,7 @@ const SOCIAL_LINKS = {
   instagram: '',
   youtube: 'https://www.youtube.com/@ArduinoProjectMakers',
   linkedin: 'https://www.linkedin.com/in/ankit-bhattacharya-1a40a8442/',
-  twitter: '',
+  twitter: 'https://x.com/AnkitBhattq2sk',
 };
 
 const FOOTER_POLICY_LINKS = {
