@@ -123,6 +123,7 @@ const Order = mongoose.model('Order', new mongoose.Schema({
   promoCodeId: { type: mongoose.Schema.Types.ObjectId, ref: 'PromoCode' },
   promoCode: String,
   promoCodeAmountPaise: { type: Number, min: 0 },
+  rewardPointsEarned: { type: Number, min: 0, default: 0 },
   promoCodeStatus: { type: String, enum: ['PURCHASED', 'PARTIALLY_REDEEMED', 'REDEEMED', 'EXPIRED', 'FULLY_REDEEMED'] },
   promoActivationStatus: { type: String, enum: ['pending', 'active', 'expired', 'fully_redeemed', 'rejected'] },
   promoActivatedAt: Date,
@@ -494,6 +495,7 @@ const CreditPurchase = mongoose.model('CreditPurchase', new mongoose.Schema({
   totalAmountPaise: { type: Number, required: true, min: 1 },
   currency: { type: String, default: 'INR' },
   paymentMethod: { type: String, enum: ['Wallet', 'Razorpay'], required: true },
+  authorizedPlan: { type: String, enum: ['Exclusive'] },
   status: { type: String, enum: ['pending', 'processing', 'completed', 'failed', 'cancelled'], default: 'pending', index: true },
   walletTransactionId: String,
   razorpayOrderId: String,
@@ -515,6 +517,7 @@ const AITrial = mongoose.model('AITrial', new mongoose.Schema({
   status: { type: String, enum: ['active', 'expired'], required: true, default: 'active', index: true },
   activatedAt: { type: Date, required: true },
   expiresAt: { type: Date, required: true, index: true },
+  expirationWarningShownAt: Date,
   buildLimit: { type: Number, required: true, min: 1, default: 2 },
   successfulBuilds: { type: Number, required: true, min: 0, default: 0 },
 }, { timestamps: true }));
@@ -970,7 +973,12 @@ const awardRewardPointsForOrder = async (session, order) => {
   const points = pointsForEligibleAmount(eligibleAmountPaise, rules);
   if (!Number.isSafeInteger(points) || points <= 0 || !order.orderId || !order.userId) return null;
   const transactionId = `earn:${order.orderId}`;
-  if (await RewardTransaction.exists({ transactionId }).session(session)) return null;
+  const existingTransaction = await RewardTransaction.findOne({ transactionId }).session(session).lean();
+  if (existingTransaction) {
+    order.rewardPointsEarned = existingTransaction.points;
+    await Order.updateOne({ orderId: order.orderId, userId: order.userId }, { $set: { rewardPointsEarned: existingTransaction.points } }, { session });
+    return existingTransaction.points;
+  }
   await RewardAccount.findOneAndUpdate(
     { userId: order.userId },
     { $setOnInsert: { userId: order.userId }, $inc: { availablePoints: points, lifetimePointsEarned: points } },
@@ -989,6 +997,8 @@ const awardRewardPointsForOrder = async (session, order) => {
     walletAmountPaise: 0,
     status: 'earned',
   }], { session });
+  order.rewardPointsEarned = points;
+  await Order.updateOne({ orderId: order.orderId, userId: order.userId }, { $set: { rewardPointsEarned: points } }, { session });
   return points;
 };
 
@@ -1895,6 +1905,7 @@ const createOfflinePromoCodeOrder = async (session, {
 }) => {
   const now = new Date();
   const recipientType = requestedRecipientType || promo.recipientType || 'myself';
+  if (recipientType === 'gift') promo.maxUses = 1;
   const orderId = `IL-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
   promo.status = 'pending_approval';
   promo.purchaseType = 'offline';
@@ -2175,10 +2186,18 @@ const resolvePromoRecipient = async (session, { promo, userId, userEmail, recipi
     return { recipientUserId: promo.giftRecipientId, recipientEmail: promo.giftRecipientEmail };
   }
   const normalizedEmail = String(recipientEmail || '').trim().toLowerCase();
-  if (!normalizedEmail) return { recipientUserId: null, recipientEmail: '' };
+  if (!normalizedEmail) {
+    throw Object.assign(new Error('Enter the registered email address of the gift recipient.'), { status: 400 });
+  }
+  if (normalizedEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    throw Object.assign(new Error('Enter a valid recipient email address.'), { status: 400 });
+  }
   const recipient = await User.findOne({ email: normalizedEmail }).select('googleId email').session(session).lean();
   if (!recipient) {
-    throw Object.assign(new Error('The optional recipient email must belong to a registered Innovation Labs account.'), { status: 404 });
+    throw Object.assign(new Error('The recipient email must belong to a registered Innovation Labs account.'), { status: 404 });
+  }
+  if (recipient.googleId === userId) {
+    throw Object.assign(new Error('Choose a different registered Innovation Labs account for an offline gift.'), { status: 400 });
   }
   return { recipientUserId: recipient.googleId, recipientEmail: recipient.email };
 };
@@ -2304,14 +2323,37 @@ const currentSubscription = async (userId, session) => {
   return Subscription.findOne({ userId, status: 'active', expiryDate: { $gt: now } }).sort({ expiryDate: -1 }).session(session || null).lean();
 };
 
+const requireActiveExclusiveCreditAccess = async (req, res, next) => {
+  const subscription = await currentSubscription(req.session.sub);
+  if (subscription?.plan !== 'Exclusive') {
+    return res.status(403).json({ message: 'Add Credits is available to active Exclusive subscribers only.' });
+  }
+  return next();
+};
+
+const requireExclusiveCreditAccess = async (req, res, next) => {
+  const subscription = await currentSubscription(req.session.sub);
+  if (subscription?.plan === 'Exclusive') return next();
+  const purchaseId = req.params.purchaseId || req.body?.purchaseId;
+  const pendingPurchase = purchaseId && await CreditPurchase.exists({
+    purchaseId,
+    userId: req.session.sub,
+    authorizedPlan: 'Exclusive',
+    status: { $in: ['pending', 'processing', 'completed'] },
+  });
+  if (pendingPurchase) return next();
+  return res.status(403).json({ message: 'Add Credits is available to active Exclusive subscribers only.' });
+};
+
 const aiTrialView = (trial, now = new Date()) => ({
   used: Boolean(trial),
   active: Boolean(trial && trial.status === 'active' && trial.expiresAt > now),
   plan: trial?.plan || null,
   activatedAt: trial?.activatedAt || null,
   expiresAt: trial?.expiresAt || null,
+  expirationWarningShownAt: trial?.expirationWarningShownAt || null,
   remainingBuilds: trial ? Math.max(0, trial.buildLimit - trial.successfulBuilds) : null,
-  buildLimit: trial?.buildLimit || 2,
+  buildLimit: trial?.buildLimit ?? 2,
 });
 
 const getAiAccess = async (userId) => {
@@ -2334,13 +2376,15 @@ const getAiAccess = async (userId) => {
       ? `starter:${userId}`
       : `subscription:${subscription?._id || plan}`;
   const quota = await AIProjectQuota.findOne({ userId, quotaKey }).lean();
-  const buildsUsed = trialMode ? activeTrial.successfulBuilds : (quota?.successfulBuilds || 0);
+  const buildsUsed = (quota?.successfulBuilds || 0) + (quota?.pendingBuilds || 0);
+  const trialView = aiTrialView(trial, now);
+  if (activeTrial) trialView.remainingBuilds = Math.max(0, activeTrial.buildLimit - buildsUsed);
   return {
     plan,
     accessType: trialMode ? 'trial' : subscription ? 'paid' : 'starter',
     subscription,
     trialRecord: activeTrial,
-    trial: aiTrialView(trial, now),
+    trial: trialView,
     trialMode,
     quotaKey,
     buildLimit,
@@ -2887,6 +2931,9 @@ const publicReviewView = (review) => ({
 app.get('/api/products/:productId', requireDatabase, async (req, res) => {
   const product = await getProductById(req.params.productId);
   if (!product) return res.status(404).json({ message: 'Product was not found.' });
+  const rewardRules = await rewardRulesFor(null);
+  const rewardEligible = !/plan|membership|subscription|service|delivery|ai credit/i.test(`${product.category || ''} ${product.name || ''}`);
+  const rewardPoints = rewardEligible ? pointsForEligibleAmount(toPaise(product.price), rewardRules) : 0;
   const reviews = await ProductReview.find({ productId: product.id, moderationStatus: 'approved' })
     .sort({ createdAt: -1 })
     .select('-images.data')
@@ -2898,7 +2945,7 @@ app.get('/api/products/:productId', requireDatabase, async (req, res) => {
   const averageRating = reviews.length
     ? Math.round(reviews.reduce((sum, review) => sum + review.rating, 0) / reviews.length * 10) / 10
     : 0;
-  return res.json({ product, reviews: reviews.map(publicReviewView), reviewSummary: { averageRating, totalReviews: reviews.length, distribution } });
+  return res.json({ product, rewardPoints, reviews: reviews.map(publicReviewView), reviewSummary: { averageRating, totalReviews: reviews.length, distribution } });
 });
 
 app.get('/api/products/:productId/review-eligibility', requireSession, requireDatabase, async (req, res) => {
@@ -3360,12 +3407,34 @@ app.post('/api/promotion/claim', requireSession, requireDatabase, async (req, re
 });
 
 app.get('/api/subscription', requireSession, requireDatabase, async (req, res) => {
-  const active = await currentSubscription(req.session.sub);
-  const history = await Subscription.find({ userId: req.session.sub }).sort({ createdAt: -1 }).limit(20).lean();
-  const transactions = await SubscriptionTransaction.find({ userId: req.session.sub }).sort({ createdAt: -1 }).limit(20).lean();
-  const credits = await AICredits.findOne({ userId: req.session.sub }).lean();
+  const [access, history, transactions, credits] = await Promise.all([
+    getAiAccess(req.session.sub),
+    Subscription.find({ userId: req.session.sub }).sort({ createdAt: -1 }).limit(20).lean(),
+    SubscriptionTransaction.find({ userId: req.session.sub }).sort({ createdAt: -1 }).limit(20).lean(),
+    AICredits.findOne({ userId: req.session.sub }).lean(),
+  ]);
+  const current = access.subscription
+    ? planPaymentResponse(access.subscription).subscription
+    : access.trial.active
+      ? {
+        id: `trial:${access.trialRecord._id}`,
+        plan: access.trial.plan,
+        price: 0,
+        startDate: access.trial.activatedAt,
+        expiryDate: access.trial.expiresAt,
+        autoRenew: false,
+        status: 'active',
+        paymentMethod: 'Trial',
+        cashbackGranted: false,
+        isTrial: true,
+        buildLimit: access.trial.buildLimit,
+        successfulBuilds: access.trial.successfulBuilds,
+        remainingBuilds: access.remainingBuilds,
+      }
+      : { plan: 'Starter', status: 'active', autoRenew: false, isTrial: false };
   return res.json({
-    current: active ? planPaymentResponse(active).subscription : { plan: 'Starter', status: 'active', autoRenew: false },
+    current,
+    trial: { ...access.trial, eligible: access.trialEligible },
     history,
     transactions: transactions.map((item) => ({ ...item, amount: money(item.amountPaise), cashback: money(item.cashbackPaise) })),
     credits: credits ? { balance: credits.balance, includedCredits: credits.includedCredits, purchasedCredits: credits.purchasedCredits, usedCredits: credits.usedCredits } : { balance: 0, includedCredits: 0, purchasedCredits: 0, usedCredits: 0 },
@@ -3487,7 +3556,7 @@ app.post('/api/subscription/razorpay/verify', requireSession, requireDatabase, a
   }
 });
 
-app.post('/api/credits/purchase', requireSession, requireDatabase, async (req, res) => {
+app.post('/api/credits/purchase', requireSession, requireDatabase, requireActiveExclusiveCreditAccess, async (req, res) => {
   const paymentMethod = req.body?.paymentMethod === 'Razorpay' ? 'Razorpay' : 'Wallet';
   let credits;
   try {
@@ -3508,12 +3577,13 @@ app.post('/api/credits/purchase', requireSession, requireDatabase, async (req, r
     pricePerCreditPaise: aiCreditPricePaise,
     totalAmountPaise: credits * aiCreditPricePaise,
     paymentMethod,
+    authorizedPlan: 'Exclusive',
     status: 'pending',
   });
   return res.status(201).json({ purchase: creditPurchaseView(purchase) });
 });
 
-app.get('/api/credits/purchase/:purchaseId', requireSession, requireDatabase, async (req, res) => {
+app.get('/api/credits/purchase/:purchaseId', requireSession, requireDatabase, requireExclusiveCreditAccess, async (req, res) => {
   const purchase = await CreditPurchase.findOne({ purchaseId: req.params.purchaseId, userId: req.session.sub }).lean();
   if (!purchase) return res.status(404).json({ message: 'Credit purchase was not found.' });
   const wallet = await Wallet.findOne({ userId: req.session.sub }).select('balancePaise').lean();
@@ -3525,7 +3595,7 @@ app.get('/api/credits/purchase/:purchaseId', requireSession, requireDatabase, as
   });
 });
 
-app.post('/api/credits/wallet/confirm', requireSession, requireDatabase, async (req, res) => {
+app.post('/api/credits/wallet/confirm', requireSession, requireDatabase, requireExclusiveCreditAccess, async (req, res) => {
   const { purchaseId, pin } = req.body || {};
   if (typeof purchaseId !== 'string' || !validatePin(pin)) return res.status(400).json({ message: 'Credit purchase and 4-digit Wallet PIN are required.' });
   try {
@@ -3580,7 +3650,7 @@ app.post('/api/credits/wallet/confirm', requireSession, requireDatabase, async (
   }
 });
 
-app.post('/api/credits/razorpay/create', requireSession, requireDatabase, async (req, res) => {
+app.post('/api/credits/razorpay/create', requireSession, requireDatabase, requireExclusiveCreditAccess, async (req, res) => {
   const purchase = await CreditPurchase.findOne({ purchaseId: req.body?.purchaseId, userId: req.session.sub });
   if (!purchase) return res.status(404).json({ message: 'Credit purchase was not found.' });
   if (purchase.status === 'completed') return res.json({ purchase: creditPurchaseView(purchase) });
@@ -3604,7 +3674,7 @@ app.post('/api/credits/razorpay/create', requireSession, requireDatabase, async 
   }
 });
 
-app.post('/api/credits/razorpay/verify', requireSession, requireDatabase, async (req, res) => {
+app.post('/api/credits/razorpay/verify', requireSession, requireDatabase, requireExclusiveCreditAccess, async (req, res) => {
   const orderId = req.body?.razorpay_order_id;
   const paymentId = req.body?.razorpay_payment_id;
   const signature = req.body?.razorpay_signature;
@@ -3694,7 +3764,7 @@ app.get('/api/ai/trial/status', requireSession, requireDatabase, async (req, res
   return res.json({ trial: { ...access.trial, eligible: access.trialEligible }, subscription: access.subscription ? {
     plan: access.subscription.plan,
     expiryDate: access.subscription.expiryDate,
-  } : null });
+  } : null, effectivePlan: access.plan, accessType: access.accessType });
 });
 
 app.post('/api/ai/trial/activate', requireSession, requireDatabase, async (req, res) => {
@@ -3719,13 +3789,38 @@ app.post('/api/ai/trial/activate', requireSession, requireDatabase, async (req, 
     }]);
     return res.status(201).json({
       trial: { ...aiTrialView(trial.toObject(), activatedAt), eligible: false },
-      entitlements: aiAccessResponse(await getAiAccess(req.session.sub)).entitlements,
+      ...aiAccessResponse(await getAiAccess(req.session.sub)),
       message: 'Your four-day trial is active. Trial activation does not start paid billing or grant cashback.',
     });
   } catch (error) {
     if (error.code === 11000) return res.status(409).json({ code: 'TRIAL_ALREADY_USED', message: 'Your free trial has already been used.' });
     throw error;
   }
+});
+
+app.post('/api/ai/trial/expiration-warning/claim', requireSession, requireDatabase, async (req, res) => {
+  const now = new Date();
+  await AITrial.updateMany(
+    { userId: req.session.sub, status: 'active', expiresAt: { $lte: now } },
+    { $set: { status: 'expired' } },
+  );
+  const warningTrial = await AITrial.findOneAndUpdate(
+    {
+      userId: req.session.sub,
+      status: 'active',
+      expiresAt: { $gt: now, $lte: new Date(now.getTime() + 24 * 60 * 60 * 1000) },
+      expirationWarningShownAt: { $exists: false },
+    },
+    { $set: { expirationWarningShownAt: now } },
+    { new: true },
+  ).select('plan expiresAt expirationWarningShownAt').lean();
+  return res.json({
+    warning: warningTrial ? {
+      plan: warningTrial.plan,
+      expiresAt: warningTrial.expiresAt,
+      shownAt: warningTrial.expirationWarningShownAt,
+    } : null,
+  });
 });
 
 app.post('/api/ai/project-builder', requireSession, requireDatabase, async (req, res) => {
@@ -3904,7 +3999,7 @@ app.post('/api/ai/project-builder', requireSession, requireDatabase, async (req,
       ].join('\n'),
     };
     const latestAccess = await getAiAccess(userId);
-    if (latestAccess.quotaKey !== access.quotaKey || latestAccess.plan !== access.plan || latestAccess.remainingBuilds === 0) {
+    if (latestAccess.quotaKey !== access.quotaKey || latestAccess.plan !== access.plan) {
       throw Object.assign(new Error('Your project-building entitlement changed while the project was being prepared. Please refresh and try again.'), { status: 403, code: 'AI_ENTITLEMENT_CHANGED' });
     }
     await withMongoTransaction(async (session) => {
@@ -4193,26 +4288,30 @@ app.get('/api/wallet/transfers/account', requireSession, requireDatabase, requir
 });
 
 app.post('/api/wallet/transfers/wallet-id', requireSession, requireDatabase, requireWalletUnlock, async (req, res) => {
-  const rawWalletId = normalizeWalletId(req.body?.walletId);
-  const idBody = rawWalletId.startsWith('@WL') ? rawWalletId.slice(3) : rawWalletId;
-  if (!/^[A-Z]{4}\d{4}$/.test(idBody)) {
-    return res.status(400).json({ message: 'Wallet ID must contain exactly 4 letters followed by 4 numbers.' });
+  const owner = await Wallet.findOne({ userId: req.session.sub }).select('_id walletId').lean();
+  if (!owner) return res.status(409).json({ message: 'Create and unlock your wallet before creating a Wallet ID.' });
+  if (owner.walletId) return res.json({ walletId: owner.walletId, existing: true });
+
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const letters = Array.from(crypto.randomBytes(4), (value) => alphabet[value % alphabet.length]).join('');
+    const digits = String(crypto.randomInt(0, 10000)).padStart(4, '0');
+    const walletId = `@WL${letters}${digits}`;
+    try {
+      const wallet = await Wallet.findOneAndUpdate(
+        { _id: owner._id, walletId: null },
+        { $set: { walletId } },
+        { new: true, runValidators: true },
+      ).select('walletId').lean();
+      if (wallet) return res.status(201).json({ walletId: wallet.walletId, existing: false });
+      const existing = await Wallet.findOne({ userId: req.session.sub }).select('walletId').lean();
+      if (existing?.walletId) return res.json({ walletId: existing.walletId, existing: true });
+      return res.status(409).json({ message: 'Your wallet is not available. Please try again.' });
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+    }
   }
-  const walletId = `@WL${idBody}`;
-  try {
-    const wallet = await Wallet.findOneAndUpdate(
-      { userId: req.session.sub, walletId: null },
-      { $set: { walletId } },
-      { new: true, runValidators: true },
-    ).select('walletId').lean();
-    if (wallet) return res.status(201).json({ walletId: wallet.walletId });
-    const existing = await Wallet.findOne({ userId: req.session.sub }).select('walletId').lean();
-    if (existing?.walletId) return res.status(409).json({ message: 'Your Wallet ID has already been created.', walletId: existing.walletId });
-    return res.status(409).json({ message: 'Your wallet is not available. Please try again.' });
-  } catch (error) {
-    if (error.code === 11000) return res.status(409).json({ message: 'That Wallet ID is already registered. Choose another one.' });
-    throw error;
-  }
+  return res.status(503).json({ message: 'A unique Wallet ID could not be generated. Please try again.' });
 });
 
 app.post('/api/wallet/transfers/recipient', requireSession, requireDatabase, requireWalletUnlock, async (req, res) => {

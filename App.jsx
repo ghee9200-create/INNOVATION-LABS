@@ -204,6 +204,9 @@ function App() {
   const [cartError, setCartError] = useState('');
   const [authLoading, setAuthLoading] = useState(true);
   const [subscriptionData, setSubscriptionData] = useState(null);
+  const [aiEntitlementVersion, setAiEntitlementVersion] = useState(0);
+  const [subscriptionLoading, setSubscriptionLoading] = useState(false);
+  const [subscriptionError, setSubscriptionError] = useState('');
   const [orders, setOrders] = useState([]);
   const [accountData, setAccountData] = useState(null);
   const [accountLoading, setAccountLoading] = useState(false);
@@ -405,6 +408,8 @@ function App() {
   useEffect(() => {
     if (!auth) {
       setSubscriptionData(null);
+      setSubscriptionLoading(false);
+      setSubscriptionError('');
       setAccountData(null);
       setCustomOrders([]);
       setNotifications([]);
@@ -415,11 +420,18 @@ function App() {
     }
 
     let active = true;
+    setSubscriptionLoading(true);
+    setSubscriptionError('');
     setAccountLoading(true);
     setAccountError('');
     requestApi('/api/subscription')
       .then((result) => { if (active) setSubscriptionData(result); })
-      .catch((error) => { if (active) setAccountError(`Subscription details could not be loaded: ${error.message}`); });
+      .catch((error) => {
+        if (!active) return;
+        setSubscriptionError(`Subscription details could not be loaded: ${error.message}`);
+        setAccountError(`Subscription details could not be loaded: ${error.message}`);
+      })
+      .finally(() => { if (active) setSubscriptionLoading(false); });
     requestApi('/api/account')
       .then((result) => {
         if (!active) return;
@@ -1312,6 +1324,13 @@ function App() {
     razorpay.open();
   };
 
+  const refreshAppSubscription = async () => {
+    const result = await requestApi('/api/subscription');
+    setSubscriptionData(result);
+    setAiEntitlementVersion((version) => version + 1);
+    return result;
+  };
+
   return (
     <>
       <Header
@@ -1322,6 +1341,7 @@ function App() {
         onWallet={() => openWalletUnlock()}
         onOpenCart={() => navigate('/cart')}
       />
+      <TrialExpirationWarning auth={auth} />
       {!auth && !authLoading && accountError && <div className="container"><div className="alert-box" role="alert">{accountError} <button type="button" className="secondary-btn small" onClick={() => window.location.reload()}>Retry</button></div></div>}
 
       <Routes>
@@ -1343,8 +1363,8 @@ function App() {
           onRemove={removeProductFromHistory}
           onClear={clearBrowsingHistory}
         />} />
-        <Route path="/plans" element={<PlansPage auth={auth} onSignIn={() => openModal('google-login')} onSubscriptionChange={() => requestApi('/api/subscription').then(setSubscriptionData).catch((error) => setAccountError(`Subscription details could not be refreshed: ${error.message}`))} />} />
-        <Route path="/plans/ai-trial/:plan" element={<AITrialActivationPage auth={auth} onSignIn={() => openModal('google-login')} />} />
+        <Route path="/plans" element={<PlansPage auth={auth} onSignIn={() => openModal('google-login')} onSubscriptionChange={() => refreshAppSubscription().catch((error) => setAccountError(`Subscription details could not be refreshed: ${error.message}`))} />} />
+        <Route path="/plans/ai-trial/:plan" element={<AITrialActivationPage auth={auth} onSignIn={() => openModal('google-login')} onActivation={refreshAppSubscription} />} />
         <Route path="/products/:productId" element={<ProductDetailsPage auth={auth} onSignIn={() => openModal('google-login')} onAddToCart={handleAddToCart} onAddWishlistItem={addWishlistItem} onTrackViewed={trackProductView} wishlist={wishlist} cart={cart} />} />
         <Route path="/products" element={<ProductsPage cart={cart} wishlist={wishlist} auth={auth} onSignIn={() => openModal('google-login')} onTrackViewed={trackProductView} onAddToCart={handleAddToCart} onAddWishlistItem={addWishlistItem} onQty={updateQuantity} onAddPromoToCart={handleAddPromoToCart} />} />
             <Route path="/discount-codes" element={authLoading ? <AccountLoadingPage /> : auth ? <ProductsPage initialCategory="Discount Promo Codes" cart={cart} wishlist={wishlist} auth={auth} onSignIn={() => openModal('google-login')} onTrackViewed={trackProductView} onAddToCart={handleAddToCart} onAddWishlistItem={addWishlistItem} onQty={updateQuantity} onAddPromoToCart={handleAddPromoToCart} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
@@ -1387,12 +1407,13 @@ function App() {
         <Route path="/refunds/:id" element={<RefundStatusPage auth={auth} />} />
         <Route path="/admin/refunds" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/refunds"><AdminRefundsPage auth={auth} refunds={adminRefunds} error={adminOrderError} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/refunds/:id" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/refunds"><AdminRefundDetailPage auth={auth} onUpdated={handleAdminRefundUpdated} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
-        <Route path="/account/ai-credits/add" element={authLoading ? <AccountLoadingPage /> : auth ? <AddCreditsPage /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/account/ai-credits/add" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : subscriptionLoading || !subscriptionData && !subscriptionError ? <AccountLoadingPage /> : subscriptionError ? <main className="page-shell"><div className="container narrow-container"><div className="alert-box" role="alert">{subscriptionError}</div></div></main> : subscriptionData?.current?.plan === 'Exclusive' ? <AddCreditsPage /> : <main className="page-shell"><div className="container narrow-container"><div className="alert-box" role="status">Add Credits is available to active Exclusive subscribers only.</div><Link className="secondary-btn" to="/plans">View Plans &amp; AI</Link></div></main>} />
         <Route path="/account/:section?" element={authLoading ? (
           <AccountLoadingPage />
         ) : auth ? (
           <AccountPage
             user={auth}
+            canAddCredits={subscriptionData?.current?.plan === 'Exclusive'}
             accountData={accountData}
             wishlist={wishlist}
             onAddWishlistItem={addWishlistItem}
@@ -1462,6 +1483,7 @@ function App() {
         <AIAssistant
           auth={auth}
           plan={subscriptionData?.current?.plan || 'Starter'}
+          entitlementVersion={aiEntitlementVersion}
           cart={cart}
           service={selectedService}
           onAddComponentsToCart={addProjectComponentsToCart}
@@ -1947,7 +1969,7 @@ function PlansPage({ auth, onSignIn, onSubscriptionChange }) {
   const choosePlan = (plan) => {
     setMessage('');
     if (!auth) { onSignIn(); return; }
-    if (current?.plan && current.plan !== 'Starter' && current.expiryDate && new Date(current.expiryDate) > new Date()) {
+    if (!current?.isTrial && current?.plan && current.plan !== 'Starter' && current.expiryDate && new Date(current.expiryDate) > new Date()) {
       setMessage(`Your ${current.plan} plan remains active until it expires. Plan changes are available afterward.`);
       return;
     }
@@ -2039,7 +2061,7 @@ function PlansPage({ auth, onSignIn, onSubscriptionChange }) {
       {loading ? <p className="plans-loading">Loading plans...</p> : <>
         <div className="plan-grid">
           {plans.map((plan, index) => {
-            const active = current?.plan === plan.name;
+            const active = !current?.isTrial && current?.plan === plan.name;
             return <article className={`plan-card plan-${plan.name.toLowerCase()} ${active ? 'is-current' : ''}`} key={plan.name} style={{ '--plan-order': index }}>
               <div className="plan-card-top"><span className="plan-icon" aria-hidden="true">{planIcons[plan.name]}</span>{active && <span className="plan-current-label">Current plan</span>}</div>
               <h2>{plan.name}</h2>
@@ -2047,8 +2069,8 @@ function PlansPage({ auth, onSignIn, onSubscriptionChange }) {
               <p className="plan-summary">{plan.name === 'Starter' ? 'Everything you need to browse and build.' : plan.name === 'Medium' ? 'More support for projects in progress.' : plan.name === 'Premium' ? 'A capable AI partner for finding and preparing parts.' : 'Advanced AI help, including confirmed purchase assistance.'}</p>
               {plan.credits > 0 && <div className="plan-credit-line">{plan.credits.toLocaleString('en-IN')} AI credits each month</div>}
               {plan.cashback > 0 && <div className="plan-cashback-line">₹{plan.cashback} one-time wallet cashback</div>}
-              <button className={active ? 'secondary-btn full' : 'primary-btn full'} disabled={active || (current?.plan && current.plan !== 'Starter' && current.expiryDate && new Date(current.expiryDate) > new Date())} onClick={() => choosePlan(plan)}>
-                {active ? 'Your current plan' : current?.plan && current.plan !== 'Starter' && current.expiryDate && new Date(current.expiryDate) > new Date() ? 'Available after expiry' : plan.price === 0 ? 'Included by default' : auth ? 'Choose plan' : 'Sign in to subscribe'}
+              <button className={active ? 'secondary-btn full' : 'primary-btn full'} disabled={active || (!current?.isTrial && current?.plan && current.plan !== 'Starter' && current.expiryDate && new Date(current.expiryDate) > new Date())} onClick={() => choosePlan(plan)}>
+                {active ? 'Your current plan' : !current?.isTrial && current?.plan && current.plan !== 'Starter' && current.expiryDate && new Date(current.expiryDate) > new Date() ? 'Available after expiry' : plan.price === 0 ? 'Included by default' : auth ? 'Choose plan' : 'Sign in to subscribe'}
               </button>
               {['Premium', 'Exclusive'].includes(plan.name) && !paidSubscriptionActive && <button className="secondary-btn full ai-trial-plan-button" disabled={auth && !trialStatus || trialUsed || trialActive} onClick={() => chooseTrial(plan.name)}>
                 {!auth ? 'Sign in for Free Trial' : !trialStatus ? 'Checking trial eligibility...' : trialActive ? `${trialStatus.trial.plan} Trial Active` : trialUsed ? 'Free Trial Already Used' : 'Start 4-Day Free Trial'}
@@ -2108,6 +2130,60 @@ function PlansPage({ auth, onSignIn, onSubscriptionChange }) {
   </main>;
 }
 
+function TrialExpirationWarning({ auth }) {
+  const [warning, setWarning] = useState(null);
+  const [error, setError] = useState('');
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (!auth) {
+      setWarning(null);
+      setError('');
+      return undefined;
+    }
+    let active = true;
+    let claimed = false;
+    const claimWarning = async () => {
+      if (claimed) return;
+      try {
+        const result = await requestApi('/api/ai/trial/expiration-warning/claim', { method: 'POST' });
+        if (!active) return;
+        setError('');
+        if (result.warning) {
+          claimed = true;
+          setWarning(result.warning);
+        }
+      } catch (requestError) {
+        if (active) setError(`Trial expiration status could not be checked: ${requestError.message}`);
+      }
+    };
+    claimWarning();
+    const interval = window.setInterval(claimWarning, 60 * 1000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [auth?.id]);
+
+  useEffect(() => {
+    if (!warning) return undefined;
+    const interval = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [warning?.expiresAt]);
+
+  const remainingMs = warning ? new Date(warning.expiresAt).getTime() - now : 0;
+  useEffect(() => {
+    if (warning && remainingMs <= 0) setWarning(null);
+  }, [warning, remainingMs]);
+  const seconds = Math.max(0, Math.floor(remainingMs / 1000));
+  const remaining = `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ${seconds % 60}s`;
+
+  return <>
+    {error && <div className="trial-warning-error" role="alert">{error}</div>}
+    {warning && remainingMs > 0 && <div className="wallet-lock-overlay trial-expiration-overlay"><section className="wallet-pin-modal trial-expiration-dialog" role="alertdialog" aria-modal="true" aria-labelledby="trial-expiration-title"><span className="eyebrow">Trial ending soon</span><h2 id="trial-expiration-title">Your {warning.plan} trial expires within 24 hours</h2><p>Expires {new Date(warning.expiresAt).toLocaleString('en-IN')}</p><strong>{remaining} remaining</strong><button type="button" className="primary-btn" onClick={() => setWarning(null)}>Continue</button></section></div>}
+  </>;
+}
+
 function AccountPlanSection() {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
@@ -2126,15 +2202,17 @@ function AccountPlanSection() {
   return <>
     <div className="account-section-heading"><h2>Current Plan</h2><Link to="/plans">Compare plans</Link></div>
     {error && <div className="alert-box" role="alert">{error}</div>}
-    {current ? <section className="account-panel current-plan-panel"><div><span className="eyebrow">Your membership</span><h3>{current.plan}</h3><strong>{current.plan === 'Starter' ? '₹0/month' : `₹${Number(current.price || (current.pricePaise || 0) / 100).toLocaleString('en-IN')}/month`}</strong></div>
-      {current.plan !== 'Starter' && <><p>Started: {current.startDate ? new Date(current.startDate).toLocaleDateString() : 'Not available'}</p><p>Expires: {current.expiryDate ? new Date(current.expiryDate).toLocaleDateString() : 'Not available'}</p><label className="renew-toggle"><span>Auto Renew</span><input type="checkbox" checked={Boolean(current.autoRenew)} disabled={busy || current.status !== 'active'} onChange={(event) => toggleAutoRenew(event.target.checked)} /><span>{current.autoRenew ? 'ON' : 'OFF'}</span></label><p className="plan-terms">Turning auto-renew off keeps your plan active through its expiry date. Unused AI credits are available only while a paid plan is active.</p></>}
+    {current ? <section className="account-panel current-plan-panel"><div><span className="eyebrow">Your membership{current.isTrial ? ' · Free trial' : ''}</span><h3>{current.plan}</h3><strong>{current.isTrial ? 'Four-day free trial' : current.plan === 'Starter' ? '₹0/month' : `₹${Number(current.price || (current.pricePaise || 0) / 100).toLocaleString('en-IN')}/month`}</strong></div>
+      {current.isTrial && <><p>Trial activated: {new Date(current.startDate).toLocaleString('en-IN')}</p><p>Trial expires: {new Date(current.expiryDate).toLocaleString('en-IN')}</p><div className="ai-trial-status-facts"><span><strong>{current.remainingBuilds}</strong> of {current.buildLimit} successful project builds remaining</span><span>This trial has no paid billing, auto-renewal, or cashback.</span></div></>}
+      {!current.isTrial && current.plan !== 'Starter' && <><p>Started: {current.startDate ? new Date(current.startDate).toLocaleDateString('en-IN') : 'Not available'}</p><p>Expires: {current.expiryDate ? new Date(current.expiryDate).toLocaleDateString('en-IN') : 'Not available'}</p><label className="renew-toggle"><span>Auto Renew</span><input type="checkbox" checked={Boolean(current.autoRenew)} disabled={busy || current.status !== 'active'} onChange={(event) => toggleAutoRenew(event.target.checked)} /><span>{current.autoRenew ? 'ON' : 'OFF'}</span></label><p className="plan-terms">Turning auto-renew off keeps your plan active through its expiry date. Unused AI credits are available only while a paid plan is active.</p></>}
       {current.plan === 'Starter' && <p>Starter is your default plan. Upgrade anytime to add AI features.</p>}
     </section> : <p>Loading your plan...</p>}
+    {!current?.isTrial && data?.trial?.used && !data.trial.active && <section className="account-panel plan-history"><h3>{data.trial.plan} trial · Expired</h3><p>Activated: {data.trial.activatedAt ? new Date(data.trial.activatedAt).toLocaleString('en-IN') : 'Not available'}</p><p>Expired: {data.trial.expiresAt ? new Date(data.trial.expiresAt).toLocaleString('en-IN') : 'Not available'}</p></section>}
     {data?.history?.length > 0 && <section className="account-panel plan-history"><h3>Subscription history</h3>{data.history.map((item) => <div className="plan-history-row" key={item._id}><strong>{item.plan}</strong><span>{new Date(item.startDate).toLocaleDateString()} – {new Date(item.expiryDate).toLocaleDateString()}</span><span>{item.status}</span></div>)}</section>}
   </>;
 }
 
-function AITrialActivationPage({ auth, onSignIn }) {
+function AITrialActivationPage({ auth, onSignIn, onActivation }) {
   const { plan: routePlan = '' } = useParams();
   const navigate = useNavigate();
   const plan = routePlan.charAt(0).toUpperCase() + routePlan.slice(1).toLowerCase();
@@ -2169,8 +2247,13 @@ function AITrialActivationPage({ auth, onSignIn }) {
         method: 'POST',
         body: JSON.stringify({ plan, termsAccepted: true }),
       });
-      setStatus({ trial: result.trial, subscription: null });
+      setStatus({ trial: result.trial, subscription: result.subscription, effectivePlan: result.plan, accessType: result.accessType });
       setNotice(result.message);
+      try {
+        await onActivation();
+      } catch (refreshError) {
+        setError(`Your trial is active, but the account plan could not be refreshed: ${refreshError.message}`);
+      }
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -2201,14 +2284,14 @@ function AITrialActivationPage({ auth, onSignIn }) {
   </div></main>;
 }
 
-function AICreditSection() {
+function AICreditSection({ canAddCredits }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   useEffect(() => { requestApi('/api/ai-credits').then(setData).catch((requestError) => setError(requestError.message)); }, []);
   return <>
     <div className="account-section-heading"><h2>AI Credits</h2><span>Usage and remaining balance</span></div>
     {error ? <div className="alert-box" role="alert">{error}</div> : data ? <>
-      <section className="credits-balance-panel"><span>Remaining Credits</span><strong>{data.balance.toLocaleString('en-IN')}</strong><p>AI credits are used when you use certain AI features.</p><Link className="primary-btn small" to="/account/ai-credits/add">Add Credits</Link></section>
+      <section className="credits-balance-panel"><span>Remaining Credits</span><strong>{data.balance.toLocaleString('en-IN')}</strong><p>AI credits are used when you use certain AI features.</p>{canAddCredits && <Link className="primary-btn small" to="/account/ai-credits/add">Add Credits</Link>}</section>
       <section className="account-panel credit-history"><h3>Credit history</h3>{data.transactions.length ? data.transactions.map((transaction) => <article key={transaction._id}><span className={transaction.type === 'added' ? 'credit-added' : 'credit-used'}>{transaction.type === 'added' ? '+' : '−'}{transaction.amount}</span><div><strong>{transaction.action === 'credit_purchase' ? 'Credit Purchase' : transaction.action}</strong><small>{new Date(transaction.createdAt).toLocaleString()} · Balance {transaction.balanceAfter}</small></div></article>) : <AccountEmpty text="No credit transactions yet." />}</section>
     </> : <p>Loading your AI credits...</p>}
   </>;
@@ -2326,7 +2409,7 @@ function CreditPurchaseSuccess({ success, onDone }) {
   return <main className="page-shell confirmation-shell"><div className="container credit-success"><div className="success-badge">✓</div><h1>Payment Successful</h1><p className="confirmation-intro">Credits Added</p><div className="credit-success-grid"><div><span>Credits Added</span><strong>+{success.purchase.credits.toLocaleString('en-IN')}</strong></div><div><span>Amount Paid</span><strong>₹{success.purchase.totalAmount.toLocaleString('en-IN')}</strong></div><div><span>New Credit Balance</span><strong>{Number(success.balance).toLocaleString('en-IN')} Credits</strong></div></div><p>Transaction {success.purchase.purchaseId}</p><button className="primary-btn" onClick={onDone}>Done</button></div></main>;
 }
 
-function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareCheckout, onOpenCustomBuilding, onNavigate, openSignal }) {
+function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareCheckout, onOpenCustomBuilding, onNavigate, openSignal, entitlementVersion }) {
   const [open, setOpen] = useState(false);
   const [maximized, setMaximized] = useState(false);
   const [input, setInput] = useState('');
@@ -2338,6 +2421,7 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
   const [messages, setMessages] = useState([{ role: 'assistant', text: 'Describe the electronics project you want to build. I can recommend real catalog components, estimate their current cost, and prepare a custom-building brief.' }]);
   const feedRef = useRef(null);
   const appliedActionKeys = useRef(new Set());
+  const buildLimitReached = Boolean(entitlements && entitlements.entitlements.buildLimit != null && entitlements.entitlements.remainingBuilds <= 0);
 
   useEffect(() => {
     if (openSignal) setOpen(true);
@@ -2349,11 +2433,15 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
       .then((result) => { if (active) setEntitlements(result); })
       .catch((error) => { if (active) setMessages((current) => [...current, { role: 'assistant', text: `AI entitlements are unavailable: ${error.message}` }]); });
     return () => { active = false; };
-  }, []);
+  }, [entitlementVersion]);
   useEffect(() => { if (open && feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight; }, [messages, project, open, maximized, busy]);
 
   const showMessage = (text) => setMessages((current) => [...current, { role: 'assistant', text }]);
   const createProject = async (idea) => {
+    if (buildLimitReached) {
+      showMessage('You have used all available project builds on this plan. Upgrade your plan to continue.');
+      return;
+    }
     const budgetMatch = idea.match(/\b(?:under|within|budget(?: of)?)\s*(?:₹|rs\.?\s*)?([\d,]+)/i);
     const budget = budgetMatch ? Number(budgetMatch[1].replaceAll(',', '')) : undefined;
     const result = await requestApi('/api/ai/project-builder', {
@@ -2432,11 +2520,15 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
     event?.preventDefault();
     const text = input.trim();
     if (!text || busy) return;
-    setInput('');
-    setMessages((current) => [...current, { role: 'user', text }]);
     const normalized = text.toLowerCase();
     const addAll = /\b(add|put)\b.*\b(all|required|components|parts)\b.*\b(cart|basket)\b|\b(add all|required components)\b/i.test(text);
     const checkoutIntent = /\b(checkout|check out|place (an )?order)\b/i.test(text);
+    if (!checkoutIntent && !addAll && buildLimitReached) {
+      showMessage('You have used all available project builds on this plan. Upgrade your plan to continue.');
+      return;
+    }
+    setInput('');
+    setMessages((current) => [...current, { role: 'user', text }]);
     if (checkoutIntent) {
       await checkout();
       return;
@@ -2470,6 +2562,10 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
 
   const retryProject = async () => {
     if (!retryIdea || busy) return;
+    if (buildLimitReached) {
+      showMessage('You have used all available project builds on this plan. Upgrade your plan to continue.');
+      return;
+    }
     const idea = retryIdea;
     setBusy(true);
     setMessages((current) => [...current, { role: 'user', text: idea }]);
@@ -2506,7 +2602,7 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
       <div className="ai-chat-feed" ref={feedRef} aria-live="polite">
         {entitlements && <div className="ai-builder-entitlement"><span>{entitlements.accessType === 'trial' ? `${entitlements.trial.plan} trial` : entitlements.plan}</span><span>{entitlements.entitlements.buildLimit == null ? 'Unlimited builds' : `${entitlements.entitlements.remainingBuilds} of ${entitlements.entitlements.buildLimit} builds remaining`}</span></div>}
         {messages.map((item, index) => <div className={`ai-message ${item.role}`} key={`${index}-${item.text}`}>{item.text}{item.text.includes('Upgrade') && <button className="ai-exclusive-link" onClick={() => onNavigate('/plans')}>View Plans &amp; AI</button>}</div>)}
-        {retryIdea && !busy && <button type="button" className="ai-project-retry" onClick={retryProject}>Retry project request</button>}
+        {retryIdea && !busy && <button type="button" className="ai-project-retry" disabled={buildLimitReached} onClick={retryProject}>Retry project request</button>}
         {checkoutEstimate && <section className="ai-checkout-payment-choice" aria-label="Choose checkout payment method"><strong>Choose how to continue</strong><p>Final totals and payment authorization will be handled in secure checkout. Wallet PINs are entered only in the existing trusted PIN dialog.</p><button type="button" disabled={busy} onClick={() => chooseCheckoutPayment('Wallet')}>Continue with Wallet</button><button type="button" disabled={busy} onClick={() => chooseCheckoutPayment('Online Payment')}>Continue with Online Payment</button></section>}
         {project && <section className="ai-project-result" aria-label="Generated project plan">
           <header><span className="eyebrow">Project plan</span><h2>{project.title}</h2><p>{project.description}</p></header>
@@ -2531,7 +2627,7 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
         </section>}
         {busy && <div className="ai-message assistant ai-progress" role="status"><span className="spinner" /> Working with the secure catalog and current entitlements…</div>}
       </div>
-      <form className="ai-chat-input" onSubmit={send}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Describe a project or ask to add its components" aria-label="Describe an electronics project" maxLength={2000} /><button disabled={busy || !input.trim()} aria-label="Send project request">↑</button></form>
+      <form className="ai-chat-input" onSubmit={send}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Describe a project or ask to add its components" aria-label="Describe an electronics project" maxLength={2000} /><button disabled={busy || !input.trim() || buildLimitReached} aria-label="Send project request">↑</button></form>
       <footer className="ai-chat-safety">Project Builder only. Never enter a PIN, password, OTP, or card details here.</footer>
     </section>}
   </>;
@@ -2909,6 +3005,7 @@ function ProductDetailsPage({ auth, onSignIn, onAddToCart, onAddWishlistItem, on
             {isOutOfStock ? <button className="primary-btn" disabled={notifying || Boolean(notifyMessage)} onClick={subscribeBackInStock}>{notifying ? 'Saving...' : notifyMessage ? 'Notification Set' : 'Notify Me When Available'}</button> : <button className="primary-btn" disabled={inCart || cart.some((item) => item.promoReservationId) || product.inventoryProduct && Number(product.stock) < 1} onClick={() => onAddToCart(productForAction)}>{inCart ? 'Added to Cart' : 'Add to Cart'}</button>}
             <button className="secondary-btn" disabled={alreadyInWishlist} onClick={() => onAddWishlistItem(productForAction, 'product')}>{alreadyInWishlist ? 'Added to Wishlist' : 'Add to Wishlist'}</button>
           </div>
+          <p className="product-reward-points" role="note">🎁 Earn <strong>{Number(data.rewardPoints || 0).toLocaleString('en-IN')}</strong> Reward Points with this purchase!</p>
           {notifyMessage && <p className="account-notice">{notifyMessage}</p>}{notifyError && <div className="alert-box" role="alert">{notifyError}</div>}
         </div>
       </section>
@@ -3335,6 +3432,7 @@ function PromoOfflineOrderSummary({ amount, buyer, buyerAddress, recipientAddres
 
 function OfflinePromoAddressStep({ recipientType, step, address, buyerAddress, savedAddress, savedRecipientAddresses, useNewAddress, recipientEmail, errors, onUseSaved, onUseNew, onBuyerAddressChange, onAddressChange, onRecipientEmailChange, onContinue }) {
   const buyerStep = recipientType === 'gift' && step === 'buyer';
+  const recipientEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(recipientEmail || '').trim());
   const activeAddress = buyerStep ? buyerAddress : address;
   const onChange = buyerStep ? onBuyerAddressChange : onAddressChange;
   const showSavedAddress = buyerStep || recipientType === 'myself';
@@ -3356,9 +3454,10 @@ function OfflinePromoAddressStep({ recipientType, step, address, buyerAddress, s
       {showSavedAddress && savedAddress && <div className="promo-address-choice"><button type="button" className={!useNewAddress ? 'selected' : ''} onClick={onUseSaved}><strong>Use saved address</strong><span>{[savedAddress.fullName, savedAddress.addressLine1, savedAddress.addressLine2, savedAddress.city, savedAddress.state, savedAddress.pinCode].filter(Boolean).join(', ')}</span></button><button type="button" className={useNewAddress ? 'selected' : ''} onClick={onUseNew}><strong>Add or edit address</strong><span>Use different contact or delivery details.</span></button></div>}
       {recipientType === 'gift' && !buyerStep && recipientAddressChoices.length > 0 && <div className="promo-address-choice">{recipientAddressChoices.map((choice) => <button key={choice.key} type="button" className={!useNewAddress && sameAddress(activeAddress, choice.address) ? 'selected' : ''} onClick={() => onUseSaved(choice.address)}><strong>{choice.label}</strong><span>{[choice.address.fullName, choice.address.phoneNumber, choice.address.addressLine1, choice.address.addressLine2, choice.address.city, choice.address.state, choice.address.pinCode].filter(Boolean).join(', ')}</span></button>)}<button type="button" className={useNewAddress ? 'selected' : ''} onClick={onUseNew}><strong>Add new recipient address</strong><span>Enter a different recipient's delivery details.</span></button></div>}
       {(!showSavedAddress || !savedAddress || useNewAddress) && <div className="promo-delivery-address-grid">{fields.map(([field, label]) => <label key={field} className={field === 'addressLine1' || field === 'addressLine2' ? 'full-width' : ''}>{label}<input required value={activeAddress?.[field] || ''} onChange={(event) => onChange(field, event.target.value)} />{errors[field] && <small>{errors[field]}</small>}</label>)}
-        {recipientType === 'gift' && !buyerStep && <><label className="full-width">Recipient Email (optional)<input type="email" value={recipientEmail} onChange={(event) => onRecipientEmailChange(event.target.value)} placeholder="recipient@example.com" /></label><label className="full-width">Additional Delivery Instructions<textarea value={activeAddress?.deliveryInstructions || ''} onChange={(event) => onChange('deliveryInstructions', event.target.value)} /></label></>}
+        {recipientType === 'gift' && !buyerStep && <label className="full-width">Additional Delivery Instructions<textarea value={activeAddress?.deliveryInstructions || ''} onChange={(event) => onChange('deliveryInstructions', event.target.value)} /></label>}
       </div>}
-      <button className="primary-btn full" type="button" onClick={onContinue}>{buyerStep ? "Next: Recipient's Address" : 'Confirm Addresses & Continue to Payment'}</button>
+      {recipientType === 'gift' && !buyerStep && <label className="promo-recipient-email">Registered Recipient Email<input type="email" value={recipientEmail} onChange={(event) => onRecipientEmailChange(event.target.value)} placeholder="recipient@example.com" required autoComplete="email" /><small>The recipient must have an Innovation Labs account. We verify this email before payment.</small></label>}
+      <button className="primary-btn full" type="button" disabled={recipientType === 'gift' && !buyerStep && !recipientEmailValid} onClick={onContinue}>{buyerStep ? "Next: Recipient's Address" : 'Confirm Addresses & Continue to Payment'}</button>
     </section>
   </div></main>;
 }
@@ -3681,7 +3780,7 @@ function SignInRequiredPage({ onSignIn }) {
   );
 }
 
-function AccountPage({ user, accountData, orders, customOrders, notifications, address, wishlist, onAddWishlistItem, onRemoveWishlistItem, onAddWishlistPromoToCart, onAddToCart, onAddDiscountCodeToCart, loading, error, notice, onSaveAddress, onSavePhone, onMarkRead, onOrderCustomItem, onSignOut, onCancelOrder }) {
+function AccountPage({ user, canAddCredits, accountData, orders, customOrders, notifications, address, wishlist, onAddWishlistItem, onRemoveWishlistItem, onAddWishlistPromoToCart, onAddToCart, onAddDiscountCodeToCart, loading, error, notice, onSaveAddress, onSavePhone, onMarkRead, onOrderCustomItem, onSignOut, onCancelOrder }) {
   const { section = 'overview' } = useParams();
   const activeSection = accountSections.some(([id]) => id === section) ? section : 'overview';
   const profile = accountData?.profile || user;
@@ -3861,7 +3960,7 @@ function AccountPage({ user, accountData, orders, customOrders, notifications, a
 
             {activeSection === 'plan' && <AccountPlanSection />}
 
-            {activeSection === 'ai-credits' && <AICreditSection />}
+            {activeSection === 'ai-credits' && <AICreditSection canAddCredits={canAddCredits} />}
 
             {activeSection === 'address' && (
               <>
@@ -4371,7 +4470,6 @@ function WalletPromoCode({ promo }) {
 function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
   const [view, setView] = useState('checking-id');
   const [walletId, setWalletId] = useState(wallet.walletId || '');
-  const [walletIdSuffix, setWalletIdSuffix] = useState('');
   const [recipientSuffix, setRecipientSuffix] = useState('');
   const [recipient, setRecipient] = useState(null);
   const [recipientConfirmOpen, setRecipientConfirmOpen] = useState(false);
@@ -4416,26 +4514,15 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
   const availablePaise = Math.round(Number(wallet.balance || 0) * 100);
 
   const createWalletId = async () => {
-    if (!/^[A-Z]{4}\d{4}$/.test(walletIdSuffix) || creatingId) return;
+    if (creatingId) return;
     setCreatingId(true);
     setError('');
     try {
-      const result = await requestApi('/api/wallet/transfers/wallet-id', { method: 'POST', body: JSON.stringify({ walletId: walletIdSuffix }) });
+      const result = await requestApi('/api/wallet/transfers/wallet-id', { method: 'POST', body: JSON.stringify({}) });
       setWalletId(result.walletId);
       onWalletUpdate((current) => ({ ...current, walletId: result.walletId }));
-      setView('created-id');
+      setView(result.existing ? 'recipient' : 'created-id');
     } catch (requestError) {
-      if (requestError.status === 409) {
-        try {
-          const existing = await requestApi('/api/wallet/transfers/account');
-          if (existing.walletId) {
-            setWalletId(existing.walletId);
-            onWalletUpdate((current) => ({ ...current, walletId: existing.walletId }));
-            setView('recipient');
-            return;
-          }
-        } catch { }
-      }
       setError(requestError.message);
     } finally {
       setCreatingId(false);
@@ -4570,7 +4657,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
     {view === 'checking-id' && <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Checking your Wallet ID...</p></div>}
     {view === 'error' && <section className="wallet-transfer-panel"><div className="voice-error" role="alert">{error}</div><button className="secondary-btn" onClick={() => setView('create-id')}>Retry</button></section>}
 
-    {view === 'create-id' && <section className="wallet-transfer-panel wallet-id-create-panel"><h2>Create your Wallet ID</h2><p>Your Wallet ID will be used by other Innovation Labs users to send money to your wallet.</p><label className="wallet-amount">Wallet ID<div className="wallet-id-input"><span aria-hidden="true">@WL</span><input value={walletIdSuffix} onChange={(event) => { setWalletIdSuffix(suffixFromInput(event.target.value)); setError(''); }} maxLength={8} autoComplete="off" aria-label="Four letters followed by four numbers" placeholder="ABCD1234" /></div></label><ul className="wallet-id-rules"><li>Exactly 4 letters</li><li>Exactly 4 numbers</li><li>Letters and numbers are both required</li><li>Wallet IDs are unique and permanent</li></ul>{error && <div className="voice-error" role="alert">{error}</div>}<div className="modal-actions"><button className="secondary-btn" onClick={onBackToOverview}>Cancel</button><button className="primary-btn" disabled={creatingId || !/^[A-Z]{4}\d{4}$/.test(walletIdSuffix)} onClick={createWalletId}>{creatingId ? 'Creating...' : 'Create ID'}</button></div></section>}
+    {view === 'create-id' && <section className="wallet-transfer-panel wallet-id-create-panel"><h2>Create your Wallet ID</h2><p>Your Wallet ID is generated securely and saved to your account. Other Innovation Labs users can use it to send money to your wallet.</p><ul className="wallet-id-rules"><li>Automatically generated in the @WL plus 4 letters and 4 numbers format</li><li>Unique and permanent for your account</li><li>Existing Wallet IDs are never replaced</li></ul>{error && <div className="voice-error" role="alert">{error}</div>}<div className="modal-actions"><button className="secondary-btn" onClick={onBackToOverview}>Cancel</button><button className="primary-btn" disabled={creatingId} onClick={createWalletId}>{creatingId ? 'Creating...' : 'Create ID'}</button></div></section>}
 
     {view === 'created-id' && <section className="wallet-transfer-panel wallet-id-success-panel"><div className="transfer-success-icon" aria-hidden="true">✓</div><h2>Wallet ID Created</h2><p>Your Wallet ID has been successfully created. You can share it with another Innovation Labs user so they can transfer money to your wallet.</p><strong className="wallet-id-display">{walletId}</strong><button className="primary-btn" onClick={() => { setError(''); setView('recipient'); }}>Continue to Transfer Money</button></section>}
 
@@ -5997,7 +6084,10 @@ function OrderPlacedPage({ order }) {
   const [stage, setStage] = useState(0);
   const [copyState, setCopyState] = useState('Copy Code');
   const [discountRevealOpen, setDiscountRevealOpen] = useState(false);
+  const [rewardPopupOpen, setRewardPopupOpen] = useState(false);
   const orderKey = order?.orderId || order?.id;
+  const rewardPointsEarned = Number(order?.rewardPointsEarned || 0);
+  const rewardWasEarned = rewardPointsEarned > 0 && order?.paymentStatus === 'Paid' && !['Cancelled', 'Declined', 'Rejected', 'Failed'].includes(order?.orderStatus);
   const address = order?.address || {};
   const packageLabels = { parts: 'Parts Only', coding: 'Parts + Coding', building: 'Parts + Building', full: 'Complete Build' };
   const money = (value) => Number(value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -6046,6 +6136,10 @@ function OrderPlacedPage({ order }) {
   }, [orderKey]);
 
   useEffect(() => {
+    setRewardPopupOpen(rewardWasEarned);
+  }, [orderKey, rewardPointsEarned, order?.paymentStatus, order?.orderStatus]);
+
+  useEffect(() => {
     if (stage >= 2 && purchasedDiscountCodes.length) setDiscountRevealOpen(true);
   }, [stage, orderKey, purchasedDiscountCodes.length]);
 
@@ -6073,6 +6167,8 @@ function OrderPlacedPage({ order }) {
             <div className={`order-success-circle ${stage >= 1 ? 'is-visible' : ''}`} role="img" aria-label="Order successfully placed"><span className="order-checkmark" aria-hidden="true" /></div>
             {stage >= 2 && <><h1 className="order-confirmation-title">{order.orderStatus === 'Declined' ? 'Order Declined' : order.orderStatus === 'Rejected' ? 'Order Rejected' : isGiftOrder ? 'Gift Order Confirmed' : 'Order Placed'}</h1><p className="order-confirmation-intro">{order.orderStatus === 'Declined' ? 'Your order was declined by the admin. The refundable parts amount has been credited to your wallet.' : order.orderStatus === 'Rejected' ? 'Your offline Promo Code order was rejected. The eligible purchase amount was refunded to your wallet.' : order.orderType === 'PROMO_CODE' && order.purchaseType === 'offline' && order.orderStatus === 'Pending Admin Approval' ? 'Your payment is confirmed. This offline order is pending admin approval; the Promo Code and wallet credit will be activated only after acceptance.' : isGiftOrder ? 'Your gift order was successfully placed. The promo code is assigned to the recipient account.' : isPromoCodeOrder ? 'Your digital Promo Code purchase has been confirmed. The code is ready to redeem in your Wallet.' : 'Your order has been successfully placed. Our team will review your order and update the delivery timeline.'}</p></>}
           </header>
+          {stage >= 2 && rewardWasEarned && <section className="reward-points-confirmation" aria-label="Reward points earned"><span aria-hidden="true">🎁</span><div><strong>{rewardPointsEarned.toLocaleString('en-IN')} Reward Points Earned</strong><small>These points have been added to your account.</small></div></section>}
+          {stage >= 2 && rewardWasEarned && rewardPopupOpen && <div className="wallet-lock-overlay reward-success-overlay"><section className="wallet-pin-modal reward-success-dialog" role="dialog" aria-modal="true" aria-labelledby="reward-success-title"><span className="reward-success-icon" aria-hidden="true">🎉</span><h2 id="reward-success-title">You earned reward points!</h2><strong>{rewardPointsEarned.toLocaleString('en-IN')} Reward Points</strong><p>They have been credited to your account for this completed purchase.</p><button type="button" className="primary-btn" onClick={() => setRewardPopupOpen(false)}>View Order Confirmation</button></section></div>}
 
           {stage >= 3 && !isPromoCodeOrder && order.deliveryRequired !== false && <section className="order-confirmation-card order-address-card" aria-labelledby="delivery-address-title">
             <h2 id="delivery-address-title">Delivery Address</h2>

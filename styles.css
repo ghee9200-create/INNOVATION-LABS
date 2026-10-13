@@ -613,6 +613,9 @@ body.modal-open {
 .promo-delivery-address-grid label, .promo-order-action-modal label { display: grid; gap: 7px; color: var(--muted); font-size: .88rem; }
 .promo-delivery-address-grid input, .promo-order-action-modal input, .promo-order-action-modal textarea { width: 100%; min-height: 42px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: rgba(255,255,255,.035); }
 .promo-delivery-address-grid label.full-width { grid-column: 1 / -1; }
+.promo-recipient-email { display: grid; gap: 7px; min-width: 0; color: var(--muted); font-size: .88rem; }
+.promo-recipient-email input { width: 100%; min-height: 42px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: rgba(255,255,255,.035); }
+.promo-recipient-email small { color: var(--muted); line-height: 1.45; }
 .promo-delivery-address-grid small { color: #ff9bad; }
 .promo-payment-success { align-items: center; }
 .promo-order-action-modal { display: grid; gap: 12px; }
@@ -1900,6 +1903,18 @@ body.modal-open {
 @keyframes order-check-draw { to { opacity: 1; transform: translateY(-3px) rotate(45deg) scale(1); } }
 .order-confirmation-title { margin: 4px 0 8px; font-size: clamp(1.8rem, 4vw, 2.3rem); animation: order-copy-enter 380ms ease-out both; }
 .order-confirmation-intro { max-width: 550px; margin: 0; color: var(--muted); line-height: 1.65; animation: order-copy-enter 420ms 70ms ease-out both; }
+.reward-points-confirmation { display: flex; align-items: center; gap: 13px; width: 100%; margin: 0 0 18px; padding: 15px 18px; border: 1px solid rgba(68, 217, 169, .3); border-radius: 12px; color: #d8fff0; background: linear-gradient(120deg, rgba(22, 91, 71, .34), rgba(12, 42, 43, .7)); box-shadow: 0 10px 32px rgba(15, 177, 125, .09); }
+.reward-points-confirmation > span { font-size: 1.6rem; }
+.reward-points-confirmation > div { display: grid; gap: 4px; min-width: 0; }
+.reward-points-confirmation strong { overflow-wrap: anywhere; font-size: .98rem; }
+.reward-points-confirmation small { color: #a8c9bf; }
+.reward-success-overlay { z-index: 85; }
+.reward-success-dialog { display: grid; justify-items: center; gap: 11px; width: min(430px, 100%); text-align: center; animation: wallet-modal-enter 220ms ease-out both; }
+.reward-success-icon { display: grid; place-items: center; width: 70px; height: 70px; border: 1px solid rgba(68, 217, 169, .38); border-radius: 50%; background: rgba(37, 159, 118, .14); font-size: 2rem; }
+.reward-success-dialog h2 { margin: 0; }
+.reward-success-dialog > strong { color: #8ceac8; font-size: 1.35rem; }
+.reward-success-dialog p { margin: 0 0 7px; color: var(--muted); line-height: 1.55; }
+.reward-success-dialog .primary-btn { max-width: 100%; white-space: normal; }
 @keyframes order-copy-enter { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 .order-confirmation-card { width: 100%; margin: 14px 0; padding: 20px 22px; border: 1px solid var(--border); border-radius: 10px; background: linear-gradient(145deg, rgba(16,33,41,0.94), rgba(9,21,27,0.94)); box-shadow: 0 14px 34px rgba(0,0,0,0.16); text-align: left; }
 .order-confirmation-card h2 { position: relative; margin: 0 0 15px; padding-bottom: 11px; color: var(--text); font-size: 1.08rem; }
@@ -2457,6 +2472,13 @@ body.modal-open {
 .current-plan-panel { display: grid; gap: 8px; }
 .current-plan-panel h3 { margin: 4px 0 2px; font-size: 1.7rem; }
 .current-plan-panel > p { margin: 0; color: var(--muted); }
+.current-plan-panel .ai-trial-status-facts { max-width: 440px; }
+.trial-expiration-overlay { z-index: 110; }
+.trial-expiration-dialog { display: grid; gap: 12px; width: min(480px, 100%); text-align: center; }
+.trial-expiration-dialog h2 { margin: 0; overflow-wrap: anywhere; }
+.trial-expiration-dialog p { margin: 0; color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }
+.trial-expiration-dialog > strong { color: var(--primary-strong); font-size: clamp(1.1rem, 5vw, 1.5rem); font-variant-numeric: tabular-nums; }
+.trial-warning-error { position: fixed; z-index: 111; top: 12px; left: 50%; width: min(620px, calc(100% - 24px)); transform: translateX(-50%); padding: 12px 15px; border: 1px solid rgba(255, 130, 145, .35); border-radius: 8px; color: #ffb1be; background: #29151b; box-shadow: var(--shadow); font-size: .84rem; }
 .renew-toggle { display: flex; align-items: center; gap: 12px; width: fit-content; margin-top: 12px; }
 .renew-toggle input { width: 20px; height: 20px; accent-color: var(--primary); }
 .renew-toggle span:last-child { min-width: 34px; color: var(--primary-strong); font-weight: 700; }
@@ -4012,6 +4034,8 @@ body.modal-open {
 .product-details-stock.out-of-stock { border-color: rgba(255, 130, 145, .25); color: #ff9eac; background: rgba(255, 130, 145, .07); }
 .product-details-description { margin: 0; color: #b5c8ce; line-height: 1.75; white-space: pre-line; }
 .product-details-actions { display: flex; flex-wrap: wrap; gap: 10px; width: 100%; margin-top: 6px; }
+.product-reward-points { max-width: 100%; margin: -5px 0 0; padding: 10px 12px; border: 1px solid rgba(68, 217, 169, .25); border-radius: 8px; color: #bbf2db; background: rgba(36, 133, 99, .09); font-size: .88rem; line-height: 1.45; overflow-wrap: anywhere; }
+.product-reward-points strong { color: #8ceac8; }
 .product-specifications { width: 100%; padding-top: 4px; }
 .product-specifications h2 { margin: 0 0 10px; font-size: 1rem; }
 .product-specifications dl { display: grid; gap: 0; margin: 0; }
@@ -4069,6 +4093,11 @@ body.modal-open {
   .product-details-image-frame img { max-height: 380px; }
 }
 @media (max-width: 560px) {
+  .product-details-actions { align-items: stretch; }
+  .product-details-actions > button { max-width: 100%; }
+  .product-reward-points { width: 100%; }
+  .reward-points-confirmation { align-items: flex-start; padding: 13px; }
+  .reward-success-dialog { padding: 23px 18px; }
   .review-summary-layout { grid-template-columns: 1fr; gap: 18px; }
   .review-average { justify-items: center; }
   .review-rating-bar { grid-template-columns: 62px minmax(40px,1fr) 63px; gap: 7px; }
@@ -4077,6 +4106,7 @@ body.modal-open {
 }
 @media (prefers-reduced-motion: reduce) {
   .product-card-image-clickable { transition: none; }
+  .reward-success-dialog { animation: none; }
 }
 
 /* Admin workspace visual system */
