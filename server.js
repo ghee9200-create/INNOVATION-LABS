@@ -855,16 +855,30 @@ const refundEligibilityFor = (order, existingRefund = null, now = new Date()) =>
   return { eligible: true, reason: '', deliveredAt, eligibleAt };
 };
 
-const cancellationEligibilityFor = (order) => {
+const cancellationEligibilityFor = (order, hasUnusedDiscountCodePurchases = false) => {
   if (order.orderType === 'PROMO_CODE') return { eligible: false, reason: 'Digital Promo Code purchases cannot be cancelled or refunded.' };
+  if (order.orderType === 'DISCOUNT_CODE' && !hasUnusedDiscountCodePurchases) return { eligible: false, reason: 'This Discount Promo Code is not available for cancellation.' };
   if (order.paymentMethod !== 'Wallet') return { eligible: false, reason: 'Only Wallet-paid orders can use wallet cancellation.' };
   if (order.paymentStatus !== 'Paid') return { eligible: false, reason: 'Only paid orders can be cancelled.' };
-  if (order.orderStatus !== 'Processing' || order.acceptedAt || (order.statusHistory || []).some((entry) => entry.status === 'Accepted')) {
+  const cancellableStatus = order.orderType === 'DISCOUNT_CODE'
+    ? ['Processing', 'Confirmed'].includes(order.orderStatus)
+    : order.orderStatus === 'Processing';
+  if (!cancellableStatus || order.acceptedAt || (order.statusHistory || []).some((entry) => entry.status === 'Accepted')) {
     return { eligible: false, reason: 'Orders can only be cancelled before admin acceptance.' };
   }
   if (order.cancelledAt || order.cancellationId || order.orderStatus === 'Cancelled') return { eligible: false, reason: 'This order has already been cancelled.' };
   if (order.refundCaseId) return { eligible: false, reason: 'This order already has a refund case.' };
   return { eligible: true, reason: '' };
+};
+
+const orderDiscountCodePurchasesAreUnused = (order, purchases) => {
+  if (order.orderType !== 'DISCOUNT_CODE') return false;
+  const expectedCount = (order.items || []).reduce((sum, item) =>
+    sum + (item.discountOfferId ? Number(item.quantity || 0) : 0), 0);
+  return expectedCount > 0
+    && purchases.length === expectedCount
+    && purchases.every((purchase) =>
+      purchase.fulfillmentStatus === 'fulfilled' && purchase.redemptionCount === 0 && purchase.offerId);
 };
 
 const refundEvidenceUpload = (req, res, next) => uploadRefundEvidence.single('evidence')(req, res, (error) => {
@@ -5960,11 +5974,12 @@ app.post('/api/wallet/pay', requireSession, requireDatabase, async (req, res) =>
       return { order, discountCodes, wallet: wallet.toObject() };
     });
     const savedOrder = result.order.toObject ? result.order.toObject() : result.order;
-    const cancellation = cancellationEligibilityFor(savedOrder);
+    const discountCodes = result.discountCodes || await discountCodesForOrder(savedOrder.orderId);
+    const cancellation = cancellationEligibilityFor(savedOrder, Boolean(discountCodes.length));
     const refund = refundEligibilityFor(savedOrder, null);
     const order = {
       ...savedOrder,
-      discountCodes: result.discountCodes || await discountCodesForOrder(savedOrder.orderId),
+      discountCodes,
       cancelEligible: cancellation.eligible,
       cancellationEligibility: { eligible: cancellation.eligible, reason: cancellation.reason },
       refundEligible: refund.eligible,
@@ -6315,11 +6330,22 @@ app.get('/api/account', requireSession, requireDatabase, async (req, res) => {
     Notification.find({ userId: req.session.sub }).sort({ createdAt: -1 }).lean(),
     Refund.find({ userId: req.session.sub }).select('orderId refundCaseId status refundAmountPaise approvedRefundAmountPaise reasonCategory walletTransactionReferenceId').lean(),
   ]);
+  const discountOrderIds = orders.filter((order) => order.orderType === 'DISCOUNT_CODE').map((order) => order.orderId);
+  const discountPurchases = discountOrderIds.length
+    ? await PurchasedDiscountCode.find({ orderId: { $in: discountOrderIds } }).select('orderId offerId fulfillmentStatus redemptionCount').lean()
+    : [];
+  const discountPurchasesByOrder = new Map();
+  for (const purchase of discountPurchases) {
+    const purchases = discountPurchasesByOrder.get(purchase.orderId) || [];
+    purchases.push(purchase);
+    discountPurchasesByOrder.set(purchase.orderId, purchases);
+  }
   const refundsByOrder = new Map(refunds.map((refund) => [refund.orderId, refund]));
   const ordersWithRefundEligibility = orders.map((order) => {
     const refund = refundsByOrder.get(order.orderId) || null;
     const eligibility = refundEligibilityFor(order, refund);
-    const cancellation = cancellationEligibilityFor(order);
+    const hasUnusedDiscountCodePurchases = orderDiscountCodePurchasesAreUnused(order, discountPurchasesByOrder.get(order.orderId) || []);
+    const cancellation = cancellationEligibilityFor(order, hasUnusedDiscountCodePurchases);
     return {
       ...buyerOrderView(order),
       cancelEligible: cancellation.eligible,
@@ -6595,8 +6621,38 @@ app.post('/api/orders/:orderId/cancel', requireSession, requireDatabase, async (
           duplicate: true,
         };
       }
-      const eligibility = cancellationEligibilityFor(order.toObject());
+      const orderValue = order.toObject();
+      const discountPurchases = order.orderType === 'DISCOUNT_CODE'
+        ? await PurchasedDiscountCode.find({ orderId: order.orderId }).session(session).lean()
+        : [];
+      const hasUnusedDiscountCodePurchases = orderDiscountCodePurchasesAreUnused(orderValue, discountPurchases);
+      const eligibility = cancellationEligibilityFor(orderValue, hasUnusedDiscountCodePurchases);
       if (!eligibility.eligible) throw Object.assign(new Error(eligibility.reason), { status: 409 });
+      if (order.orderType === 'DISCOUNT_CODE') {
+        const revoked = await PurchasedDiscountCode.updateMany(
+          { orderId: order.orderId, fulfillmentStatus: 'fulfilled', redemptionCount: 0 },
+          { $set: { fulfillmentStatus: 'rejected' } },
+          { session },
+        );
+        if (revoked.modifiedCount !== discountPurchases.length) {
+          throw Object.assign(new Error('This Discount Promo Code is no longer available for cancellation.'), { status: 409 });
+        }
+        const quantitiesByOffer = new Map();
+        for (const purchase of discountPurchases) {
+          const offerId = String(purchase.offerId);
+          quantitiesByOffer.set(offerId, (quantitiesByOffer.get(offerId) || 0) + 1);
+        }
+        for (const [offerId, quantity] of quantitiesByOffer) {
+          const restoredOffer = await DiscountCodeOffer.updateOne(
+            { _id: offerId, purchasedCount: { $gte: quantity } },
+            { $inc: { availableQuantity: quantity, purchasedCount: -quantity } },
+            { session },
+          );
+          if (!restoredOffer.modifiedCount) {
+            throw Object.assign(new Error('The Discount Promo Code inventory could not be restored.'), { status: 409 });
+          }
+        }
+      }
       await restoreInventoryForOrder(session, order);
       const amountPaise = toPaise(order.total);
       if (!Number.isSafeInteger(amountPaise) || amountPaise <= 0) {
