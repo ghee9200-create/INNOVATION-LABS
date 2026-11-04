@@ -6222,6 +6222,8 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
   const [qrData, setQrData] = useState(null);
   const [qrImage, setQrImage] = useState('');
   const [qrLoading, setQrLoading] = useState(false);
+  const [qrRenderError, setQrRenderError] = useState('');
+  const [qrRetry, setQrRetry] = useState(0);
   const [qrTransferAvailable, setQrTransferAvailable] = useState(false);
   const [qrAccessError, setQrAccessError] = useState('');
   const [qrAccessRefresh, setQrAccessRefresh] = useState(0);
@@ -6305,15 +6307,23 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
   const availablePaise = Math.round(Number(wallet.balance || 0) * 100);
 
   useEffect(() => {
-    if (transferTab !== 'show' || !ownWalletId) return undefined;
+    if (transferTab !== 'show') return undefined;
     let active = true;
     setQrLoading(true);
+    setQrRenderError('');
     requestApi('/api/wallet/transfers/qr', { method: 'POST', body: JSON.stringify({}) })
-      .then((result) => { if (active) setQrData(result); })
+      .then((result) => {
+        if (active) {
+          setWalletId(result.walletId);
+          setWalletIdChecked(true);
+          setQrData(result);
+          setQrImage('');
+        }
+      })
       .catch((requestError) => { if (active) setError(requestError.message); })
       .finally(() => { if (active) setQrLoading(false); });
     return () => { active = false; };
-  }, [transferTab, ownWalletId]);
+  }, [transferTab, ownWalletId, qrRetry]);
 
   useEffect(() => {
     let active = true;
@@ -6322,6 +6332,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
       return undefined;
     }
     setQrImage('');
+    setQrRenderError('');
     const renderWalletQr = async () => {
       try {
         const qrDataUrl = await QRCode.toDataURL(qrData.qrPayload, {
@@ -6330,12 +6341,13 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
           color: { dark: '#07151c', light: '#ffffff' },
           errorCorrectionLevel: 'H',
         });
-        const [qr, logo] = await Promise.all([qrDataUrl, innovationLabsLogo].map((src) => new Promise((resolve, reject) => {
+        const loadImage = (src) => new Promise((resolve, reject) => {
           const image = new Image();
           image.onload = () => resolve(image);
-          image.onerror = () => reject(new Error('The QR code logo could not be loaded.'));
+          image.onerror = () => reject(new Error('Image could not be loaded.'));
           image.src = src;
-        })));
+        });
+        const qr = await loadImage(qrDataUrl);
         const canvas = document.createElement('canvas');
         canvas.width = 640;
         canvas.height = 640;
@@ -6343,6 +6355,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
         if (!context) throw new Error('Your browser could not prepare the QR code image.');
         context.imageSmoothingEnabled = false;
         context.drawImage(qr, 0, 0, canvas.width, canvas.height);
+        if (active) setQrImage(canvas.toDataURL('image/png'));
 
         const panelWidth = 136;
         const panelHeight = 112;
@@ -6351,21 +6364,27 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
         context.imageSmoothingEnabled = true;
         context.fillStyle = '#ffffff';
         context.beginPath();
-        context.roundRect(panelX, panelY, panelWidth, panelHeight, 14);
+        if (typeof context.roundRect === 'function') context.roundRect(panelX, panelY, panelWidth, panelHeight, 14);
+        else context.rect(panelX, panelY, panelWidth, panelHeight);
         context.fill();
         context.strokeStyle = '#00aeca';
         context.lineWidth = 3;
         context.stroke();
+        const logo = await loadImage(innovationLabsLogo);
         context.save();
         context.beginPath();
-        context.roundRect(panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16, 8);
+        if (typeof context.roundRect === 'function') context.roundRect(panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16, 8);
+        else context.rect(panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16);
         context.clip();
         context.drawImage(logo, 105, 175, 1045, 825, panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16);
         context.restore();
 
         if (active) setQrImage(canvas.toDataURL('image/png'));
       } catch (qrError) {
-        if (active) setError(`Your QR code could not be generated: ${qrError.message}`);
+        if (active) {
+          setQrRenderError(`The QR image could not be prepared: ${qrError.message}`);
+          setError('');
+        }
       }
     };
     renderWalletQr();
@@ -6374,8 +6393,8 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
 
   const selectTransferTab = async (nextTab) => {
     setError('');
-    if (nextTab === 'show' && (!walletIdChecked || !ownWalletId)) {
-      setError('Your Wallet ID has not been generated yet. Generate your Wallet ID first to use QR transfers.');
+    if (nextTab === 'show' && !walletIdChecked) {
+      setError('Your wallet is still being checked. Please try again in a moment.');
       return;
     }
     setTransferTab(nextTab);
@@ -6548,9 +6567,9 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
 
     {showTransferOptions && <nav className="wallet-transfer-options" aria-label="Transfer methods">
       <button type="button" className={transferTab === 'enter' ? 'active' : ''} aria-current={transferTab === 'enter' ? 'page' : undefined} onClick={() => selectTransferTab('enter')}>Enter Wallet ID</button>
-      <button type="button" className={transferTab === 'show' ? 'active' : ''} aria-current={transferTab === 'show' ? 'page' : undefined} disabled={!walletIdChecked || !ownWalletId} title={!walletIdChecked || !ownWalletId ? 'Generate your Wallet ID first to use QR transfers.' : undefined} onClick={() => selectTransferTab('show')}>Show QR</button>
+      <button type="button" className={transferTab === 'show' ? 'active' : ''} aria-current={transferTab === 'show' ? 'page' : undefined} disabled={!walletIdChecked} title={!walletIdChecked ? 'Checking your wallet...' : undefined} onClick={() => selectTransferTab('show')}>Show QR</button>
     </nav>}
-    {showTransferOptions && walletIdChecked && !ownWalletId && <p className="wallet-qr-unavailable" role="status">Your Wallet ID has not been generated yet. Generate your Wallet ID first to use QR transfers.</p>}
+    {showTransferOptions && walletIdChecked && !ownWalletId && <p className="wallet-qr-unavailable" role="status">Your Wallet ID will be created automatically when you generate your QR code.</p>}
 
     {showTransferOptions && transferTab === 'enter' && view === 'create-id' && <section className="wallet-transfer-panel wallet-id-create-panel"><h2>Create your Wallet ID</h2><p>Your Wallet ID is generated securely and saved to your account. Other Innovation Labs users can use it to send money to your wallet.</p><ul className="wallet-id-rules"><li>Automatically generated in the @WL plus 4 letters and 4 numbers format</li><li>Unique and permanent for your account</li><li>Existing Wallet IDs are never replaced</li></ul>{error && <div className="voice-error" role="alert">{error}</div>}<div className="modal-actions"><button className="secondary-btn" onClick={onBackToOverview}>Cancel</button><button className="primary-btn" disabled={creatingId} onClick={createWalletId}>{creatingId ? 'Creating...' : 'Create ID'}</button></div></section>}
 
@@ -6558,7 +6577,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
 
     {showTransferOptions && transferTab === 'enter' && view === 'recipient' && <section className="wallet-transfer-panel"><h2>Transfer Money</h2><div className="wallet-id-summary"><span>Your Wallet ID</span><strong>{ownWalletId || 'Loading Wallet ID...'}</strong></div><form className="wallet-transfer-form" onSubmit={checkRecipient}><label className="wallet-amount">Recipient Wallet ID<div className="wallet-id-input"><span aria-hidden="true">@WL</span><input value={recipientSuffix} onChange={(event) => { setRecipientSuffix(suffixFromInput(event.target.value)); setError(''); setRecipient(null); transferKeyRef.current = ''; }} maxLength={8} autoComplete="off" aria-label="Recipient letters and numbers" placeholder="ABCD1234" /></div></label>{error && <div className="voice-error" role="alert">{error}</div>}<button className="primary-btn" disabled={recipientBusy || !validRecipientSuffix}>{recipientBusy ? 'Checking recipient...' : 'Check Recipient'}</button></form></section>}
 
-    {showTransferOptions && transferTab === 'show' && ownWalletId && <section className="wallet-transfer-panel wallet-qr-panel"><h2>My Wallet QR Code</h2>{qrLoading ? <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Preparing your wallet QR code...</p></div> : qrData && <><div className="wallet-qr-image-wrap">{qrImage ? <img src={qrImage} alt="Scannable Innovation Labs wallet QR code" /> : <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Generating QR code...</p></div>}</div><strong>{qrData.fullName}</strong><code className="wallet-id-display">{qrData.walletId}</code><p>Let another Innovation Labs user scan this QR code to send you money.</p><div className="wallet-qr-actions">{qrImage && <a className="secondary-btn" href={qrImage} download={`innovation-labs-wallet-${qrData.walletId}.png`}>Download QR</a>}{typeof navigator.share === 'function' && <button className="primary-btn" onClick={shareQr}>Share QR</button>}</div>{qrTransferAvailable ? <button type="button" className="wallet-scan-bar" onClick={() => navigate('/wallet/scan-pay')}><span className="wallet-scan-icon" aria-hidden="true">▦</span><span><strong>Scan Another Wallet QR</strong><small>Scan another user's QR code to send money.</small></span><span className="wallet-scan-chevron" aria-hidden="true">›</span></button> : <section className="wallet-scan-locked" aria-label="Exclusive QR transfer feature"><div className="wallet-scan-locked-heading"><span className="wallet-scan-lock-icon" aria-hidden="true">🔒</span><div><strong>Scan Another Wallet QR</strong><small>{qrAccessChecking ? 'Checking subscription...' : 'Exclusive Feature'}</small></div></div><p>{qrAccessChecking ? 'Checking your plan eligibility...' : qrAccessError || 'Upgrade to the Exclusive plan to unlock QR Code Money Transfers.'}</p>{!qrAccessChecking && (qrAccessError ? <button type="button" className="secondary-btn small" onClick={() => setQrAccessRefresh((value) => value + 1)}>Retry eligibility check</button> : <Link className="primary-btn small" to="/plans">Upgrade to Exclusive</Link>)}</section>}</>}{error && <div className="voice-error" role="alert">{error}</div>}</section>}
+    {showTransferOptions && transferTab === 'show' && <section className="wallet-transfer-panel wallet-qr-panel"><h2>My Wallet QR Code</h2>{qrLoading ? <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Preparing your wallet QR code...</p></div> : qrData && <><div className="wallet-qr-image-wrap">{qrImage ? <img src={qrImage} alt="Scannable Innovation Labs wallet QR code" /> : qrRenderError ? <div className="wallet-transfer-loading" role="alert"><p>{qrRenderError}</p><button type="button" className="secondary-btn small" onClick={() => setQrRetry((value) => value + 1)}>Retry</button></div> : <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Generating QR code...</p></div>}</div><strong>{qrData.fullName}</strong><code className="wallet-id-display">{qrData.walletId}</code><p>Let another Innovation Labs user scan this QR code to send you money.</p><div className="wallet-qr-actions">{qrImage && <a className="secondary-btn" href={qrImage} download={`innovation-labs-wallet-${qrData.walletId}.png`}>Download QR</a>}{typeof navigator.share === 'function' && <button className="primary-btn" onClick={shareQr}>Share QR</button>}</div>{qrTransferAvailable ? <button type="button" className="wallet-scan-bar" onClick={() => navigate('/wallet/scan-pay')}><span className="wallet-scan-icon" aria-hidden="true">▦</span><span><strong>Scan Another Wallet QR</strong><small>Scan another user's QR code to send money.</small></span><span className="wallet-scan-chevron" aria-hidden="true">›</span></button> : <section className="wallet-scan-locked" aria-label="Exclusive QR transfer feature"><div className="wallet-scan-locked-heading"><span className="wallet-scan-lock-icon" aria-hidden="true">🔒</span><div><strong>Scan Another Wallet QR</strong><small>{qrAccessChecking ? 'Checking subscription...' : 'Exclusive Feature'}</small></div></div><p>{qrAccessChecking ? 'Checking your plan eligibility...' : qrAccessError || 'Upgrade to the Exclusive plan to unlock QR Code Money Transfers.'}</p>{!qrAccessChecking && (qrAccessError ? <button type="button" className="secondary-btn small" onClick={() => setQrAccessRefresh((value) => value + 1)}>Retry eligibility check</button> : <Link className="primary-btn small" to="/plans">Upgrade to Exclusive</Link>)}</section>}</>}{error && <div className="voice-error" role="alert">{error}</div>}</section>}
 
 
     {view === 'amount' && recipient && <section className="wallet-transfer-panel"><h2>Transfer Money</h2><div className="wallet-transfer-recipient"><span>Recipient</span><strong>{recipient.walletId}</strong><p>Recipient: {recipient.displayName}</p></div><form className="wallet-transfer-form" onSubmit={continueToConfirmation}><label className="wallet-amount">Amount (₹)<input type="number" inputMode="decimal" min="0.01" step="0.01" value={amount} disabled={checkingBalance} onChange={(event) => { setAmount(event.target.value); setError(''); transferKeyRef.current = ''; }} placeholder="0.00" /></label><div className="wallet-transfer-balance"><span>Available Balance</span><strong>₹{Number(wallet.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{error && <div className="voice-error" role="alert">{error}</div>}<button className="primary-btn" disabled={!amount || checkingBalance}>{checkingBalance ? 'Checking balance...' : 'Continue'}</button></form></section>}

@@ -6625,9 +6625,30 @@ app.post('/api/wallet/transfers/wallet-id', requireSession, requireDatabase, req
   return res.status(503).json({ message: 'A unique Wallet ID could not be generated. Please try again.' });
 });
 
-app.post('/api/wallet/transfers/qr', requireSession, requireDatabase, requireWalletUnlock, async (req, res) => {
+app.post('/api/wallet/transfers/qr', requireSession, requireDatabase, requireWalletUnlock, requireActiveExclusiveQrTransfer, async (req, res) => {
   const wallet = await Wallet.findOne({ userId: req.session.sub }).select('_id walletId +qrReference').lean();
-  if (!wallet?.walletId) return res.status(409).json({ message: 'Create your Wallet ID before generating a QR code.' });
+  if (!wallet) return res.status(409).json({ message: 'Create and unlock your wallet before generating a QR code.' });
+  let walletId = wallet.walletId;
+  if (!walletId) {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    for (let attempt = 0; attempt < 5 && !walletId; attempt += 1) {
+      const letters = Array.from(crypto.randomBytes(4), (value) => alphabet[value % alphabet.length]).join('');
+      const digits = String(crypto.randomInt(0, 10000)).padStart(4, '0');
+      try {
+        const updatedWallet = await Wallet.findOneAndUpdate(
+          { _id: wallet._id, walletId: null },
+          { $set: { walletId: `@WL${letters}${digits}` } },
+          { new: true, runValidators: true },
+        ).select('walletId +qrReference').lean();
+        walletId = updatedWallet?.walletId
+          || (await Wallet.findById(wallet._id).select('walletId +qrReference').lean())?.walletId
+          || '';
+      } catch (error) {
+        if (error.code !== 11000) throw error;
+      }
+    }
+  }
+  if (!walletId) return res.status(503).json({ message: 'A unique Wallet ID could not be prepared. Please try again.' });
 
   let qrReference = wallet.qrReference;
   for (let attempt = 0; !qrReference && attempt < 3; attempt += 1) {
@@ -6651,7 +6672,7 @@ app.post('/api/wallet/transfers/qr', requireSession, requireDatabase, requireWal
   const owner = await User.findOne({ googleId: req.session.sub }).select('name').lean();
   if (!owner) return res.status(404).json({ message: 'Your account could not be found.' });
   return res.json({
-    walletId: wallet.walletId,
+    walletId,
     fullName: safeRecipientName(owner.name),
     qrPayload: `ILW1:${qrReference}`,
   });
