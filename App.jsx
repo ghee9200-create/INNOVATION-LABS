@@ -1,8 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, Route, Routes, useNavigate, useLocation, useParams, useSearchParams } from 'react-router-dom';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, Navigate, Route, Routes, useNavigate, useLocation, useParams, useSearchParams } from 'react-router-dom';
+import { AdminInquiriesPage, AdminInquiryChatPage, InquiryPage, NotOrderedPage } from './InquiryPage';
+import PoliciesPage from './Policies';
+import AboutUsPage from './AboutUs';
+import { formatEstimatedDelivery } from './deliveryDate';
+import { getOrderItemQuantities } from './cancellationRefund';
+import QRCode from 'qrcode';
+import innovationLabsLogo from './Innovation Labs logo.png';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
+const AdminSessionContext = createContext({ auth: null, onSignOut: () => {} });
+const SESSION_STATE_EVENT = 'innovation:session-state';
+const PLAN_DISPLAY_NAMES = { Starter: 'Starter', Medium: 'Plus', Premium: 'Pro', Exclusive: 'Exclusive' };
+const displayPlanName = (plan) => PLAN_DISPLAY_NAMES[plan] || plan || '';
+const displayPlanText = (text) => String(text || '')
+  .replace(/\bMedium\b/g, 'Plus')
+  .replace(/\bPremium\b/g, 'Pro')
+  .replace(/\bAlpha\b/g, 'Plus')
+  .replace(/\bBeta\b/g, 'Pro')
+  .replace(/\bTheta\b/g, 'Exclusive');
+const isNonNegativeAmount = (value) => value !== null && value !== undefined && value !== ''
+  && Number.isFinite(Number(value)) && Number(value) >= 0;
 let googleIdentityInitialized = false;
+let activeGoogleLoginCallback = null;
 
 const SOCIAL_LINKS = {
   whatsapp: '',
@@ -15,7 +35,7 @@ const SOCIAL_LINKS = {
 
 const FOOTER_POLICY_LINKS = {
   privacy: '',
-  terms: '',
+  terms: '/policies#terms',
   refund: '',
   shipping: '',
   contact: '',
@@ -59,7 +79,7 @@ const mergeBrowsingHistory = (...groups) => {
     .slice(0, browsingHistoryLimit);
 };
 
-const deliveryFor = (subtotal) => (subtotal > 800 ? 0 : subtotal > 0 ? 40 : 0);
+const deliveryFor = (subtotal) => (subtotal >= 500 ? 0 : subtotal > 0 ? 40 : 0);
 const maxCartQuantity = (item) => item.discountOfferId && item.availableQuantity != null
   ? Math.max(0, Math.min(99, Math.floor(Number(item.availableQuantity))))
   : item.inventoryProduct && item.stock != null && Number.isFinite(Number(item.stock))
@@ -123,8 +143,20 @@ const requestApi = async (url, options = {}) => {
   });
   const result = await parseJsonSafely(response);
   if (!response.ok) {
-    const error = new Error(result?.message || `Request failed with status ${response.status}.`);
+    if (typeof window !== 'undefined' && (
+      response.status === 401 && !result?.message
+      || response.status === 403 && ['ACCOUNT_RESTRICTED', 'AGE_VERIFICATION_REQUIRED'].includes(result?.code)
+    )) {
+      window.dispatchEvent(new CustomEvent(SESSION_STATE_EVENT, {
+        detail: { status: response.status, code: result?.code, message: result?.message },
+      }));
+    }
+    const error = new Error(displayPlanText(result?.message || `Request failed with status ${response.status}.`));
     error.status = response.status;
+    error.code = result?.code;
+    error.availableBalance = result?.availableBalance;
+    error.availableBalancePaise = result?.availableBalancePaise;
+    error.requiredAmountPaise = result?.requiredAmountPaise;
     throw error;
   }
   return result;
@@ -188,20 +220,104 @@ const normalizeOrderRecord = (order) => ({
   orderStatus: order.orderStatus || 'Processing',
 });
 
+function OrderItemStatusList({
+  items,
+  orderStatus = 'Processing',
+  cancellationEvents = [],
+  currentSubscription,
+}) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const subscriptionSummary = currentSubscription
+    || safeItems.find((item) => item.adminCurrentSubscription)?.adminCurrentSubscription;
+  const itemRows = safeItems.flatMap((item, index) => {
+    const { activeQuantity, cancelledQuantity } = getOrderItemQuantities(item);
+    const name = item.name || item.productName || 'Product';
+    const price = Number(item.price || 0);
+    const fulfillmentStatus = item.fulfillmentStatus || orderStatus || 'Processing';
+    const rows = [];
+
+    if (activeQuantity > 0) {
+      rows.push(
+        <li className="order-item-status-row" key={`${item.id || name}-${index}-active`}>
+          <span>
+            {name} × {activeQuantity}
+            <small className="order-item-status-meta">
+              <span className="order-item-status-badge is-active">Active</span>
+              <span>Fulfillment: {fulfillmentStatus}</span>
+            </small>
+          </span>
+          <strong>₹{(price * activeQuantity).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+        </li>,
+      );
+    }
+
+    if (cancelledQuantity > 0) {
+      const savedCancellations = item.cancellations || [];
+      const cancellationHistory = savedCancellations.length ? savedCancellations : cancellationEvents.flatMap((event) => (
+        (event.items || [])
+          .filter((cancelledItem) => Number(cancelledItem.itemIndex) === index)
+          .map((cancelledItem) => ({
+            ...event,
+            quantity: cancelledItem.quantity,
+            cancelledAt: event.createdAt,
+          }))
+      ));
+      const cancellationDetails = cancellationHistory.map((cancellation, cancellationIndex) => (
+        <span className="order-item-cancellation-detail" key={`${cancellation.cancellationId || cancellationIndex}`}>
+          {cancellation.cancelledAt && `Cancelled ${new Date(cancellation.cancelledAt).toLocaleString()}`}
+          {cancellation.reason && ` · ${cancellation.reason}`}
+        </span>
+      ));
+      rows.push(
+        <li className="order-item-status-row is-cancelled" key={`${item.id || name}-${index}-cancelled`}>
+          <span>
+            {name} × {cancelledQuantity}
+            <small className="order-item-status-meta">
+              <span className="order-item-status-badge is-cancelled">Cancelled</span>
+              <span>This item has been cancelled.</span>
+              {cancellationDetails}
+            </small>
+          </span>
+          <strong>₹{(price * cancelledQuantity).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+        </li>,
+      );
+    }
+
+    return rows;
+  });
+
+  return <>
+    {subscriptionSummary && <div className="order-row admin-current-subscription">
+      <span>Current Subscription</span>
+      <strong>
+        {subscriptionSummary.displayName || 'No Active Subscription'}
+        {subscriptionSummary.expiryDate && <small>{subscriptionSummary.status === 'Active' ? 'Expires' : 'Expired'} {new Date(subscriptionSummary.expiryDate).toLocaleDateString()}</small>}
+      </strong>
+    </div>}
+    {itemRows.length
+      ? <ul className="order-product-list order-item-status-list">{itemRows}</ul>
+      : <p>No product details are available.</p>}
+  </>;
+}
+
 function App() {
   const [cart, setCart] = useState([]);
   const [wishlist, setWishlist] = useState([]);
   const [appliedDiscount, setAppliedDiscount] = useState(null);
   const [auth, setAuth] = useState(null);
+  const [ageVerificationSuccess, setAgeVerificationSuccess] = useState(false);
+  const [ageVerificationError, setAgeVerificationError] = useState('');
   const [catalog, setCatalog] = useState([]);
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState('');
   const [browsingHistory, setBrowsingHistory] = useState([]);
+  const [browsingSearchHistory, setBrowsingSearchHistory] = useState([]);
   const [browsingHistoryLoading, setBrowsingHistoryLoading] = useState(true);
   const [browsingHistoryError, setBrowsingHistoryError] = useState('');
   const [aiOpenSignal, setAiOpenSignal] = useState(0);
   const [cartOwnerId, setCartOwnerId] = useState(null);
   const [cartError, setCartError] = useState('');
+  const [cartPriceNotice, setCartPriceNotice] = useState('');
   const [authLoading, setAuthLoading] = useState(true);
   const [subscriptionData, setSubscriptionData] = useState(null);
   const [aiEntitlementVersion, setAiEntitlementVersion] = useState(0);
@@ -227,20 +343,33 @@ function App() {
   const [selectedService, setSelectedService] = useState('parts');
   const [projectPreferences, setProjectPreferences] = useState('');
   const [checkoutStep, setCheckoutStep] = useState(1);
+  const [checkoutAttemptReference, setCheckoutAttemptReference] = useState('');
+  const [checkoutExitIntent, setCheckoutExitIntent] = useState(null);
+  const [checkoutExitLoading, setCheckoutExitLoading] = useState(false);
   const [address, setAddress] = useState({ ...initialAddress });
   const [modal, setModal] = useState({ open: false, kind: '', props: {} });
+  const [adminSignOutConfirm, setAdminSignOutConfirm] = useState(false);
   const [walletAccessVersion, setWalletAccessVersion] = useState(0);
   const [loginAttempted, setLoginAttempted] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
   const reminderCountRef = useRef(0);
   const walletAccessRequestRef = useRef(0);
+  const trackedProductViewsRef = useRef(new Map());
   const aiCartActionKeysRef = useRef(new Set());
   const cartSyncQueueRef = useRef(Promise.resolve());
   const walletPaymentKeyRef = useRef('');
+  const checkoutAttemptRef = useRef('');
+  const checkoutCreationRef = useRef(null);
+  const checkoutIdempotencyRef = useRef('');
 
   const trackProductView = useCallback(async (product) => {
     if (!product?.id) return;
+    const trackingKey = `${auth?.id || 'guest'}:${String(product.id)}`;
+    const now = Date.now();
+    const previousView = trackedProductViewsRef.current.get(trackingKey);
+    if (previousView && now - previousView < 30_000) return;
+    trackedProductViewsRef.current.set(trackingKey, now);
     const viewedAt = new Date().toISOString();
     const entry = {
       productId: String(product.id),
@@ -262,6 +391,47 @@ function App() {
     }
   }, [auth?.id]);
 
+  const trackProductSearch = useCallback(async (term) => {
+    if (!auth || typeof term !== 'string' || term.trim().length < 2) return;
+    try {
+      const result = await requestApi('/api/browsing-history/search', {
+        method: 'POST',
+        body: JSON.stringify({ term: term.trim() }),
+      });
+      setBrowsingSearchHistory((current) => [
+        result.search,
+        ...current.filter((entry) => entry.id !== result.search.id),
+      ].slice(0, 100));
+    } catch (error) {
+      setBrowsingHistoryError(error.message);
+      console.error('Could not record product search history:', error.message);
+    }
+  }, [auth?.id]);
+
+  const verifyAccountAge = async (dateOfBirth) => {
+    setAgeVerificationError('');
+    try {
+      const result = await requestApi('/api/account/age-verification', {
+        method: 'POST',
+        body: JSON.stringify({ dateOfBirth }),
+      });
+      setAuth((current) => current ? {
+        ...current,
+        dateOfBirth: result.dateOfBirth,
+        purchaseAgeEligible: !result.accountRestricted,
+        ageVerificationStatus: result.ageVerificationStatus,
+        accountStatus: result.accountStatus,
+        restrictionReason: result.restrictionReason,
+        restrictedAt: result.restrictedAt,
+      } : current);
+      setAgeVerificationSuccess(!result.accountRestricted);
+      return result;
+    } catch (error) {
+      setAgeVerificationError(error.message || 'Age verification could not be completed.');
+      throw error;
+    }
+  };
+
   const removeProductFromHistory = async (productId) => {
     setBrowsingHistoryError('');
     try {
@@ -274,13 +444,24 @@ function App() {
     }
   };
 
-  const clearBrowsingHistory = async () => {
+  const removeSearchFromHistory = async (id) => {
+    setBrowsingHistoryError('');
+    try {
+      await requestApi(`/api/browsing-history/search/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      setBrowsingSearchHistory((current) => current.filter((entry) => entry.id !== id));
+    } catch (error) {
+      setBrowsingHistoryError(error.message);
+    }
+  };
+
+  const clearHistory = async (type) => {
     setBrowsingHistoryError('');
     try {
       if (auth) {
-        await requestApi('/api/browsing-history', { method: 'DELETE' });
+        await requestApi(`/api/browsing-history?type=${type}`, { method: 'DELETE' });
       }
-      setBrowsingHistory([]);
+      if (type === 'views' || type === 'all') setBrowsingHistory([]);
+      if (type === 'searches' || type === 'all') setBrowsingSearchHistory([]);
     } catch (error) {
       setBrowsingHistoryError(error.message);
     }
@@ -295,27 +476,173 @@ function App() {
   };
 
   useEffect(() => {
-    fetch('/api/auth/me', { credentials: 'include' })
-      .then(async (response) => {
-        if (response.status === 401) return null;
-        if (!response.ok) {
-          const result = await parseJsonSafely(response);
-          throw new Error(result?.message || `Sign-in status check failed with status ${response.status}.`);
+    let active = true;
+    const controller = new AbortController();
+    const restoreSession = async () => {
+      try {
+        let response;
+        try {
+          response = await fetch('/api/auth/me', { credentials: 'include', signal: controller.signal });
+        } catch (error) {
+          if (!active || error.name === 'AbortError') return;
+          setAuth(null);
+          setAccountError(`Your sign-in status could not be checked: ${error.message}`);
+          return;
         }
-        return parseJsonSafely(response);
-      })
-      .then((result) => {
-        setAuth(result?.user ? { ...result.user, requiresAdminVerification: Boolean(result.requiresAdminVerification) } : null);
-        if (result?.requiresAdminVerification) {
+        if (response.status !== 401 && !response.ok) {
+          const result = await parseJsonSafely(response);
+          if (!active) return;
+          setAuth(null);
+          setAccountError(result?.message || `Sign-in status check failed with status ${response.status}.`);
+          return;
+        }
+        const result = response.status === 401 ? null : await parseJsonSafely(response);
+        if (!active) return;
+        const user = result?.user
+          ? { ...result.user, requiresAdminVerification: Boolean(result.requiresAdminVerification) }
+          : null;
+        setAuth(user);
+
+        if (!user) {
+          setSubscriptionData(null);
+          setSubscriptionError('');
+        } else if (result?.requiresAdminVerification && user.ageVerificationStatus === 'verified') {
           setModal({ open: true, kind: 'admin-verification', props: {} });
         }
+      } finally {
+        if (!active) return;
+        setAuthLoading(false);
+      }
+    };
+    restoreSession();
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!auth || auth.accountStatus === 'restricted' || auth.ageVerificationStatus !== 'verified') {
+      setSubscriptionData(null);
+      setSubscriptionLoading(false);
+      setSubscriptionError('');
+      return undefined;
+    }
+
+    let active = true;
+    const controller = new AbortController();
+    setSubscriptionLoading(true);
+    setSubscriptionError('');
+    requestApi('/api/subscription', { signal: controller.signal })
+      .then((subscription) => {
+        if (active) setSubscriptionData(subscription);
       })
       .catch((error) => {
-        setAuth(null);
-        setAccountError(`Your sign-in status could not be checked: ${error.message}`);
+        if (active && error.name !== 'AbortError') {
+          setSubscriptionData(null);
+          setSubscriptionError(`Subscription details could not be verified: ${error.message}`);
+        }
       })
-      .finally(() => setAuthLoading(false));
-  }, []);
+      .finally(() => {
+        if (active) setSubscriptionLoading(false);
+      });
+
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [auth?.id, auth?.accountStatus, auth?.ageVerificationStatus]);
+
+  useEffect(() => {
+    const clearAccountState = () => {
+      setAccountData(null);
+      setOrders([]);
+      setCustomOrders([]);
+      setNotifications([]);
+      setGiftPopupNotification(null);
+      setAdminCustomOrders([]);
+      setRefunds([]);
+      setAdminRefunds([]);
+      setWishlist([]);
+      setSavedAddresses({});
+      setBrowsingHistory([]);
+      setBrowsingSearchHistory([]);
+      setCart([]);
+      setAddress({ ...initialAddress });
+      setAccountLoading(false);
+      setAccountError('');
+      setAccountNotice('');
+      setSubscriptionData(null);
+      setSubscriptionLoading(false);
+      setSubscriptionError('');
+      setModal({ open: false, kind: '', props: {} });
+    };
+    const handleSessionState = (event) => {
+      const { status, code } = event.detail || {};
+      if (status === 401) {
+        clearAccountState();
+        setAuth(null);
+        navigate('/', { replace: true });
+        return;
+      }
+      if (code === 'ACCOUNT_RESTRICTED') {
+        clearAccountState();
+        setAuth((current) => current ? {
+          ...current,
+          accountStatus: 'restricted',
+          ageVerificationStatus: 'restricted',
+        } : current);
+      } else if (code === 'AGE_VERIFICATION_REQUIRED') {
+        clearAccountState();
+        setAuth((current) => current ? { ...current, ageVerificationStatus: 'pending' } : current);
+      }
+    };
+    window.addEventListener(SESSION_STATE_EVENT, handleSessionState);
+    return () => window.removeEventListener(SESSION_STATE_EVENT, handleSessionState);
+  }, [navigate]);
+
+  useEffect(() => {
+    if (!auth?.id || auth.accountStatus === 'restricted' || auth.ageVerificationStatus !== 'verified') return undefined;
+    let active = true;
+    let checking = false;
+    const verifyVisibleSession = async () => {
+      if (!active || checking || document.visibilityState === 'hidden') return;
+      checking = true;
+      try {
+        const result = await requestApi('/api/auth/me');
+        if (!active) return;
+        if (!result?.user) {
+          window.dispatchEvent(new CustomEvent(SESSION_STATE_EVENT, { detail: { status: 401 } }));
+          return;
+        }
+        const user = { ...result.user, requiresAdminVerification: Boolean(result.requiresAdminVerification) };
+        if (user.accountStatus === 'restricted' || user.ageVerificationStatus === 'restricted') {
+          window.dispatchEvent(new CustomEvent(SESSION_STATE_EVENT, {
+            detail: { status: 403, code: 'ACCOUNT_RESTRICTED' },
+          }));
+          return;
+        }
+        setAuth((current) => current?.id === user.id ? { ...current, ...user } : current);
+      } catch (error) {
+        if (active && error.name !== 'AbortError' && error.status !== 401
+          && !['ACCOUNT_RESTRICTED', 'AGE_VERIFICATION_REQUIRED'].includes(error.code)) {
+          setAccountError(`Your session could not be revalidated: ${error.message}`);
+        }
+      } finally {
+        checking = false;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') verifyVisibleSession();
+    };
+    window.addEventListener('focus', verifyVisibleSession);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      active = false;
+      window.removeEventListener('focus', verifyVisibleSession);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [auth?.id, auth?.accountStatus, auth?.ageVerificationStatus]);
 
   useEffect(() => {
     let active = true;
@@ -364,6 +691,7 @@ function App() {
         const result = await requestApi('/api/browsing-history');
         if (!active) return;
         setBrowsingHistory(mergeBrowsingHistory(result.history || [], syncError ? guestEntries : []));
+        setBrowsingSearchHistory(result.searches || []);
         if (syncError) setBrowsingHistoryError(syncError);
       } catch (error) {
         if (!active) return;
@@ -384,15 +712,50 @@ function App() {
         const result = await requestApi('/api/products');
         if (!active || !Array.isArray(result.products)) return;
         const inventoryById = new Map(result.products.map((item) => [item.id, item]));
-        setCart((current) => current.flatMap((cartItem) => {
-          if (cartItem.promoReservationId || cartItem.customOrderId) return [cartItem];
+        const priceChanges = cart.flatMap((cartItem) => {
+          if (cartItem.promoReservationId || cartItem.customOrderId) return [];
           const product = inventoryById.get(cartItem.id);
-          if (!product || !product.inventoryProduct || !Number.isFinite(Number(product.stock))) return [cartItem];
-          const quantity = Math.min(cartItem.quantity, Math.max(0, Math.floor(Number(product.stock))));
-          if (!quantity) return [];
-          if (cartItem.stock === product.stock && cartItem.status === product.status && cartItem.quantity === quantity) return [cartItem];
-          return [{ ...cartItem, inventoryProduct: true, stock: product.stock, status: product.status, quantity }];
-        }));
+          const price = Number(product?.price);
+          return product?.inventoryProduct && Number.isFinite(price) && Number(cartItem.price) !== price
+            ? [`${product.name}: ₹${Number(cartItem.price).toLocaleString('en-IN')} → ₹${price.toLocaleString('en-IN')}`]
+            : [];
+        });
+        if (priceChanges.length) {
+          setCartPriceNotice(`Product price updated (${priceChanges.join(', ')}). Review the updated cart before payment.`);
+          if (location.pathname === '/checkout' && checkoutAttemptRef.current) {
+            checkoutAttemptRef.current = '';
+            setCheckoutAttemptReference('');
+          }
+        }
+        setCart((current) => {
+          const nextCart = current.flatMap((cartItem) => {
+            if (cartItem.promoReservationId || cartItem.customOrderId) return [cartItem];
+            const product = inventoryById.get(cartItem.id);
+            if (!product || !product.inventoryProduct || !Number.isFinite(Number(product.stock))) return [cartItem];
+            const quantity = Math.min(cartItem.quantity, Math.max(0, Math.floor(Number(product.stock))));
+            if (!quantity) return [];
+            const currentPrice = Number(product.price);
+            const priceChanged = Number.isFinite(currentPrice) && Number(cartItem.price) !== currentPrice;
+            if (cartItem.stock === product.stock && cartItem.status === product.status && cartItem.quantity === quantity
+              && !priceChanged && cartItem.name === product.name && cartItem.category === product.category) return [cartItem];
+            return [{
+              ...cartItem,
+              name: product.name,
+              category: product.category,
+              description: product.description,
+              price: Number.isFinite(currentPrice) ? currentPrice : cartItem.price,
+              image: cartItem.image || product.images?.[0] || '',
+              images: product.images || [],
+              inventoryProduct: true,
+              stock: product.stock,
+              status: product.status,
+              quantity,
+            }];
+          });
+          return nextCart.length === current.length && nextCart.every((item, index) => item === current[index])
+            ? current
+            : nextCart;
+        });
       } catch (error) {
         if (active) setCartError(`Cart availability could not be refreshed: ${error.message}`);
       }
@@ -403,7 +766,7 @@ function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, []);
+  }, [cart, location.pathname]);
 
   useEffect(() => {
     if (!auth) {
@@ -420,18 +783,8 @@ function App() {
     }
 
     let active = true;
-    setSubscriptionLoading(true);
-    setSubscriptionError('');
     setAccountLoading(true);
     setAccountError('');
-    requestApi('/api/subscription')
-      .then((result) => { if (active) setSubscriptionData(result); })
-      .catch((error) => {
-        if (!active) return;
-        setSubscriptionError(`Subscription details could not be loaded: ${error.message}`);
-        setAccountError(`Subscription details could not be loaded: ${error.message}`);
-      })
-      .finally(() => { if (active) setSubscriptionLoading(false); });
     requestApi('/api/account')
       .then((result) => {
         if (!active) return;
@@ -583,10 +936,9 @@ function App() {
 
   useEffect(() => {
     const adminRoute = location.pathname === '/admin' || location.pathname.startsWith('/admin/');
-    if (authLoading || !adminRoute) return;
+    if (authLoading || !adminRoute || location.pathname === '/admin/sign-in') return;
     if (!auth) {
-      navigate('/', { replace: true });
-      setModal({ open: true, kind: 'require-signin', props: {} });
+      navigate('/admin/sign-in', { replace: true });
       return;
     }
     if (auth.requiresAdminVerification) {
@@ -599,46 +951,21 @@ function App() {
   useEffect(() => {
     const protectedRoute = location.pathname === '/orders' || location.pathname.startsWith('/account');
     if (authLoading || auth || !protectedRoute) return;
-    navigate('/', { replace: true });
     setModal({ open: true, kind: 'require-signin', props: {} });
-  }, [auth, authLoading, location.pathname, navigate]);
+  }, [auth, authLoading, location.pathname]);
 
   const cartCount = cart.reduce((sum, item) => sum + item.quantity, 0);
-  const subtotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
-
-  const codingCharge = useMemo(() => {
-    const physicalCart = cart.filter((item) => !item.discountOfferId && !item.promoReservationId);
-    if (!physicalCart.length) return 0;
-    if (selectedService === 'coding' || selectedService === 'full') {
-      const partCount = physicalCart.reduce((sum, item) => sum + item.quantity, 0);
-      const extraParts = Math.max(0, partCount - 3);
-      return 700 + extraParts * 300;
-    }
-    return 0;
-  }, [cart, selectedService]);
-
-  const buildingCharge = useMemo(() => {
-    if (!cart.some((item) => !item.discountOfferId && !item.promoReservationId)) return 0;
-    if (selectedService === 'building' || selectedService === 'full') {
-      return 1200;
-    }
-    return 0;
-  }, [selectedService]);
-
-  const physicalSubtotal = cart.reduce((sum, item) => sum + (item.discountOfferId || item.promoReservationId ? 0 : item.price * item.quantity), 0);
-  const deliveryCharge = deliveryFor(physicalSubtotal);
-  const grandTotal = Math.max(0, subtotal + codingCharge + buildingCharge + deliveryCharge - Number(appliedDiscount?.discountAmount || 0));
 
   const openModal = (kind, props = {}) => setModal({ open: true, kind, props });
   const closeModal = () => setModal({ open: false, kind: '', props: {} });
-  const openWalletUnlock = async (fromDirectRoute = false) => {
+  const openWalletUnlock = async (fromDirectRoute = false, returnTo = '/wallet') => {
     if (!auth) {
       openModal('google-login');
       return;
     }
     const requestId = walletAccessRequestRef.current + 1;
     walletAccessRequestRef.current = requestId;
-    openModal('wallet-access-pin', { mode: 'unlock', fromDirectRoute, checking: true });
+    openModal('wallet-access-pin', { mode: 'unlock', fromDirectRoute, returnTo, checking: true });
     try {
       const access = await requestApi('/api/wallet/access');
       if (walletAccessRequestRef.current === requestId) {
@@ -655,16 +982,18 @@ function App() {
       method: 'POST',
       body: JSON.stringify({ pin }),
     });
+    const returnTo = modal.props.returnTo || '/wallet';
     closeModal();
     setWalletAccessVersion((version) => version + 1);
-    navigate('/wallet');
+    navigate(returnTo);
   };
   const cancelWalletUnlock = () => {
     const fromDirectRoute = modal.props.fromDirectRoute;
     walletAccessRequestRef.current += 1;
     closeModal();
-    if (fromDirectRoute && location.pathname === '/wallet') {
-      if (window.history.state?.idx > 0) navigate(-1);
+    if (fromDirectRoute && location.pathname.startsWith('/wallet')) {
+      if (location.pathname !== '/wallet') navigate('/wallet', { replace: true });
+      else if (window.history.state?.idx > 0) navigate(-1);
       else navigate('/', { replace: true });
     }
   };
@@ -890,13 +1219,7 @@ function App() {
     setCart((curr) => curr.filter((cartItem) => cartItem.id !== id));
   };
 
-  const handleLogin = (user) => {
-    setAuth(user);
-    setLoginAttempted(true);
-    closeModal();
-  };
-
-  const handleGoogleSuccess = async (credentialResponse) => {
+  const handleGoogleSuccess = async (credentialResponse, acceptPolicies = false) => {
     if (!credentialResponse?.credential) {
       openModal('payment-error', { title: 'Sign-in issue', message: 'Google sign-in failed. Please try again.' });
       return;
@@ -907,10 +1230,19 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ credential: credentialResponse.credential }),
+        body: JSON.stringify({ credential: credentialResponse.credential, acceptPolicies }),
       });
       const result = await parseJsonSafely(response);
       if (!response.ok) {
+        if (response.status === 403 && result?.code === 'ACCOUNT_RESTRICTED' && result.user) {
+          setAuth({ ...result.user, accountStatus: 'restricted', ageVerificationStatus: 'restricted' });
+          setLoginAttempted(true);
+          closeModal();
+          return { authenticated: true, restricted: true };
+        }
+        if (response.status === 428 && result?.requiresPolicyConsent) {
+          return { requiresPolicyConsent: true, credential: credentialResponse.credential };
+        }
         throw new Error(
           result?.message ||
           (response.status >= 500
@@ -919,13 +1251,12 @@ function App() {
         );
       }
       if (!result?.user) throw new Error('The sign-in service returned an invalid response. Please try again.');
-      if (result.requiresAdminVerification) {
-        setAuth({ ...result.user, requiresAdminVerification: true });
-        setLoginAttempted(true);
-        openModal('admin-verification');
-      } else {
-        handleLogin(result.user);
-      }
+      const nextUser = { ...result.user, requiresAdminVerification: Boolean(result.requiresAdminVerification) };
+      setAuth(nextUser);
+      setLoginAttempted(true);
+      closeModal();
+      if (result.requiresAdminVerification && result.user.ageVerificationStatus === 'verified') openModal('admin-verification');
+      return { authenticated: true };
     } catch (error) {
       openModal('payment-error', {
         title: 'Sign-in issue',
@@ -933,6 +1264,7 @@ function App() {
           ? 'Could not reach the sign-in service. Check that the API server and database are running.'
           : error.message || 'Google sign-in failed. Please try again.',
       });
+      return { authenticated: false };
     }
   };
 
@@ -942,17 +1274,57 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ password }),
       });
-      setAuth(result.user);
+      setAuth((current) => ({ ...current, ...result.user, requiresAdminVerification: false }));
       closeModal();
       navigate('/admin', { replace: true });
     } catch (error) {
-      throw new Error(error.message === 'The admin password you entered is incorrect.'
-        ? error.message
-        : 'Admin verification could not be completed. Please try again.');
+      if (error.status === 429) {
+        setAuth((current) => current ? { ...current, isAdmin: false, requiresAdminVerification: true } : null);
+        closeModal();
+        navigate('/admin/sign-in', { replace: true });
+      }
+      throw new Error(error.message || 'Admin verification could not be completed. Please try again.');
     }
   };
 
-  const handleCheckoutClick = () => {
+  const createCheckoutAttempt = async () => {
+    if (!auth || !cart.length) return null;
+    if (checkoutAttemptRef.current) return checkoutAttemptRef.current;
+    if (checkoutCreationRef.current) return checkoutCreationRef.current;
+    checkoutIdempotencyRef.current ||= globalThis.crypto?.randomUUID?.()
+      || `checkout-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    checkoutCreationRef.current = (async () => {
+      try {
+        const result = await requestApi('/api/checkout-attempts', {
+          method: 'POST',
+          body: JSON.stringify({
+            items: cart,
+            service: selectedService,
+            discountCode: appliedDiscount?.code || '',
+            idempotencyKey: checkoutIdempotencyRef.current,
+          }),
+        });
+        if (result.priceChanges?.length) {
+          setCartPriceNotice(`Product price updated (${result.priceChanges.map((item) => `${item.name}: ₹${Number(item.previousPrice).toLocaleString('en-IN')} → ₹${Number(item.currentPrice).toLocaleString('en-IN')}`).join(', ')}). Review the updated total before payment.`);
+        }
+        if (Array.isArray(result.items)) {
+          const currentById = new Map(result.items.map((item) => [String(item.id), item]));
+          setCart((current) => current.map((cartItem) => {
+            const latest = currentById.get(String(cartItem.id));
+            return latest ? { ...cartItem, name: latest.name, category: latest.category, price: Number(latest.price) } : cartItem;
+          }));
+        }
+        checkoutAttemptRef.current = result.attempt.reference;
+        setCheckoutAttemptReference(result.attempt.reference);
+        return result.attempt.reference;
+      } finally {
+        checkoutCreationRef.current = null;
+      }
+    })();
+    return checkoutCreationRef.current;
+  };
+
+  const handleCheckoutClick = async () => {
     if (!auth) {
       openModal('require-signin');
       return;
@@ -966,9 +1338,91 @@ function App() {
       navigate(`/products/promo-codes/payment/${encodeURIComponent(promoItems[0].promoReservationId)}`);
       return;
     }
+    try {
+      const reference = await createCheckoutAttempt();
+      if (!reference) throw new Error('Checkout could not be recorded. Please try again.');
+    } catch (error) {
+      openModal('payment-error', { title: 'Unable to start checkout', message: error.message });
+      return;
+    }
     setCheckoutStep(cart.every((item) => item.discountOfferId) ? 3 : 1);
     navigate('/checkout');
   };
+
+  const beginCheckoutPayment = async () => {
+    const reference = checkoutAttemptRef.current || await createCheckoutAttempt();
+    if (!reference) throw new Error('Checkout has not been recorded. Please try again.');
+    await requestApi(`/api/checkout-attempts/${encodeURIComponent(reference)}/stage`, {
+      method: 'POST',
+      body: '{}',
+    });
+    return reference;
+  };
+
+  const confirmCheckoutExit = async () => {
+    if (!checkoutExitIntent) return;
+    setCheckoutExitLoading(true);
+    try {
+      if (!checkoutAttemptRef.current) {
+        const reference = await createCheckoutAttempt();
+        if (!reference) throw new Error('Checkout could not be recorded. Stay on this page and try again.');
+      }
+      await requestApi(`/api/checkout-attempts/${encodeURIComponent(checkoutAttemptRef.current)}/exit`, {
+        method: 'POST',
+        body: JSON.stringify({ destination: checkoutExitIntent.destination }),
+      });
+      const destination = checkoutExitIntent.destination;
+      checkoutAttemptRef.current = '';
+      setCheckoutAttemptReference('');
+      checkoutIdempotencyRef.current = '';
+      setCheckoutExitIntent(null);
+      navigate(destination);
+    } catch (error) {
+      openModal('payment-error', { title: 'Checkout was not closed', message: error.message });
+    } finally {
+      setCheckoutExitLoading(false);
+    }
+  };
+
+  const handleCheckoutLinkClick = (event) => {
+    if (location.pathname !== '/checkout' || event.defaultPrevented || event.button !== 0
+      || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const anchor = event.target.closest('a[href]');
+    if (!anchor || anchor.target && anchor.target !== '_self') return;
+    const target = new URL(anchor.href, window.location.href);
+    if (target.origin !== window.location.origin || target.pathname === '/checkout') return;
+    event.preventDefault();
+    event.stopPropagation();
+    setCheckoutExitIntent({ destination: `${target.pathname}${target.search}${target.hash}` });
+  };
+
+  const requestCheckoutExit = (destination) => {
+    if (location.pathname !== '/checkout') {
+      navigate(destination);
+      return;
+    }
+    setCheckoutExitIntent({ destination });
+  };
+
+  useEffect(() => {
+    if (location.pathname !== '/checkout') return undefined;
+    const marker = { ...(window.history.state || {}), checkoutExitGuard: true };
+    window.history.pushState(marker, '', window.location.href);
+    const handleBack = (event) => {
+      event.stopImmediatePropagation();
+      window.history.pushState(marker, '', window.location.href);
+      setCheckoutExitIntent({ destination: '/' });
+    };
+    window.addEventListener('popstate', handleBack, true);
+    return () => window.removeEventListener('popstate', handleBack, true);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (location.pathname !== '/checkout' || !auth || !cart.length || checkoutAttemptRef.current || checkoutCreationRef.current) return;
+    createCheckoutAttempt().catch((error) => {
+      openModal('payment-error', { title: 'Unable to record checkout', message: error.message });
+    });
+  }, [location.pathname, auth?.id, cart, selectedService, appliedDiscount?.code]);
 
   const applyDiscountCode = async (code) => {
     const result = await requestApi('/api/discount-codes/validate', {
@@ -989,6 +1443,7 @@ function App() {
         projectDescription: projectPreferences,
         discountCode: appliedDiscount?.code,
         razorpayId,
+        checkoutReference: checkoutAttemptRef.current || undefined,
       }),
     });
     const savedOrder = normalizeOrderRecord(result.order);
@@ -1031,7 +1486,10 @@ function App() {
     }
     setCart([]);
     setCheckoutStep(4);
-    navigate('/order-placed', { state: { order: savedOrder } });
+    checkoutAttemptRef.current = '';
+    setCheckoutAttemptReference('');
+    checkoutIdempotencyRef.current = '';
+    navigate(`/order-placed/${encodeURIComponent(savedOrder.orderId || savedOrder.id)}`, { state: { order: savedOrder } });
   };
 
   const submitCustomOrder = async (event) => {
@@ -1077,6 +1535,9 @@ function App() {
         : [...current, { ...item, quantity: 1 }];
     });
     setCheckoutStep(1);
+    checkoutAttemptRef.current = '';
+    setCheckoutAttemptReference('');
+    checkoutIdempotencyRef.current = '';
     setSelectedService('parts');
     navigate('/checkout');
   };
@@ -1189,7 +1650,8 @@ function App() {
     markNotificationRead(giftNotification);
   }, [auth, notifications, giftPopupNotification]);
 
-  const handleSignOut = async () => {
+  const handleSignOut = async (returnTo = '/') => {
+    const redirectPath = typeof returnTo === 'string' ? returnTo : '/';
     try {
       await requestApi('/api/auth/logout', { method: 'POST' });
       setAuth(null);
@@ -1206,16 +1668,58 @@ function App() {
       setWishlist([]);
       setSavedAddresses({});
       setBrowsingHistory([]);
+      setBrowsingSearchHistory([]);
       setAddress({ ...initialAddress });
       setSelectedService('parts');
       setProjectPreferences('');
       setCheckoutStep(1);
       setAccountError('');
       closeModal();
-      navigate('/', { replace: true });
+      navigate(redirectPath, { replace: true });
     } catch (error) {
-      setAccountError(`Could not sign out: ${error.message}`);
+      if (error.status === 401) {
+        setAuth(null);
+        setAiOpenSignal(0);
+        setAccountData(null);
+        setCustomOrders([]);
+        setNotifications([]);
+        setGiftPopupNotification(null);
+        setAdminCustomOrders([]);
+        setRefunds([]);
+        setAdminRefunds([]);
+        setCart([]);
+        setOrders([]);
+        setWishlist([]);
+        setSavedAddresses({});
+        setBrowsingHistory([]);
+        setBrowsingSearchHistory([]);
+        setAddress({ ...initialAddress });
+        setSelectedService('parts');
+        setProjectPreferences('');
+        setCheckoutStep(1);
+        setAccountError('');
+        closeModal();
+        navigate(redirectPath, { replace: true });
+      } else {
+        setAccountError('Could not sign out. Please try again.');
+      }
     }
+  };
+
+  const refreshAccountOrders = useCallback(async () => {
+    try {
+      const result = await requestApi('/api/account');
+      setOrders((result.orders || []).map(normalizeOrderRecord));
+      setAccountData((current) => ({ ...(current || {}), serverNow: result.serverNow || current?.serverNow }));
+    } catch (refreshError) {
+      setAccountError(`Could not refresh order delivery estimates: ${refreshError.message}`);
+    }
+  }, []);
+
+  const requestAdminSignOut = () => setAdminSignOutConfirm(true);
+  const confirmAdminSignOut = async () => {
+    setAdminSignOutConfirm(false);
+    await handleSignOut('/');
   };
 
   const handleRefundSubmitted = (refund) => {
@@ -1239,19 +1743,22 @@ function App() {
     return savedOrder;
   };
 
-  const cancelWalletOrder = async (order, reason, idempotencyKey) => {
+  const cancelWalletOrder = async (order, reason, idempotencyKey, items) => {
     const orderId = order.orderId || order.id;
     const result = await requestApi(`/api/orders/${encodeURIComponent(orderId)}/cancel`, {
       method: 'POST',
-      body: JSON.stringify({ reason, idempotencyKey }),
+      body: JSON.stringify({ reason, idempotencyKey, items }),
     });
     const normalized = normalizeOrderRecord(result.order);
+    const hasCancellableItemsRemaining = (result.order.items || []).some((item) =>
+      item.cancellable !== false && Number(item.cancelledQuantity || 0) < Number(item.quantity || 0));
     const updateOrder = (current) => (current.orderId || current.id) === orderId
-      ? { ...current, ...normalized, cancelEligible: false, refundEligible: false }
+      ? { ...current, ...normalized, cancelEligible: hasCancellableItemsRemaining && !result.cancellation.complete, refundEligible: false }
       : current;
     setOrders((current) => current.map(updateOrder));
     setAccountData((current) => current ? { ...current, orders: current.orders.map(updateOrder) } : current);
     openModal('order-cancel-success', { order: normalized, cancellation: result.cancellation, wallet: result.wallet });
+    await refreshAccountOrders();
   };
 
   const handleAdminRefundUpdated = (refund) => {
@@ -1260,11 +1767,12 @@ function App() {
 
   const payWithWallet = async (pin) => {
     const projectDescription = projectPreferences || '';
+    await beginCheckoutPayment();
     const idempotencyKey = walletPaymentKeyRef.current || (globalThis.crypto?.randomUUID?.() || `checkout-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
     walletPaymentKeyRef.current = idempotencyKey;
     const result = await requestApi('/api/wallet/pay', {
       method: 'POST',
-      body: JSON.stringify({ items: cart, address: cart.some((item) => !item.discountOfferId) ? address : undefined, service: selectedService, projectDescription, pin, idempotencyKey, discountCode: appliedDiscount?.code }),
+      body: JSON.stringify({ items: cart, address: cart.some((item) => !item.discountOfferId) ? address : undefined, service: selectedService, projectDescription, pin, idempotencyKey, discountCode: appliedDiscount?.code, checkoutReference: checkoutAttemptRef.current || undefined }),
     });
     const paidOrder = { ...normalizeOrderRecord(result.order), paymentMethod: 'Wallet', walletBalanceAfter: result.wallet.balance };
     setOrders((current) => [paidOrder, ...current.filter((order) => order.id !== paidOrder.id)]);
@@ -1273,10 +1781,13 @@ function App() {
       orders: [paidOrder, ...(current.orders || []).filter((order) => order.orderId !== paidOrder.id)],
     } : current);
     walletPaymentKeyRef.current = '';
+    checkoutAttemptRef.current = '';
+    setCheckoutAttemptReference('');
+    checkoutIdempotencyRef.current = '';
     setCart([]);
     setAppliedDiscount(null);
     closeModal();
-    navigate('/order-placed', { state: { order: paidOrder } });
+    navigate(`/order-placed/${encodeURIComponent(paidOrder.orderId || paidOrder.id)}`, { state: { order: paidOrder } });
   };
 
   const handleRazorpay = async () => {
@@ -1285,11 +1796,22 @@ function App() {
       return;
     }
 
-    const amount = Math.round(grandTotal * 100);
+    let razorpayOrder;
+    try {
+      const reference = await beginCheckoutPayment();
+      razorpayOrder = await requestApi(`/api/checkout-attempts/${encodeURIComponent(reference)}/razorpay/order`, {
+        method: 'POST',
+        body: '{}',
+      });
+    } catch (error) {
+      openModal('payment-error', { title: 'Checkout could not continue', message: error.message });
+      return;
+    }
     const options = {
-      key: 'rzp_test_dummykey',
-      amount,
-      currency: 'INR',
+      key: razorpayOrder.keyId,
+      order_id: razorpayOrder.orderId,
+      amount: razorpayOrder.amountPaise,
+      currency: razorpayOrder.currency,
       name: 'Innovation Labs',
       description: 'Project Purchase',
       handler: async function (response) {
@@ -1306,7 +1828,10 @@ function App() {
         }
         setCart([]);
         setAppliedDiscount(null);
-        navigate('/order-placed', { state: { order: savedOrder } });
+        checkoutAttemptRef.current = '';
+        setCheckoutAttemptReference('');
+        checkoutIdempotencyRef.current = '';
+        navigate(`/order-placed/${encodeURIComponent(savedOrder.orderId || savedOrder.id)}`, { state: { order: savedOrder } });
       },
       prefill: {
         name: auth?.name || '',
@@ -1331,20 +1856,45 @@ function App() {
     return result;
   };
 
+  const isAdminArea = location.pathname === '/admin' || location.pathname.startsWith('/admin/');
+  if (authLoading) return <AccountLoadingPage />;
+  if (ageVerificationSuccess) {
+    return <AgeVerificationSuccessPage onComplete={() => {
+      setAgeVerificationSuccess(false);
+      if (auth?.requiresAdminVerification) openModal('admin-verification');
+      else navigate('/', { replace: true });
+    }} />;
+  }
+  if (auth?.accountStatus === 'restricted' || auth?.ageVerificationStatus === 'restricted') {
+    return <RestrictedAccountPage onSignOut={() => handleSignOut('/')} />;
+  }
+  if (auth && auth.ageVerificationStatus !== 'verified') {
+    return <AgeVerificationPage
+      error={ageVerificationError}
+      onVerify={verifyAccountAge}
+    />;
+  }
   return (
-    <>
-      <Header
+    <AdminSessionContext.Provider value={{ auth, onSignOut: requestAdminSignOut }}>
+    <div className="app-route-shell" onClickCapture={handleCheckoutLinkClick}>
+      {!isAdminArea && <Header
         auth={auth}
         cartCount={cartCount}
         onSignIn={() => openModal('google-login')}
         onAccount={() => navigate('/account')}
         onWallet={() => openWalletUnlock()}
         onOpenCart={() => navigate('/cart')}
-      />
-      <TrialExpirationWarning auth={auth} />
-      {!auth && !authLoading && accountError && <div className="container"><div className="alert-box" role="alert">{accountError} <button type="button" className="secondary-btn small" onClick={() => window.location.reload()}>Retry</button></div></div>}
+        onRouteNavigation={requestCheckoutExit}
+      />}
+      {!isAdminArea && <TrialExpirationWarning auth={auth} />}
+      {!isAdminArea && <SubscriptionLifecycleWarning auth={auth} />}
+      {!isAdminArea && !auth && !authLoading && accountError && <div className="container"><div className="alert-box" role="alert">{accountError} <button type="button" className="secondary-btn small" onClick={() => window.location.reload()}>Retry</button></div></div>}
 
       <Routes>
+        <Route path="/admin/sign-in" element={authLoading ? <AdminLoadingPage /> : auth?.isAdmin ? <Navigate to="/admin" replace /> : <AdminSignInPage auth={auth} onSignIn={() => openModal('google-login')} onSignOut={() => handleSignOut('/admin/sign-in')} />} />
+        <Route path="/inquiry" element={<InquiryPage auth={auth} onSignIn={() => openModal('google-login')} />} />
+        <Route path="/policies" element={<PoliciesPage />} />
+        <Route path="/about-us" element={<AboutUsPage />} />
         <Route path="/" element={<HomePage
           catalog={catalog}
           catalogLoading={catalogLoading}
@@ -1355,21 +1905,28 @@ function App() {
           onBuild={openAIBuilder}
           onExploreAI={() => navigate('/plans')}
         />} />
-        <Route path="/history" element={<HistoryPage
+        <Route path="/history" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <HistoryPage
           history={browsingHistory}
+          searches={browsingSearchHistory}
           catalog={catalog}
           loading={browsingHistoryLoading}
           error={browsingHistoryError}
           onRemove={removeProductFromHistory}
-          onClear={clearBrowsingHistory}
+          onClearBrowsing={() => clearHistory('views')}
+          onClearSearch={() => clearHistory('searches')}
+          onClearAll={() => clearHistory('all')}
+          onSearchAgain={(term) => navigate('/products', { state: { productSearchQuery: term } })}
+          onRemoveSearch={removeSearchFromHistory}
         />} />
-        <Route path="/plans" element={<PlansPage auth={auth} onSignIn={() => openModal('google-login')} onSubscriptionChange={() => refreshAppSubscription().catch((error) => setAccountError(`Subscription details could not be refreshed: ${error.message}`))} />} />
+        <Route path="/plans" element={<PlansPage auth={auth} onSignIn={() => openModal('google-login')} />} />
+        <Route path="/plans/duration/:plan" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <SubscriptionDurationPage auth={auth} />} />
+        <Route path="/plans/checkout/:plan" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <SubscriptionCheckoutPage auth={auth} onSubscriptionChange={refreshAppSubscription} />} />
         <Route path="/plans/ai-trial/:plan" element={<AITrialActivationPage auth={auth} onSignIn={() => openModal('google-login')} onActivation={refreshAppSubscription} />} />
         <Route path="/products/:productId" element={<ProductDetailsPage auth={auth} onSignIn={() => openModal('google-login')} onAddToCart={handleAddToCart} onAddWishlistItem={addWishlistItem} onTrackViewed={trackProductView} wishlist={wishlist} cart={cart} />} />
-        <Route path="/products" element={<ProductsPage cart={cart} wishlist={wishlist} auth={auth} onSignIn={() => openModal('google-login')} onTrackViewed={trackProductView} onAddToCart={handleAddToCart} onAddWishlistItem={addWishlistItem} onQty={updateQuantity} onAddPromoToCart={handleAddPromoToCart} />} />
-            <Route path="/discount-codes" element={authLoading ? <AccountLoadingPage /> : auth ? <ProductsPage initialCategory="Discount Promo Codes" cart={cart} wishlist={wishlist} auth={auth} onSignIn={() => openModal('google-login')} onTrackViewed={trackProductView} onAddToCart={handleAddToCart} onAddWishlistItem={addWishlistItem} onQty={updateQuantity} onAddPromoToCart={handleAddPromoToCart} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/products" element={<ProductsPage cart={cart} wishlist={wishlist} auth={auth} onSignIn={() => openModal('google-login')} onTrackViewed={trackProductView} onTrackSearch={trackProductSearch} onAddToCart={handleAddToCart} onAddWishlistItem={addWishlistItem} onQty={updateQuantity} onAddPromoToCart={handleAddPromoToCart} />} />
+            <Route path="/discount-codes" element={authLoading ? <AccountLoadingPage /> : auth ? <ProductsPage initialCategory="Discount Promo Codes" cart={cart} wishlist={wishlist} auth={auth} onSignIn={() => openModal('google-login')} onTrackViewed={trackProductView} onTrackSearch={trackProductSearch} onAddToCart={handleAddToCart} onAddWishlistItem={addWishlistItem} onQty={updateQuantity} onAddPromoToCart={handleAddPromoToCart} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/products/promo-codes/payment/:reservationId" element={authLoading ? <AccountLoadingPage /> : auth ? <PromoCodePaymentPage auth={auth} address={address} setAddress={setAddress} savedAddresses={savedAddresses} saveAddress={saveAddress} savePromoRecipientAddress={savePromoRecipientAddress} nextPromoReservationId={cart.filter((item) => item.promoReservationId)[1]?.promoReservationId} onPurchased={handlePromoCodePurchased} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
-        <Route path="/cart" element={<CartPage cart={cart} cartError={cartError} appliedDiscount={appliedDiscount} onApplyDiscount={applyDiscountCode} onDiscountValidated={(result) => setAppliedDiscount({ code: result.code, discountAmount: Number(result.discountAmount), discountLabel: result.discountLabel, offerName: result.offerName })} onRemoveDiscount={() => setAppliedDiscount(null)} onRemove={removeFromCart} onQty={updateQuantity} onMoveToWishlist={moveCartItemToWishlist} onCheckout={handleCheckoutClick} />} />
+        <Route path="/cart" element={<CartPage cart={cart} cartError={cartError} cartPriceNotice={cartPriceNotice} onDismissPriceNotice={() => setCartPriceNotice('')} appliedDiscount={appliedDiscount} onApplyDiscount={applyDiscountCode} onDiscountValidated={(result) => setAppliedDiscount({ code: result.code, discountAmount: Number(result.discountAmount), discountLabel: result.discountLabel, offerName: result.offerName })} onRemoveDiscount={() => setAppliedDiscount(null)} onRemove={removeFromCart} onQty={updateQuantity} onMoveToWishlist={moveCartItemToWishlist} onCheckout={handleCheckoutClick} />} />
         <Route path="/custom-order" element={<CustomOrdersPage
           auth={auth}
           customOrders={customOrders}
@@ -1390,6 +1947,12 @@ function App() {
           onAccept={acceptCustomOrder}
           onReject={rejectCustomOrder}
         /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/inquiries" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/inquiries"><AdminInquiriesPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/inquiries/next" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/inquiries"><AdminInquiriesPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/inquiries/chat/:sessionId" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/inquiries"><AdminInquiryChatPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/not-ordered" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/not-ordered"><NotOrderedPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/account-restrictions" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/account-restrictions"><AdminAccountRestrictionsPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/subscription-finished" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/subscription-finished"><AdminSubscriptionFinishedPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin"><AdminDashboardPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/orders" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/orders"><AdminOrdersPageV2 auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/orders/:orderId" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/orders"><AdminOrderDetailPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
@@ -1401,13 +1964,16 @@ function App() {
         <Route path="/admin/inventory" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/inventory"><InventoryPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/settings" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/settings"><AdminSettingsPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/credit-purchases" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/credit-purchases"><AdminCreditPurchasesPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/ai-bill-credits" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/ai-bill-credits"><AdminAIBillCreditsPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/promo-codes" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/promo-codes"><AdminPromoCodesPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
-        <Route path="/wallet" element={<WalletPage auth={auth} accessVersion={walletAccessVersion} onRequestUnlock={() => openWalletUnlock(true)} />} />
+        <Route path="/wallet" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletPage auth={auth} accessVersion={walletAccessVersion} onRequestUnlock={() => openWalletUnlock(true)} />} />
+        <Route path="/wallet/scan-pay" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletQrTransferPage auth={auth} accessVersion={walletAccessVersion} onRequestUnlock={() => openWalletUnlock(true, '/wallet/scan-pay')} />} />
         <Route path="/refund/:orderId" element={authLoading ? <AccountLoadingPage /> : auth ? <RefundRequestPage auth={auth} onSubmitted={handleRefundSubmitted} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
-        <Route path="/refunds/:id" element={<RefundStatusPage auth={auth} />} />
+        <Route path="/refunds/:id" element={authLoading ? <AccountLoadingPage /> : auth ? <RefundStatusPage auth={auth} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/refunds" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/refunds"><AdminRefundsPage auth={auth} refunds={adminRefunds} error={adminOrderError} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/refunds/:id" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/refunds"><AdminRefundDetailPage auth={auth} onUpdated={handleAdminRefundUpdated} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/account/ai-credits/add" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : subscriptionLoading || !subscriptionData && !subscriptionError ? <AccountLoadingPage /> : subscriptionError ? <main className="page-shell"><div className="container narrow-container"><div className="alert-box" role="alert">{subscriptionError}</div></div></main> : subscriptionData?.current?.plan === 'Exclusive' ? <AddCreditsPage /> : <main className="page-shell"><div className="container narrow-container"><div className="alert-box" role="status">Add Credits is available to active Exclusive subscribers only.</div><Link className="secondary-btn" to="/plans">View Plans &amp; AI</Link></div></main>} />
+        <Route path="/account/ai-bills/add" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <AddBillsPage />} />
         <Route path="/account/:section?" element={authLoading ? (
           <AccountLoadingPage />
         ) : auth ? (
@@ -1415,6 +1981,7 @@ function App() {
             user={auth}
             canAddCredits={subscriptionData?.current?.plan === 'Exclusive'}
             accountData={accountData}
+            onRefreshOrders={refreshAccountOrders}
             wishlist={wishlist}
             onAddWishlistItem={addWishlistItem}
             onRemoveWishlistItem={removeWishlistItem}
@@ -1425,6 +1992,17 @@ function App() {
             customOrders={customOrders}
             notifications={notifications}
             address={accountData?.profile?.address || initialAddress}
+            browsingHistory={browsingHistory}
+            browsingSearchHistory={browsingSearchHistory}
+            browsingHistoryCatalog={catalog}
+            browsingHistoryLoading={browsingHistoryLoading}
+            browsingHistoryError={browsingHistoryError}
+            onRemoveBrowsingHistory={removeProductFromHistory}
+            onRemoveSearchHistory={removeSearchFromHistory}
+            onClearBrowsingHistory={() => clearHistory('views')}
+            onClearSearchHistory={() => clearHistory('searches')}
+            onClearAllHistory={() => clearHistory('all')}
+            onSearchHistoryAgain={(term) => navigate('/products', { state: { productSearchQuery: term } })}
             loading={accountLoading}
             error={accountError}
             notice={accountNotice}
@@ -1453,33 +2031,35 @@ function App() {
           onOpenProjectModal={openProjectPreferencesModal}
           onPay={handleRazorpay}
           onWalletPay={() => openModal('wallet-payment-pin')}
-          paymentTotal={grandTotal}
+          onRequestExit={requestCheckoutExit}
+          checkoutReference={checkoutAttemptReference}
+          cartPriceNotice={cartPriceNotice}
+          onDismissPriceNotice={() => setCartPriceNotice('')}
           appliedDiscount={appliedDiscount}
-          codingCharge={codingCharge}
-          buildingCharge={buildingCharge}
-          deliveryCharge={deliveryCharge}
-          subtotal={subtotal}
           handlePlaceOrder={handlePlaceOrder}
           onLogin={() => openModal('google-login')}
           savedAddresses={savedAddresses}
           authEmail={auth?.email}
         />} />
         <Route path="/orders" element={authLoading ? <AccountLoadingPage /> : (
-          <OrdersPage
+          auth ? <OrdersPage
             orders={orders}
             auth={auth}
             loading={accountLoading}
             error={accountError}
-            onSignIn={() => openModal('google-login')}
-            onCancelOrder={(order) => openModal('order-cancel', { order })}
-          />
+          serverNow={accountData?.serverNow}
+          onRefreshOrders={refreshAccountOrders}
+          onSignIn={() => openModal('google-login')}
+          onCancelOrder={(order) => openModal('order-cancel', { order })}
+          /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />
         )} />
-        <Route path="/order-placed" element={<OrderPlacedPage order={location.state?.order || orders[0]} />} />
+        <Route path="/checkout/result/:reference" element={authLoading ? <AccountLoadingPage /> : auth ? <CheckoutPaymentResultPage /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/order-placed/:orderId?" element={authLoading ? <AccountLoadingPage /> : auth ? <OrderPlacedPage order={location.state?.order} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
       </Routes>
 
-      <SiteFooter />
+      {!isAdminArea && <SiteFooter />}
 
-      {auth && (
+      {!isAdminArea && auth && (
         <AIAssistant
           auth={auth}
           plan={subscriptionData?.current?.plan || 'Starter'}
@@ -1489,13 +2069,13 @@ function App() {
           onAddComponentsToCart={addProjectComponentsToCart}
           onPrepareCheckout={prepareAiCheckout}
           onOpenCustomBuilding={openCustomBuilding}
-          onNavigate={navigate}
+          onNavigate={requestCheckoutExit}
           openSignal={aiOpenSignal}
         />
       )}
 
       {modal.open && modal.kind !== 'wallet-access-pin' && (
-        <Modal onClose={closeModal}>
+        <Modal onClose={closeModal} labelledBy={modal.kind === 'wallet-payment-pin' ? 'wallet-payment-pin-title' : undefined}>
           {modal.kind === 'google-login' && (
             <GoogleLoginModal
               onSuccess={handleGoogleSuccess}
@@ -1505,7 +2085,7 @@ function App() {
           {modal.kind === 'admin-verification' && (
             <AdminVerificationModal onCancel={() => {
               closeModal();
-              if (location.pathname === '/admin' || location.pathname.startsWith('/admin/')) navigate('/account', { replace: true });
+              navigate('/admin/sign-in', { replace: true });
             }} onVerify={verifyAdminPassword} />
           )}
 
@@ -1533,7 +2113,17 @@ function App() {
           )}
 
           {modal.kind === 'payment-error' && (
-            <PaymentErrorModal message={modal.props.message} onClose={closeModal} />
+            <PaymentErrorModal
+              title={modal.props.title}
+              message={modal.props.message}
+              onClose={closeModal}
+              onViewResult={() => {
+                const reference = checkoutAttemptReference || checkoutAttemptRef.current;
+                closeModal();
+                if (reference) navigate(`/checkout/result/${encodeURIComponent(reference)}`);
+              }}
+              hasResult={Boolean(checkoutAttemptReference || checkoutAttemptRef.current)}
+            />
           )}
           {modal.kind === 'confirm-custom-order' && (
             <ConfirmCustomOrderModal
@@ -1542,9 +2132,17 @@ function App() {
               onCancel={closeModal}
             />
           )}
-          {modal.kind === 'wallet-payment-pin' && <WalletPinModal onCancel={closeModal} onSubmit={payWithWallet} />}
+          {modal.kind === 'wallet-payment-pin' && <WalletPinModal
+            onCancel={closeModal}
+            onSubmit={payWithWallet}
+            onViewResult={() => {
+              const reference = checkoutAttemptReference || checkoutAttemptRef.current;
+              closeModal();
+              if (reference) navigate(`/checkout/result/${encodeURIComponent(reference)}`);
+            }}
+          />}
           {modal.kind === 'order-cancel' && <OrderCancellationModal order={modal.props.order} onCancel={closeModal} onConfirm={cancelWalletOrder} />}
-          {modal.kind === 'order-cancel-success' && <OrderCancellationSuccessModal {...modal.props} onViewWallet={() => { closeModal(); navigate('/wallet'); }} onViewOrder={() => { const order = modal.props.order; closeModal(); navigate('/order-placed', { state: { order } }); }} />}
+          {modal.kind === 'order-cancel-success' && <OrderCancellationSuccessModal {...modal.props} onViewWallet={() => { closeModal(); navigate('/wallet'); }} onViewOrder={() => { const order = modal.props.order; closeModal(); navigate(`/order-placed/${encodeURIComponent(order.orderId || order.id)}`, { state: { order } }); }} />}
         </Modal>
       )}
       {modal.open && modal.kind === 'wallet-access-pin' && (
@@ -1556,11 +2154,18 @@ function App() {
         />
       )}
       {giftPopupNotification && <PromoGiftReceivedModal notification={giftPopupNotification} onClose={() => setGiftPopupNotification(null)} onView={() => { setGiftPopupNotification(null); navigate('/wallet', { state: { openPromoTab: true } }); }} />}
-    </>
+      {adminSignOutConfirm && <div className="wallet-lock-overlay"><section className="wallet-pin-modal admin-signout-confirm" role="dialog" aria-modal="true" aria-labelledby="admin-signout-title"><h2 id="admin-signout-title">Do you want to sign out?</h2><div className="modal-actions"><button type="button" className="secondary-btn" onClick={() => setAdminSignOutConfirm(false)}>No, Continue</button><button type="button" className="primary-btn" onClick={confirmAdminSignOut}>Yes, Sign Out</button></div></section></div>}
+      {checkoutExitIntent && <div className="wallet-lock-overlay"><section className="wallet-pin-modal checkout-exit-modal" role="dialog" aria-modal="true" aria-labelledby="checkout-exit-title">
+        <h2 id="checkout-exit-title">Do you want to exit the payment page?</h2>
+        <p>Your cart will be kept. If you exit, this checkout attempt will be recorded separately from completed orders.</p>
+        <div className="modal-actions"><button type="button" className="secondary-btn" disabled={checkoutExitLoading} onClick={() => setCheckoutExitIntent(null)}>No, Stay on Page</button><button type="button" className="primary-btn" disabled={checkoutExitLoading} onClick={confirmCheckoutExit}>{checkoutExitLoading ? 'Saving…' : 'Yes, Exit'}</button></div>
+      </section></div>}
+    </div>
+    </AdminSessionContext.Provider>
   );
 }
 
-function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart }) {
+function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart, onRouteNavigation }) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const location = useLocation();
 
@@ -1584,11 +2189,11 @@ function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart }) 
   };
   const openCart = () => {
     closeMobileMenu();
-    onOpenCart();
+    onRouteNavigation('/cart');
   };
   const openAccount = () => {
     closeMobileMenu();
-    onAccount();
+    onRouteNavigation('/account');
   };
   const signIn = () => {
     closeMobileMenu();
@@ -1616,6 +2221,8 @@ function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart }) 
           <Link to="/">Home</Link>
           <Link to="/products">Products</Link>
           <Link to="/plans">Plans &amp; AI</Link>
+          <Link to="/inquiry">Inquiry</Link>
+          <Link to="/about-us">About Us</Link>
           {auth && <Link to="/custom-order">Custom Order</Link>}
           {auth && <button className="nav-link-button" onClick={onWallet}>Wallet</button>}
           {auth?.isAdmin && <Link to="/admin">Admin</Link>}
@@ -1642,6 +2249,8 @@ function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart }) 
           <Link to="/" onClick={closeMobileMenu}>Home</Link>
           <Link to="/products" onClick={closeMobileMenu}>Products</Link>
           <Link to="/plans" onClick={closeMobileMenu}>Plans &amp; AI</Link>
+          <Link to="/inquiry" onClick={closeMobileMenu}>Inquiry</Link>
+          <Link to="/about-us" onClick={closeMobileMenu}>About Us</Link>
           {auth && <Link to="/custom-order" onClick={closeMobileMenu}>Custom Order</Link>}
           {auth && <button type="button" onClick={openWallet}>Wallet</button>}
           {auth?.isAdmin && <Link to="/admin" onClick={closeMobileMenu}>Admin</Link>}
@@ -1663,6 +2272,9 @@ function SiteFooter() {
     { label: 'Products', to: '/products' },
     { label: 'History', to: '/history' },
     { label: 'Plans & AI', to: '/plans' },
+    { label: 'Inquiry', to: '/inquiry' },
+    { label: 'About Us', to: '/about-us' },
+    { label: 'Policies & Terms', to: '/policies' },
     { label: 'Custom Order', to: '/custom-order' },
     { label: 'Wallet', to: '/wallet' },
     { label: 'My Orders', to: '/orders' },
@@ -1880,14 +2492,18 @@ function HomePage({ catalog, catalogLoading, catalogError, browsingHistory, onTr
       <section className="home-final-section">
         <div className="home-container home-final-inner"><span className="home-section-index">07 / WHAT WILL YOU MAKE?</span><div><h2>Your next big idea starts here.</h2><p>Explore the components, tools, and custom solutions that will help you bring it to life.</p></div><div className="home-final-actions"><button className="home-final-btn" onClick={onShopNow}>Explore Products <span aria-hidden="true">↗</span></button><button className="home-secondary-btn" onClick={onBuild}>Start Building</button></div></div>
       </section>
+      <section className="home-inquiry-spotlight">
+        <div className="home-container home-inquiry-inner"><div><span className="home-section-index">08 / HERE TO HELP</span><h2>Have an inquiry? We’re here to help.</h2><p>Book a dedicated support slot, keep track of your token, and talk with our team about your project.</p></div><Link className="home-primary-btn" to="/inquiry">Visit the Inquiry Desk <span aria-hidden="true">↗</span></Link></div>
+      </section>
     </main>
   );
 }
 
-function HistoryPage({ history, catalog, loading, error, onRemove, onClear }) {
+function HistoryPage({ history, searches = [], catalog, loading, error, onRemove, onRemoveSearch, onClearBrowsing, onClearSearch, onClearAll, onSearchAgain, embedded = false }) {
   const navigate = useNavigate();
   const catalogById = new Map(catalog.map((product) => [String(product.id), product]));
   const records = [...history].sort((left, right) => new Date(right.viewedAt) - new Date(left.viewedAt));
+  const searchRecords = [...searches].sort((left, right) => new Date(right.searchedAt) - new Date(left.searchedAt));
   const formatDate = (value) => {
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? 'Date unavailable' : new Intl.DateTimeFormat('en-IN', {
@@ -1896,14 +2512,17 @@ function HistoryPage({ history, catalog, loading, error, onRemove, onClear }) {
     }).format(date);
   };
 
-  return <main className="page-shell browsing-history-page"><div className="container">
+  const HistoryWrapper = embedded ? 'div' : 'main';
+  return <HistoryWrapper className={embedded ? 'account-browsing-history' : 'page-shell browsing-history-page'}><div className={embedded ? 'account-browsing-history-inner' : 'container'}>
     <div className="browsing-history-heading"><div><span className="eyebrow">YOUR PERSONAL PRODUCT JOURNAL</span><h1>Your Discovery Journey</h1><p>Pick up where you left off. Every project begins with an idea.</p></div>
-      {!!records.length && <button type="button" className="secondary-btn" onClick={() => {
-        if (window.confirm('Clear all products from your browsing history? This will not remove any products from the catalogue.')) onClear();
+      {!!(records.length || searchRecords.length) && <button type="button" className="secondary-btn" onClick={() => {
+        if (window.confirm('Clear all browsing and search history? This will not remove orders, payments, wallet transactions, or products.')) onClearAll();
       }}>Clear History</button>}
     </div>
     {error && <div className="alert-box" role="alert">{error}</div>}
-    {loading ? <div className="history-product-grid" aria-label="Loading browsing history">{[0, 1, 2].map((index) => <div className="history-product-card history-skeleton" key={index} aria-hidden="true"><div /><span /><b /><small /></div>)}</div>
+    <section className="browsing-history-section" aria-labelledby="browsing-history-title">
+      <div className="account-section-heading"><h2 id="browsing-history-title">Browsing History</h2>{!!records.length && <button type="button" className="history-remove-btn" onClick={onClearBrowsing}>Clear Browsing History</button>}</div>
+      {loading ? <div className="history-product-grid" aria-label="Loading browsing history">{[0, 1, 2].map((index) => <div className="history-product-card history-skeleton" key={index} aria-hidden="true"><div /><span /><b /><small /></div>)}</div>
       : records.length ? <div className="history-product-grid">{records.map((record) => {
         const product = catalogById.get(String(record.productId)) || record.product || {
           id: record.productId,
@@ -1923,7 +2542,10 @@ function HistoryPage({ history, catalog, loading, error, onRemove, onClear }) {
             <img src={historyProductImage(product)} alt={product.name} loading="lazy" onError={(event) => { event.currentTarget.onerror = null; event.currentTarget.src = fallbackProductImage; }} />
           </Link>}
           <div className="history-product-content"><span className="home-product-category">{product.category || 'Product'}</span><h2>{product.name}</h2>
-            <strong>{product.price != null ? `₹${Number(product.price).toLocaleString('en-IN')}` : 'Price unavailable'}</strong>
+            <strong>{record.priceAtView != null
+              ? `Price when viewed: ₹${Number(record.priceAtView).toLocaleString('en-IN')}`
+              : product.price != null ? `Current price: ₹${Number(product.price).toLocaleString('en-IN')}` : 'Price unavailable'}</strong>
+            <span>{unavailable ? 'Currently unavailable' : `Current availability: ${product.status || 'Check product page'}`}</span>
             <time dateTime={Number.isNaN(viewedDate.getTime()) ? undefined : viewedDate.toISOString()}>Last viewed {formatDate(record.viewedAt)}</time>
             <div className="history-product-actions">
               {!unavailable && <Link className="home-view-btn" to={`/products/${encodeURIComponent(record.productId)}`}>View Product <span aria-hidden="true">↗</span></Link>}
@@ -1931,38 +2553,51 @@ function HistoryPage({ history, catalog, loading, error, onRemove, onClear }) {
             </div>
           </div>
         </article>;
-      })}</div> : <div className="history-empty-state"><span aria-hidden="true">⌕</span><h2>Your next discovery starts here.</h2><p>Products you explore will appear in this history so you can find them again.</p><button type="button" className="home-primary-btn" onClick={() => navigate('/products')}>Explore Products <span aria-hidden="true">↗</span></button></div>}
-  </div></main>;
+      })}</div> : <div className="history-empty-state"><span aria-hidden="true">⌕</span><h2>No browsing activity yet.</h2><p>Products you explore will appear here so you can find them again.</p><button type="button" className="home-primary-btn" onClick={() => navigate('/products')}>Explore Products <span aria-hidden="true">↗</span></button></div>}
+    </section>
+    <section className="browsing-search-history" aria-labelledby="search-history-title">
+      <div className="account-section-heading"><h2 id="search-history-title">Search History</h2>{!!searchRecords.length && <button type="button" className="history-remove-btn" onClick={onClearSearch}>Clear Search History</button>}</div>
+      {searchRecords.length ? <ul>{searchRecords.map((entry) => <li key={entry.id}><span><strong>{entry.term}</strong><time>{formatDate(entry.searchedAt)}</time></span><div className="history-product-actions"><button type="button" className="home-view-btn" onClick={() => onSearchAgain(entry.term)}>Search again</button><button type="button" className="history-remove-btn" onClick={() => onRemoveSearch(entry.id)}>Remove</button></div></li>)}</ul>
+        : <p className="history-empty-message">Your applied product searches will appear here.</p>}
+    </section>
+  </div></HistoryWrapper>;
 }
 
-function PlansPage({ auth, onSignIn, onSubscriptionChange }) {
+let plansPageCache = null;
+
+function PlansPage({ auth, onSignIn }) {
   const navigate = useNavigate();
-  const [plans, setPlans] = useState([]);
+  const [plans, setPlans] = useState(() => plansPageCache || []);
   const [current, setCurrent] = useState(null);
   const [trialStatus, setTrialStatus] = useState(null);
   const [trialPrompt, setTrialPrompt] = useState('');
-  const [selectedPlan, setSelectedPlan] = useState(null);
-  const [paymentMethod, setPaymentMethod] = useState('');
-  const [pin, setPin] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !plansPageCache);
   const [message, setMessage] = useState('');
-  const [activation, setActivation] = useState(null);
 
   useEffect(() => {
     let active = true;
-    Promise.all([
-      requestApi('/api/plans'),
-      auth ? requestApi('/api/subscription') : Promise.resolve(null),
-      auth ? requestApi('/api/ai/trial/status') : Promise.resolve(null),
-    ]).then(([planResult, subscriptionResult, trialResult]) => {
-      if (!active) return;
-      setPlans(planResult.plans || []);
-      setCurrent(subscriptionResult?.current || null);
-      setTrialStatus(trialResult);
-    }).catch((error) => {
-      if (active) setMessage(error.message || 'Plans are temporarily unavailable.');
-    }).finally(() => { if (active) setLoading(false); });
+    if (!plansPageCache) {
+      requestApi('/api/plans').then((planResult) => {
+        if (!active) return;
+        const nextPlans = planResult.plans || [];
+        plansPageCache = nextPlans;
+        setPlans(nextPlans);
+      }).catch((error) => {
+        if (active) setMessage(error.message || 'Plans are temporarily unavailable.');
+      }).finally(() => { if (active) setLoading(false); });
+    }
+
+    if (auth) {
+      requestApi('/api/subscription')
+        .then((result) => { if (active) setCurrent(result?.current || null); })
+        .catch(() => {});
+      requestApi('/api/ai/trial/status')
+        .then((result) => { if (active) setTrialStatus(result); })
+        .catch(() => {});
+    } else {
+      setCurrent(null);
+      setTrialStatus(null);
+    }
     return () => { active = false; };
   }, [auth]);
 
@@ -1970,13 +2605,11 @@ function PlansPage({ auth, onSignIn, onSubscriptionChange }) {
     setMessage('');
     if (!auth) { onSignIn(); return; }
     if (!current?.isTrial && current?.plan && current.plan !== 'Starter' && current.expiryDate && new Date(current.expiryDate) > new Date()) {
-      setMessage(`Your ${current.plan} plan remains active until it expires. Plan changes are available afterward.`);
+      setMessage(`Your ${displayPlanName(current.plan)} plan remains active until it expires. Plan changes are available afterward.`);
       return;
     }
     if (plan.name === 'Starter') return;
-    setSelectedPlan(plan);
-    setPaymentMethod('');
-    setPin('');
+    navigate(`/plans/duration/${encodeURIComponent(plan.name)}?months=1`);
   };
 
   const chooseTrial = (plan) => {
@@ -1984,68 +2617,21 @@ function PlansPage({ auth, onSignIn, onSubscriptionChange }) {
     setTrialPrompt(plan);
   };
 
-  const completeActivation = async (result, plan) => {
-    setActivation({ plan: plan.name, amount: plan.price, cashback: result.cashback || 0, credits: result.credits || 0 });
-    setCurrent(result.subscription);
-    requestApi('/api/ai/trial/status').then(setTrialStatus).catch((error) => setMessage(`Plan activated, but trial status could not be refreshed: ${error.message}`));
-    setSelectedPlan(null);
-    setPin('');
-    onSubscriptionChange();
+  const planIcons = { Starter: '⌂', Medium: '◈', Premium: '✦', Exclusive: '♛' };
+  const planClasses = { Starter: 'starter', Medium: 'plus', Premium: 'pro', Exclusive: 'exclusive' };
+  const planBenefits = {
+    Starter: ['Normal website, product browsing, cart and checkout', 'Razorpay and wallet payments', 'Promo-code wallet system and order tracking'],
+    Medium: ['Priority customer support', 'Priority delivery where supported', 'Additional account features'],
+    Premium: ['AI-assisted cart addition', 'AI credits included each month', 'One-time wallet cashback on activation'],
+    Exclusive: ['AI-assisted checkout assistance', 'AI shopping assistant and product search', 'Additional advanced AI and account assistance'],
   };
-
-  const payWallet = async (event) => {
-    event.preventDefault();
-    if (busy || pin.length !== 4) return;
-    setBusy(true);
-    setMessage('');
-    try {
-      const key = globalThis.crypto?.randomUUID?.() || `plan-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-      const result = await requestApi('/api/subscription/wallet', {
-        method: 'POST',
-        body: JSON.stringify({ plan: selectedPlan.name, pin, idempotencyKey: key }),
-      });
-      await completeActivation(result, selectedPlan);
-    } catch (error) {
-      setMessage(error.message);
-      setPin('');
-    } finally { setBusy(false); }
+  const isFeatureIncluded = (plan, feature, planFeature) => {
+    if (!planFeature) return false;
+    const value = planFeature?.value;
+    const isBooleanValue = value == null || value === 'Yes' || value === 'No';
+    if (plan.name === 'Exclusive' && feature.label !== 'Trial cashback' && isBooleanValue) return true;
+    return Boolean(planFeature?.included);
   };
-
-  const payRazorpay = async () => {
-    if (!window.Razorpay || busy) { setMessage('Razorpay checkout is unavailable. Please try again.'); return; }
-    setBusy(true);
-    setMessage('');
-    try {
-      const order = await requestApi('/api/subscription/razorpay/order', {
-        method: 'POST',
-        body: JSON.stringify({ plan: selectedPlan.name }),
-      });
-      const checkout = new window.Razorpay({
-        key: order.keyId,
-        order_id: order.orderId,
-        amount: order.amountPaise,
-        currency: 'INR',
-        name: 'Innovation Labs',
-        description: `${selectedPlan.name} monthly plan`,
-        prefill: { name: auth.name, email: auth.email },
-        theme: { color: '#00d1ff' },
-        handler: async (response) => {
-          try {
-            const result = await requestApi('/api/subscription/razorpay/verify', { method: 'POST', body: JSON.stringify(response) });
-            await completeActivation(result, selectedPlan);
-          } catch (error) { setMessage(error.message); }
-          finally { setBusy(false); }
-        },
-        modal: { ondismiss: () => setBusy(false) },
-      });
-      checkout.open();
-    } catch (error) {
-      setMessage(error.message);
-      setBusy(false);
-    }
-  };
-
-  const planIcons = { Starter: '♧', Medium: '◈', Premium: '✦', Exclusive: '♛' };
   const paidSubscriptionActive = Boolean(trialStatus?.subscription && trialStatus.subscription.expiryDate && new Date(trialStatus.subscription.expiryDate) > new Date());
   const trialUsed = Boolean(trialStatus?.trial?.used);
   const trialActive = Boolean(trialStatus?.trial?.active);
@@ -2055,78 +2641,431 @@ function PlansPage({ auth, onSignIn, onSubscriptionChange }) {
       <header className="plans-heading">
         <span className="eyebrow">Memberships for makers</span>
         <h1>Plans <span>&amp; AI</span></h1>
-        <p>Keep building at your pace. Add practical AI help when you need it.</p>
+        <p>Choose the right membership to unlock more possibilities with Innovation Labs.</p>
       </header>
       {message && <div className="alert-box" role="alert">{message}</div>}
       {loading ? <p className="plans-loading">Loading plans...</p> : <>
         <div className="plan-grid">
           {plans.map((plan, index) => {
             const active = !current?.isTrial && current?.plan === plan.name;
-            return <article className={`plan-card plan-${plan.name.toLowerCase()} ${active ? 'is-current' : ''}`} key={plan.name} style={{ '--plan-order': index }}>
-              <div className="plan-card-top"><span className="plan-icon" aria-hidden="true">{planIcons[plan.name]}</span>{active && <span className="plan-current-label">Current plan</span>}</div>
-              <h2>{plan.name}</h2>
+            const extraBillsPrice = plan.features?.find((feature) => feature.label === 'Purchase additional AI bills')?.value || '₹200 each';
+            const benefits = (planBenefits[plan.name] || []).filter((label) => {
+              const feature = plan.features?.find((item) => item.label === label);
+              return feature && isFeatureIncluded(plan, feature, feature);
+            });
+            const subscriptionLocked = !current?.isTrial && current?.plan && current.plan !== 'Starter'
+              && current.expiryDate && new Date(current.expiryDate) > new Date();
+            return <article className={`plan-card plan-${planClasses[plan.name] || 'starter'} ${active ? 'is-current' : ''}`} key={plan.name} style={{ '--plan-order': index }}>
+              <div className="plan-card-top">
+                <span className="plan-icon" aria-hidden="true">{planIcons[plan.name] || '✦'}</span>
+                {plan.name === 'Exclusive' && <span className="plan-badge premium">Premium membership</span>}
+                {plan.name === 'Premium' && <span className="plan-badge pro">AI enhanced</span>}
+                {active && <span className="plan-current-label">Current Plan</span>}
+              </div>
+              <h2>{displayPlanName(plan.name)}</h2>
               <p className="plan-price"><strong>{plan.price === 0 ? 'Free' : `₹${plan.price.toLocaleString('en-IN')}`}</strong><span>{plan.price ? '/ month' : 'forever'}</span></p>
               <p className="plan-summary">{plan.name === 'Starter' ? 'Everything you need to browse and build.' : plan.name === 'Medium' ? 'More support for projects in progress.' : plan.name === 'Premium' ? 'A capable AI partner for finding and preparing parts.' : 'Advanced AI help, including confirmed purchase assistance.'}</p>
-              {plan.credits > 0 && <div className="plan-credit-line">{plan.credits.toLocaleString('en-IN')} AI credits each month</div>}
-              {plan.cashback > 0 && <div className="plan-cashback-line">₹{plan.cashback} one-time wallet cashback</div>}
-              <button className={active ? 'secondary-btn full' : 'primary-btn full'} disabled={active || (!current?.isTrial && current?.plan && current.plan !== 'Starter' && current.expiryDate && new Date(current.expiryDate) > new Date())} onClick={() => choosePlan(plan)}>
-                {active ? 'Your current plan' : !current?.isTrial && current?.plan && current.plan !== 'Starter' && current.expiryDate && new Date(current.expiryDate) > new Date() ? 'Available after expiry' : plan.price === 0 ? 'Included by default' : auth ? 'Choose plan' : 'Sign in to subscribe'}
+              <div className="plan-universal-discount" aria-label={`${plan.subscriptionDiscountPercent}% off on every order`}>
+                <span>Every order benefit</span>
+                <strong>{plan.subscriptionDiscountPercent}% OFF ON EVERY ORDER</strong>
+              </div>
+              <div className="plan-included-facts">
+                <div><span>AI credits / month</span><strong>{plan.credits.toLocaleString('en-IN')}</strong></div>
+                <div><span>AI bills / month</span><strong>{plan.includedAiBills}</strong></div>
+                <div className="plan-order-discount"><span>Discount on every order</span><strong>{plan.subscriptionDiscountPercent}% OFF</strong></div>
+                <div><span>Additional AI bill</span><strong>{extraBillsPrice}</strong></div>
+                {plan.cashback > 0 && <div><span>Wallet cashback</span><strong>₹{plan.cashback}</strong></div>}
+              </div>
+              {benefits.length > 0 && <ul className="plan-benefits">{benefits.map((benefit) => <li key={benefit}><span aria-hidden="true">✓</span>{benefit}</li>)}</ul>}
+              <button className={active ? 'secondary-btn full' : 'primary-btn full'} disabled={active || subscriptionLocked} onClick={() => choosePlan(plan)}>
+                {active ? 'Current Plan' : subscriptionLocked ? 'Available after expiry' : `Choose ${displayPlanName(plan.name)}`}
               </button>
               {['Premium', 'Exclusive'].includes(plan.name) && !paidSubscriptionActive && <button className="secondary-btn full ai-trial-plan-button" disabled={auth && !trialStatus || trialUsed || trialActive} onClick={() => chooseTrial(plan.name)}>
-                {!auth ? 'Sign in for Free Trial' : !trialStatus ? 'Checking trial eligibility...' : trialActive ? `${trialStatus.trial.plan} Trial Active` : trialUsed ? 'Free Trial Already Used' : 'Start 4-Day Free Trial'}
+                {!auth ? 'Sign in for Free Trial' : !trialStatus ? 'Checking trial eligibility...' : trialActive ? `${displayPlanName(trialStatus.trial.plan)} Trial Active` : trialUsed ? 'Free Trial Already Used' : 'Start 4-Day Free Trial'}
               </button>}
             </article>;
           })}
         </div>
-        {trialActive && <section className="ai-trial-status-card"><div><span className="eyebrow">Free trial active</span><h2>{trialStatus.trial.plan} AI trial</h2><p>Activated {new Date(trialStatus.trial.activatedAt).toLocaleString('en-IN')} · Expires {new Date(trialStatus.trial.expiresAt).toLocaleString('en-IN')}</p></div><div className="ai-trial-status-facts"><span><strong>{trialStatus.trial.remainingBuilds ?? 0}</strong> of 2 project builds remaining</span><span>Trial cashback is not awarded. Trial access expires automatically.</span></div></section>}
+        {trialActive && <section className="ai-trial-status-card"><div><span className="eyebrow">Free trial active</span><h2>{displayPlanName(trialStatus.trial.plan)} AI trial</h2><p>Activated {new Date(trialStatus.trial.activatedAt).toLocaleString('en-IN')} · Expires {new Date(trialStatus.trial.expiresAt).toLocaleString('en-IN')}</p></div><div className="ai-trial-status-facts"><span><strong>{trialStatus.trial.remainingBuilds ?? 0}</strong> of 2 project builds remaining</span><span>Trial cashback is not awarded. Trial access expires automatically.</span></div></section>}
         <section className="plan-comparison" aria-labelledby="comparison-heading">
           <div className="comparison-heading"><span className="eyebrow">At a glance</span><h2 id="comparison-heading">Compare plans</h2></div>
           <div className="comparison-scroll" tabIndex="0" aria-label="Scrollable plan comparison">
             <table className="comparison-table">
-              <thead><tr><th scope="col">Feature</th>{plans.map((plan) => <th scope="col" key={plan.name}>{plan.name}</th>)}</tr></thead>
+              <thead><tr><th scope="col">Feature</th>{plans.map((plan) => <th scope="col" key={plan.name}>{displayPlanName(plan.name)}</th>)}</tr></thead>
               <tbody>{(plans[0]?.features || []).map((feature, featureIndex) => <tr key={feature.label}>
                 <th scope="row">{feature.label}</th>
                 {plans.map((plan) => {
                   const planFeature = plan.features[featureIndex];
-                  const included = planFeature?.included;
                   const value = planFeature?.value;
-                  return <td key={plan.name} className={included ? 'feature-yes' : 'feature-no'} aria-label={value || (included ? 'Available' : 'Not available')}>{value || (included ? '✓' : '✕')}</td>;
+                  const included = isFeatureIncluded(plan, feature, planFeature);
+                  const booleanValue = value == null || /^(yes|no)(?:\s|$)/i.test(value);
+                  const booleanDetail = typeof value === 'string' ? value.match(/^(?:yes|no)\s*[·-]\s*(.+)$/i)?.[1] : null;
+                  const displayValue = booleanValue ? null : value;
+                  return <td key={plan.name} className={`${included ? 'feature-yes' : 'feature-no'}${plan.name === 'Exclusive' ? ' is-exclusive-column' : ''}`} aria-label={displayValue || `${included ? 'Available' : 'Not available'}${booleanDetail ? `: ${booleanDetail}` : ''}`}>
+                    {displayValue || <><span className="feature-mark" aria-hidden="true">{included ? '✓' : '✕'}</span>{booleanDetail && <span className="feature-detail">{booleanDetail}</span>}</>}
+                  </td>;
                 })}
               </tr>)}</tbody>
             </table>
           </div>
-          <p className="plan-terms">Subscriptions run for one month from activation. Included credits refresh on renewal; unused credits remain available while your paid plan is active.</p>
-          <p className="plan-terms ai-trial-footnote">* Premium includes four project builds during an active paid subscription. Premium and Exclusive free trials include two project builds.</p>
+          <p className="plan-terms">Choose a subscription duration at checkout. Each subscription month follows the existing monthly plan rules. AI bills renew with the eligible monthly period. Each successful project build uses one bill; purchased bills remain available until used.</p>
+          <p className="plan-terms ai-trial-footnote">Additional AI bills cost ₹200 each. When your available AI credits cover the full bill purchase, 100 credits per bill are also applied; bill purchases and use do not require a positive credit balance.</p>
         </section>
       </>}
     </div>
 
-    {selectedPlan && <div className="plan-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setSelectedPlan(null); }}>
-      <section className="plan-dialog" role="dialog" aria-modal="true" aria-labelledby="plan-dialog-title">
-        <button className="plan-dialog-close" aria-label="Close subscription checkout" disabled={busy} onClick={() => setSelectedPlan(null)}>×</button>
-        <span className="eyebrow">Digital subscription</span>
-        <h2 id="plan-dialog-title">{selectedPlan.name} · ₹{selectedPlan.price.toLocaleString('en-IN')}</h2>
-        <p>No delivery address is required. The server validates the plan price and activation.</p>
-        {!paymentMethod && <div className="plan-payment-options"><button className="secondary-btn" onClick={() => setPaymentMethod('Wallet')}>◉ &nbsp; Pay with Wallet</button><button className="secondary-btn" onClick={payRazorpay}>↗ &nbsp; Razorpay / Online</button></div>}
-        {paymentMethod === 'Wallet' && <form className="plan-pin-form" onSubmit={payWallet}><label htmlFor="plan-wallet-pin">Enter your Wallet PIN</label><input id="plan-wallet-pin" type="password" inputMode="numeric" autoComplete="current-password" maxLength={4} value={pin} onChange={(event) => setPin(event.target.value.replace(/\D/g, '').slice(0, 4))} required /><div className="plan-payment-options"><button type="button" className="secondary-btn" disabled={busy} onClick={() => setPaymentMethod('')}>Back</button><button className="primary-btn" disabled={busy || pin.length !== 4}>{busy ? 'Processing...' : 'Pay ₹' + selectedPlan.price.toLocaleString('en-IN')}</button></div></form>}
-        {message && <p className="plan-dialog-error" role="alert">{message}</p>}
-      </section>
-    </div>}
-    {activation && <div className="plan-dialog-backdrop"><section className="plan-dialog plan-success" role="dialog" aria-modal="true" aria-labelledby="activation-title">
-      <div className="success-check" aria-hidden="true">✓</div><span className="eyebrow">Payment confirmed</span>
-      <h2 id="activation-title">{activation.plan} activated</h2>
-      <p>₹{activation.amount.toLocaleString('en-IN')} payment successful.</p>
-      {activation.cashback > 0 && <p>₹{activation.cashback.toLocaleString('en-IN')} wallet cashback added once.</p>}
-      {activation.credits > 0 && <p>{activation.credits.toLocaleString('en-IN')} AI credits added.</p>}
-      <button className="primary-btn full" onClick={() => setActivation(null)}>Continue</button>
-    </section></div>}
     {trialPrompt && <div className="plan-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setTrialPrompt(''); }}><section className="plan-dialog ai-trial-terms-dialog" role="dialog" aria-modal="true" aria-labelledby="trial-terms-title">
       <button className="plan-dialog-close" aria-label="Close trial information" onClick={() => setTrialPrompt('')}>×</button>
-      <span className="eyebrow">Four-day free trial</span><h2 id="trial-terms-title">{trialPrompt} AI Project Builder Trial</h2>
-      <p>Try {trialPrompt} project-building features for four consecutive days from activation, including two successful project builds. {trialPrompt === 'Premium' ? 'AI-assisted cart addition is included during the trial.' : 'AI-assisted cart addition and checkout preparation are included during the trial; checkout still requires your explicit confirmation and normal secure payment.'}</p>
+      <span className="eyebrow">Four-day free trial</span><h2 id="trial-terms-title">{displayPlanName(trialPrompt)} AI Project Builder Trial</h2>
+      <p>Try {displayPlanName(trialPrompt)} project-building features for four consecutive days from activation, including two successful project builds. {trialPrompt === 'Premium' ? 'AI-assisted cart addition is included during the trial.' : 'AI-assisted cart addition and checkout preparation are included during the trial; checkout still requires your explicit confirmation and normal secure payment.'}</p>
       <ul><li>No paid subscription is created.</li><li>No recurring billing or automatic payment is started.</li><li>No wallet cashback is awarded for trial activation.</li><li>Your one-time trial eligibility is recorded to your account.</li></ul>
       <div className="plan-payment-options"><button className="secondary-btn" onClick={() => setTrialPrompt('')}>Cancel</button><button className="primary-btn" onClick={() => { const plan = trialPrompt; setTrialPrompt(''); navigate(`/plans/ai-trial/${plan}`); }}>Continue to activation</button></div>
     </section></div>}
+  </main>;
+}
+
+function SubscriptionDurationPage({ auth }) {
+  const { plan } = useParams();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedMonths = Number(searchParams.get('months') || 1);
+  const durationMonths = Number.isSafeInteger(requestedMonths) && requestedMonths >= 1 && requestedMonths <= 12 ? requestedMonths : 1;
+  const [planDetails, setPlanDetails] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [error, setError] = useState('');
+  const maxDurationMonths = 12;
+  const selectDuration = (months) => {
+    setError('');
+    setSearchParams({ months: String(months) }, { replace: true });
+  };
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError('');
+    setPlanDetails(null);
+    setPreview(null);
+    Promise.all([
+      requestApi('/api/plans'),
+      requestApi(`/api/subscription/checkout/${encodeURIComponent(plan || '')}?months=${durationMonths}`),
+    ]).then(([result, initialPreview]) => {
+      if (!active) return;
+      const selectedPlan = result.plans?.find((item) => item.name === plan);
+      if (!selectedPlan) throw new Error('The selected subscription plan is unavailable.');
+      if (!Number.isSafeInteger(initialPreview.monthlyPricePaise) || initialPreview.monthlyPricePaise <= 0) {
+        throw new Error('The selected plan price could not be loaded. Please return to Plans & AI and try again.');
+      }
+      setPlanDetails(selectedPlan);
+      setPreview(initialPreview);
+    }).catch((requestError) => { if (active) setError(requestError.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [plan, auth?.id]);
+
+  useEffect(() => {
+    if (!planDetails || preview?.durationMonths === durationMonths) return undefined;
+    let active = true;
+    setPreviewLoading(true);
+    requestApi(`/api/subscription/checkout/${encodeURIComponent(plan || '')}?months=${durationMonths}`)
+      .then((result) => { if (active) setPreview(result); })
+      .catch((requestError) => { if (active) setError(requestError.message); })
+      .finally(() => { if (active) setPreviewLoading(false); });
+    return () => { active = false; };
+  }, [durationMonths, plan, planDetails, preview?.durationMonths]);
+
+  const formatMoney = (value) => `₹${Number(value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const formatPaise = (value) => formatMoney(Number(value || 0) / 100);
+  const formatIndiaDateTime = (value) => {
+    if (!value) return 'Updating...';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return 'Not available';
+    return new Intl.DateTimeFormat('en-IN', { dateStyle: 'long', timeStyle: 'short', timeZone: 'Asia/Kolkata' }).format(date);
+  };
+  const monthlyPricePaise = Number(preview?.monthlyPricePaise);
+  const totalPricePaise = monthlyPricePaise * durationMonths;
+  const selectedPriceIsValid = Number.isSafeInteger(monthlyPricePaise) && monthlyPricePaise > 0;
+  const previewIsCurrent = preview?.durationMonths === durationMonths
+    && preview?.pricePaise === totalPricePaise;
+  const startDate = previewIsCurrent ? preview.startDate : null;
+
+  return <main className="page-shell subscription-duration-page">
+    <div className="container">
+      <header className="plans-heading">
+        <span className="eyebrow">Plans &amp; AI</span>
+        <h1>SELECT YOUR SUBSCRIPTION DURATION</h1>
+        <p>Selected Plan: <strong>{displayPlanName(planDetails?.name || plan)}</strong>{selectedPriceIsValid && <> · Monthly Price: <strong>{formatPaise(monthlyPricePaise)}</strong></>}</p>
+      </header>
+      {error && <div className="alert-box" role="alert">{error}</div>}
+      {loading ? <p className="plans-loading">Loading subscription options...</p> : planDetails && preview && <div className="subscription-duration-layout">
+        <section className="subscription-duration-options">
+          <h2>Select a duration</h2>
+          {selectedPriceIsValid ? <p>Monthly price: <strong>{formatPaise(monthlyPricePaise)}</strong></p> : <p className="plan-dialog-error" role="alert">Plan price unavailable. You cannot continue until pricing loads.</p>}
+          <div className="duration-quick-options duration-choice-cards" role="group" aria-label="Suggested subscription durations">
+            {[1, 2, 3].map((months) => <button type="button" key={months} aria-pressed={durationMonths === months} className={durationMonths === months ? 'selected' : ''} onClick={() => selectDuration(months)}>
+              {months} {months === 1 ? 'Month' : 'Months'}
+            </button>)}
+          </div>
+          <label className="duration-month-selector" htmlFor="subscription-duration-months">
+            Or choose a duration
+            <select id="subscription-duration-months" value={durationMonths} onChange={(event) => selectDuration(Number(event.target.value))}>
+              {Array.from({ length: maxDurationMonths }, (_value, index) => index + 1).map((months) => <option key={months} value={months}>{months} {months === 1 ? 'Month' : 'Months'}</option>)}
+            </select>
+          </label>
+        </section>
+        <section className="subscription-duration-summary" aria-live="polite">
+          <h2>Price summary</h2>
+          <dl className="subscription-checkout-summary">
+            <div><dt>Selected plan</dt><dd>{planDetails.name}</dd></div>
+            <div><dt>Monthly subscription price</dt><dd>{selectedPriceIsValid ? formatPaise(monthlyPricePaise) : 'Unavailable'}</dd></div>
+            <div><dt>Duration</dt><dd>{durationMonths} {durationMonths === 1 ? 'Month' : 'Months'}</dd></div>
+            <div><dt>Subscription starting date</dt><dd>{formatIndiaDateTime(startDate)}</dd></div>
+            <div><dt>Subscription expiry date</dt><dd>{previewIsCurrent ? formatIndiaDateTime(preview.expiryDate) : 'Updating...'}</dd></div>
+          </dl>
+          <div className="subscription-duration-calculation">
+            <span>Calculation</span>
+            <strong>{selectedPriceIsValid
+              ? Array.from({ length: durationMonths }, () => formatPaise(monthlyPricePaise)).join(' + ')
+              : 'Price unavailable'}</strong>
+          </div>
+          <p className="subscription-duration-total">TOTAL SUBSCRIPTION AMOUNT: <strong>{selectedPriceIsValid ? formatPaise(totalPricePaise) : 'Unavailable'}</strong></p>
+          <div className="plan-payment-options">
+            <Link className="secondary-btn" to="/plans">Back to Plans &amp; AI</Link>
+            <button type="button" className="primary-btn duration-next-button" disabled={previewLoading || Boolean(error) || !selectedPriceIsValid || !previewIsCurrent} onClick={() => navigate(`/plans/checkout/${encodeURIComponent(planDetails.name)}?months=${durationMonths}`)}>
+              {previewLoading ? 'Updating price...' : 'NEXT'}
+            </button>
+          </div>
+        </section>
+      </div>}
+    </div>
+  </main>;
+}
+
+function SubscriptionCheckoutPage({ auth, onSubscriptionChange }) {
+  const { plan } = useParams();
+  const [searchParams] = useSearchParams();
+  const parsedDuration = Number(searchParams.get('months') || 1);
+  const durationMonths = Number.isSafeInteger(parsedDuration) && parsedDuration >= 1 && parsedDuration <= 12 ? parsedDuration : 1;
+  const navigate = useNavigate();
+  const [preview, setPreview] = useState(null);
+  const [paymentMethod, setPaymentMethod] = useState('');
+  const [pin, setPin] = useState('');
+  const [pinOpen, setPinOpen] = useState(false);
+  const [pinFocusVersion, setPinFocusVersion] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [message, setMessage] = useState('');
+  const [activation, setActivation] = useState(null);
+  const idempotencyKeyRef = useRef(globalThis.crypto?.randomUUID?.() || `plan-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`);
+
+  useEffect(() => {
+    let active = true;
+    idempotencyKeyRef.current = globalThis.crypto?.randomUUID?.() || `plan-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    if (!preview) setLoading(true);
+    setMessage('');
+    setActivation(null);
+    requestApi(`/api/subscription/checkout/${encodeURIComponent(plan || '')}?months=${encodeURIComponent(durationMonths)}`)
+      .then((result) => { if (active) setPreview(result); })
+      .catch((error) => { if (active) setMessage(error.message || 'Subscription checkout is unavailable.'); })
+      .finally(() => {
+        if (active) {
+          setLoading(false);
+        }
+      });
+    return () => { active = false; };
+  }, [plan, durationMonths, auth?.id]);
+
+  const formatIndiaDateTime = (value) => {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return 'Not available';
+    return new Intl.DateTimeFormat('en-IN', {
+      dateStyle: 'long',
+      timeStyle: 'short',
+      timeZone: 'Asia/Kolkata',
+    }).format(date);
+  };
+
+  const completeActivation = async (result) => {
+    setActivation(result);
+    setPinOpen(false);
+    setPin('');
+    try {
+      await onSubscriptionChange();
+    } catch (error) {
+      setMessage(`Your subscription is active, but account details could not be refreshed: ${error.message}`);
+    }
+  };
+
+  const payWallet = async (event) => {
+    event.preventDefault();
+    if (busy || pin.length !== 4 || !preview) return;
+    setBusy(true);
+    setMessage('');
+    try {
+      const result = await requestApi('/api/subscription/wallet', {
+        method: 'POST',
+        body: JSON.stringify({ plan: preview.plan, durationMonths: preview.durationMonths, pin, idempotencyKey: idempotencyKeyRef.current }),
+      });
+      await completeActivation(result);
+    } catch (error) {
+      if (error.status === 401) {
+        setMessage('Incorrect Wallet PIN. Please try again.');
+        setPinFocusVersion((version) => version + 1);
+      } else if (error.status === 402) {
+        const availablePaise = Number.isSafeInteger(error.availableBalancePaise)
+          ? error.availableBalancePaise
+          : Math.round(Number(error.availableBalance || 0) * 100);
+        const requiredPaise = Number.isSafeInteger(error.requiredAmountPaise)
+          ? error.requiredAmountPaise
+          : expectedTotalPaise;
+        setMessage(`Insufficient Wallet Balance! Available: ${displayPrice(availablePaise)}. Required: ${displayPrice(requiredPaise)}.`);
+        setPreview((current) => current ? {
+          ...current,
+          wallet: { ...current.wallet, balance: availablePaise / 100, availableBalance: availablePaise / 100 },
+        } : current);
+        setPinOpen(false);
+      } else {
+        setMessage(error.message);
+      }
+      if (error.status === 429) setPinFocusVersion((version) => version + 1);
+      setPin('');
+    } finally { setBusy(false); }
+  };
+
+  const payRazorpay = async () => {
+    if (!window.Razorpay || busy || !preview) {
+      setMessage('Razorpay checkout is unavailable. Please try again.');
+      return;
+    }
+    setBusy(true);
+    setMessage('');
+    let verificationStarted = false;
+    try {
+      const order = await requestApi('/api/subscription/razorpay/order', {
+        method: 'POST',
+        body: JSON.stringify({ plan: preview.plan, durationMonths: preview.durationMonths }),
+      });
+      const checkout = new window.Razorpay({
+        key: order.keyId,
+        order_id: order.orderId,
+        amount: order.amountPaise,
+        currency: 'INR',
+        name: 'Innovation Labs',
+        description: `${displayPlanName(preview.plan)} plan · ${preview.durationMonths} month${preview.durationMonths === 1 ? '' : 's'}`,
+        prefill: { name: auth.name, email: auth.email },
+        theme: { color: '#00d1ff' },
+        handler: async (response) => {
+          verificationStarted = true;
+          try {
+            const result = await requestApi('/api/subscription/razorpay/verify', {
+              method: 'POST',
+              body: JSON.stringify(response),
+            });
+            await completeActivation(result);
+          } catch (error) {
+            setMessage(error.message);
+          } finally {
+            setBusy(false);
+          }
+        },
+        modal: { ondismiss: () => { if (!verificationStarted) setBusy(false); } },
+      });
+      checkout.open();
+    } catch (error) {
+      setMessage(error.message);
+      setBusy(false);
+    }
+  };
+
+  const activated = activation?.subscription;
+  const displayPrice = (paise) => `₹${(Number(paise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+  const monthlyPriceIsValid = Number.isSafeInteger(preview?.monthlyPricePaise) && preview.monthlyPricePaise > 0;
+  const expectedTotalPaise = monthlyPriceIsValid ? preview.monthlyPricePaise * durationMonths : 0;
+  const previewIsCurrent = preview?.durationMonths === durationMonths
+    && monthlyPriceIsValid
+    && Number.isSafeInteger(expectedTotalPaise)
+    && preview.pricePaise === expectedTotalPaise;
+
+  return <main className="page-shell subscription-checkout-page">
+    <div className="container">
+      <header className="plans-heading">
+        <span className="eyebrow">Secure subscription checkout</span>
+        <h1>SELECT YOUR PAYMENT METHOD</h1>
+        <p>Review the selected plan and dates before confirming payment.</p>
+      </header>
+      {message && !pinOpen && <div className="alert-box" role="alert">{message}</div>}
+      {loading ? <p className="plans-loading">Loading subscription details...</p> : !preview ? <Link className="secondary-btn" to="/plans">Return to Plans &amp; AI</Link> : activated ? <section className="subscription-checkout-card plan-success" aria-live="polite">
+        <div className="success-check" aria-hidden="true">✓</div>
+        <span className="eyebrow">Payment confirmed</span>
+        <h2>YOUR SUBSCRIPTION HAS BEEN ACTIVATED SUCCESSFULLY!</h2>
+        <dl className="subscription-checkout-summary">
+          <div><dt>Selected plan</dt><dd>{displayPlanName(activated.plan)}</dd></div>
+          <div><dt>Monthly subscription price</dt><dd>{displayPrice(activated.monthlyPricePaise)}</dd></div>
+          <div><dt>Duration</dt><dd>{activated.durationMonths} {activated.durationMonths === 1 ? 'Month' : 'Months'}</dd></div>
+          <div><dt>Total amount paid</dt><dd>{displayPrice(activated.pricePaise)}</dd></div>
+          <div><dt>Payment method</dt><dd>{activated.paymentMethod === 'Wallet' ? 'Innovation Labs Wallet' : activated.paymentMethod}</dd></div>
+          <div><dt>Starting date</dt><dd>{formatIndiaDateTime(activated.startDate)}</dd></div>
+          <div><dt>Expiry date</dt><dd>{formatIndiaDateTime(activated.expiryDate)}</dd></div>
+          {activation.cashback > 0 && <div><dt>Wallet cashback</dt><dd>{displayPrice(activation.cashback * 100)}</dd></div>}
+          {activation.credits > 0 && <div><dt>AI credits added</dt><dd>{Number(activation.credits).toLocaleString('en-IN')}</dd></div>}
+        </dl>
+        <button type="button" className="primary-btn full" onClick={() => navigate('/plans')}>Continue</button>
+      </section> : <div className="subscription-checkout-layout">
+        <section className="subscription-checkout-card">
+          <h2>Subscription details</h2>
+          <dl className="subscription-checkout-summary">
+            <div><dt>Selected plan</dt><dd>{displayPlanName(preview.plan)}</dd></div>
+            <div><dt>Monthly subscription price</dt><dd>{monthlyPriceIsValid ? displayPrice(preview.monthlyPricePaise) : 'Unavailable'}</dd></div>
+            <div><dt>Duration</dt><dd>{durationMonths} {durationMonths === 1 ? 'Month' : 'Months'}</dd></div>
+            <div><dt>Subscription starting date</dt><dd>{formatIndiaDateTime(preview.startDate)}</dd></div>
+            <div><dt>Subscription expiry date</dt><dd>{formatIndiaDateTime(preview.expiryDate)}</dd></div>
+            <div><dt>Payment method</dt><dd>{paymentMethod || 'Select below'}</dd></div>
+            <div className="subscription-checkout-total"><dt>Total amount payable</dt><dd>{previewIsCurrent ? displayPrice(expectedTotalPaise) : 'Unavailable'}</dd></div>
+          </dl>
+          {!monthlyPriceIsValid && <p className="plan-dialog-error" role="alert">The monthly price for {displayPlanName(preview.plan)} could not be loaded. Payment is unavailable; return to Plans &amp; AI and try again.</p>}
+          {!previewIsCurrent && monthlyPriceIsValid && <p className="plan-dialog-error" role="alert">The price and selected duration do not match. Return to duration selection and try again.</p>}
+          {paymentMethod === 'Wallet' && <div className="subscription-wallet-summary">
+            <h3>Innovation Labs Wallet payment</h3>
+            <p>Available wallet balance: <strong>₹{Number(preview.wallet.availableBalance || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></p>
+            <p>Total payable: <strong>{previewIsCurrent ? displayPrice(expectedTotalPaise) : 'Unavailable'}</strong></p>
+            {!preview.wallet.walletRecordAvailable && <p className="plan-dialog-error">A wallet account is unavailable. Wallet payment cannot be processed until the wallet record is restored.</p>}
+            {previewIsCurrent && preview.wallet.walletRecordAvailable && Number(preview.wallet.availableBalance) < Number(preview.price) && <p className="plan-dialog-error wallet-insufficient">Insufficient Wallet Balance! Available: {displayPrice(Math.round(Number(preview.wallet.availableBalance) * 100))}. Required: {displayPrice(expectedTotalPaise)}.</p>}
+          </div>}
+        </section>
+        <section className="subscription-checkout-card">
+          <h2>Payment method</h2>
+          <div className="subscription-payment-methods" role="radiogroup" aria-label="Select your payment method">
+            <label><input type="radio" name="subscription-payment-method" value="Wallet" checked={paymentMethod === 'Wallet'} disabled={busy} onChange={() => { setPaymentMethod('Wallet'); setMessage(''); }} /> Innovation Labs Wallet</label>
+            <label><input type="radio" name="subscription-payment-method" value="Razorpay" checked={paymentMethod === 'Razorpay'} disabled={busy} onChange={() => { setPaymentMethod('Razorpay'); setMessage(''); }} /> Razorpay</label>
+          </div>
+          {paymentMethod === 'Wallet' && <button type="button" className="primary-btn full subscription-pay-button" disabled={busy || !previewIsCurrent || !preview.wallet.walletRecordAvailable || Number(preview.wallet.availableBalance) < Number(expectedTotalPaise) / 100} onClick={() => { setMessage(''); setPin(''); setPinOpen(true); }}>Verify Wallet PIN</button>}
+          {paymentMethod === 'Razorpay' && <button type="button" className="primary-btn full subscription-pay-button" disabled={busy || !previewIsCurrent} onClick={payRazorpay}>
+            {busy ? <><span className="subscription-spinner" aria-hidden="true" />Processing payment...</> : `PAY ${displayPrice(preview.pricePaise)} WITH RAZORPAY`}
+          </button>}
+          <div className="plan-payment-options">
+            <Link className="secondary-btn" to={`/plans/duration/${encodeURIComponent(preview.plan)}?months=${durationMonths}`}>Back to duration selection</Link>
+          </div>
+        </section>
+      </div>}
+    </div>
+    {pinOpen && <div className="wallet-lock-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setPinOpen(false); }}>
+      <form className="wallet-pin-modal plan-pin-form subscription-pin-dialog" role="dialog" aria-modal="true" aria-labelledby="subscription-pin-title" onSubmit={payWallet}>
+        <button type="button" className="plan-dialog-close" aria-label="Close Wallet PIN verification" disabled={busy} onClick={() => setPinOpen(false)}>×</button>
+        <span className="eyebrow">Secure wallet payment</span>
+        <h2 id="subscription-pin-title">Verify your Wallet PIN</h2>
+        <p>Pay {displayPrice(preview?.pricePaise)} for the {displayPlanName(preview?.plan)} subscription.</p>
+        <label>Enter your 4-digit Wallet PIN</label>
+        <PinBoxes value={pin} onChange={(value) => { setPin(value); setMessage(''); }} focusVersion={pinFocusVersion} disabled={busy} />
+        {message && <p className="plan-dialog-error" role="alert">{message}</p>}
+        <div className="plan-payment-options">
+          <button type="button" className="secondary-btn" disabled={busy} onClick={() => setPinOpen(false)}>Cancel</button>
+          <button type="submit" className="primary-btn" disabled={busy || pin.length !== 4}>
+            {busy ? <><span className="subscription-spinner" aria-hidden="true" />Processing payment...</> : 'PAY NOW'}
+          </button>
+        </div>
+      </form>
+    </div>}
   </main>;
 }
 
@@ -2180,8 +3119,174 @@ function TrialExpirationWarning({ auth }) {
 
   return <>
     {error && <div className="trial-warning-error" role="alert">{error}</div>}
-    {warning && remainingMs > 0 && <div className="wallet-lock-overlay trial-expiration-overlay"><section className="wallet-pin-modal trial-expiration-dialog" role="alertdialog" aria-modal="true" aria-labelledby="trial-expiration-title"><span className="eyebrow">Trial ending soon</span><h2 id="trial-expiration-title">Your {warning.plan} trial expires within 24 hours</h2><p>Expires {new Date(warning.expiresAt).toLocaleString('en-IN')}</p><strong>{remaining} remaining</strong><button type="button" className="primary-btn" onClick={() => setWarning(null)}>Continue</button></section></div>}
+    {warning && remainingMs > 0 && <div className="wallet-lock-overlay trial-expiration-overlay"><section className="wallet-pin-modal trial-expiration-dialog" role="alertdialog" aria-modal="true" aria-labelledby="trial-expiration-title"><span className="eyebrow">Trial ending soon</span><h2 id="trial-expiration-title">Your {displayPlanName(warning.plan)} trial expires within 24 hours</h2><p>Expires {new Date(warning.expiresAt).toLocaleString('en-IN')}</p><strong>{remaining} remaining</strong><button type="button" className="primary-btn" onClick={() => setWarning(null)}>Continue</button></section></div>}
   </>;
+}
+
+function SubscriptionLifecycleWarning({ auth }) {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [warning, setWarning] = useState(null);
+  const [remainingMs, setRemainingMs] = useState(0);
+  const [error, setError] = useState('');
+  const receivedAtRef = useRef({ serverNow: 0, performanceNow: 0 });
+  const refreshWarningRef = useRef(() => Promise.resolve());
+  const expirationRefreshRef = useRef(null);
+  const dismissedPathRef = useRef(null);
+  const dismissedGracePeriodRef = useRef(null);
+  const upgradingRef = useRef(false);
+
+  useEffect(() => {
+    if (!auth) dismissedGracePeriodRef.current = null;
+  }, [auth?.id]);
+
+  useEffect(() => {
+    if (!auth || auth.isAdmin) {
+      setWarning(null);
+      setError('');
+      upgradingRef.current = false;
+      return undefined;
+    }
+    let active = true;
+    const refreshWarning = () => {
+      if (upgradingRef.current && location.pathname.startsWith('/plans')) return Promise.resolve();
+      upgradingRef.current = false;
+      return requestApi('/api/subscription')
+      .then((result) => {
+        if (!active) return;
+        const grace = result.grace;
+        const serverNow = Date.parse(result.serverNow || '');
+      if (!Number.isFinite(serverNow)) throw new Error('The server did not return a valid current timestamp.');
+      const graceEndTime = Date.parse(grace?.endsAt || '');
+      if (grace?.active && !Number.isFinite(graceEndTime)) throw new Error('The server returned an invalid grace-period expiry timestamp.');
+      const currentWarning = grace?.active && Number.isFinite(graceEndTime)
+          ? {
+            stage: 'expired-grace',
+            previousPlan: grace.previousPlan || 'Previous',
+            currentPlan: grace.currentPlan || 'Starter',
+            startedAt: grace.startedAt,
+            endsAt: grace.endsAt,
+            gracePeriodId: grace.gracePeriodId,
+            dismissalCount: Number(grace.dismissalCount || 0),
+            popupSuppressed: Boolean(grace.popupSuppressed),
+            remainingMs: Math.max(0, graceEndTime - serverNow),
+            walletBalance: grace.walletBalance,
+            walletLimit: grace.walletLimit,
+            amountToLock: grace.amountToLock,
+          }
+          : result.warning?.stage === 'expiring' ? result.warning : null;
+        const dismissedOnThisLoad = currentWarning?.stage === 'expired-grace'
+          && dismissedGracePeriodRef.current === currentWarning.gracePeriodId;
+        const popupSuppressed = currentWarning?.stage === 'expired-grace'
+          && (currentWarning.popupSuppressed || dismissedOnThisLoad);
+        setWarning(
+          dismissedPathRef.current === location.pathname || popupSuppressed
+            ? null
+            : currentWarning || null,
+        );
+        setRemainingMs(Math.max(0, Number(currentWarning?.remainingMs || 0)));
+        receivedAtRef.current = {
+          serverNow,
+          performanceNow: performance.now(),
+        };
+        expirationRefreshRef.current = null;
+        setError('');
+      })
+      .catch((requestError) => {
+        if (active) setError(`Subscription status could not be checked: ${requestError.message}`);
+      });
+    };
+    refreshWarningRef.current = refreshWarning;
+    refreshWarning();
+    const interval = window.setInterval(refreshWarning, 60 * 1000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [auth?.id, auth?.isAdmin, location.pathname]);
+
+  useEffect(() => {
+    dismissedPathRef.current = null;
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!warning) return undefined;
+    const timer = window.setInterval(() => {
+      const clock = receivedAtRef.current;
+      const endTime = Date.parse(warning.endsAt || warning.expiryDate || '');
+      const currentServerTime = clock.serverNow + performance.now() - clock.performanceNow;
+      if (!Number.isFinite(endTime)) return;
+      const remaining = Math.max(0, endTime - currentServerTime);
+      setRemainingMs(remaining);
+      if (remaining === 0 && expirationRefreshRef.current !== (warning.endsAt || warning.expiryDate)) {
+        expirationRefreshRef.current = warning.endsAt || warning.expiryDate;
+        refreshWarningRef.current();
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [warning]);
+
+  if (!warning) return error ? <div className="trial-warning-error" role="alert">{error}</div> : null;
+  if (remainingMs <= 0) return null;
+  const seconds = Math.ceil(remainingMs / 1000);
+  const totalHours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  const timeRemaining = `${totalHours} HOURS ${minutes} MINUTES ${remainingSeconds} SECONDS`;
+  const renew = () => {
+    upgradingRef.current = true;
+    setWarning(null);
+    navigate('/plans');
+  };
+  const dismiss = () => {
+    setWarning(null);
+    if (warning.stage !== 'expired-grace') {
+      dismissedPathRef.current = location.pathname;
+      return;
+    }
+    dismissedGracePeriodRef.current = warning.gracePeriodId;
+    requestApi('/api/subscription/grace/dismiss', { method: 'POST' })
+      .then((result) => {
+        if (result.gracePeriodId !== warning.gracePeriodId) {
+          throw new Error('The active grace period changed before the popup dismissal was saved.');
+        }
+        setError('');
+      })
+      .catch((requestError) => {
+        dismissedGracePeriodRef.current = null;
+        setError(`Popup dismissal could not be saved: ${requestError.message}`);
+        refreshWarningRef.current();
+      });
+  };
+
+  return <div className="wallet-lock-overlay subscription-lifecycle-overlay">
+    <section className="wallet-pin-modal subscription-lifecycle-dialog" role="dialog" aria-modal="true" aria-labelledby="subscription-lifecycle-title">
+      {warning.stage === 'expiring' ? <>
+        <span className="eyebrow">{displayPlanName(warning.plan)} subscription</span>
+        <h2 id="subscription-lifecycle-title">Your subscription is expiring soon!</h2>
+        <p>Plan: <strong>{displayPlanName(warning.plan)}</strong></p>
+        <p>Expires: <strong>{warning.expiryDate ? new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Kolkata' }).format(new Date(warning.expiryDate)) : 'Not available'}</strong></p>
+        <p>Time remaining: <strong>{timeRemaining}</strong></p>
+      </> : <>
+        <span className="eyebrow">48-hour renewal grace period</span>
+        <h2 id="subscription-lifecycle-title">YOUR SUBSCRIPTION HAS EXPIRED!</h2>
+        <p>Your account is currently on the <strong>{displayPlanName(warning.currentPlan)}</strong> plan. Your 48-hour grace period is running out.</p>
+        <p>If you do not upgrade your subscription before the grace period ends, the excess amount in your wallet will become <strong>LOCKED</strong> and unavailable for use.</p>
+        <div className="subscription-lifecycle-facts">
+          <p>Previous subscription plan: <strong>{displayPlanName(warning.previousPlan)}</strong></p>
+          <p>Current subscription plan: <strong>{displayPlanName(warning.currentPlan)}</strong></p>
+          <p>Original wallet balance: <strong>{warning.walletBalance == null ? 'Unavailable' : `₹${Number(warning.walletBalance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`}</strong></p>
+          <p>Current wallet limit: <strong>₹{Number(warning.walletLimit || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></p>
+          <p>Amount to be locked: <strong>{warning.amountToLock == null ? 'Unavailable' : `₹${Number(warning.amountToLock).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`}</strong></p>
+        </div>
+        <p className="subscription-grace-countdown">Remaining time: <strong>{timeRemaining}</strong></p>
+      </>}
+      <div className="modal-actions">
+        <button type="button" className="primary-btn subscription-upgrade-button" onClick={renew}>{warning.stage === 'expired-grace' ? 'UPGRADE SUBSCRIPTION NOW' : 'Renew or Upgrade'}</button>
+        <button type="button" className="secondary-btn" onClick={dismiss}>CANCEL</button>
+      </div>
+    </section>
+  </div>;
 }
 
 function AccountPlanSection() {
@@ -2202,13 +3307,13 @@ function AccountPlanSection() {
   return <>
     <div className="account-section-heading"><h2>Current Plan</h2><Link to="/plans">Compare plans</Link></div>
     {error && <div className="alert-box" role="alert">{error}</div>}
-    {current ? <section className="account-panel current-plan-panel"><div><span className="eyebrow">Your membership{current.isTrial ? ' · Free trial' : ''}</span><h3>{current.plan}</h3><strong>{current.isTrial ? 'Four-day free trial' : current.plan === 'Starter' ? '₹0/month' : `₹${Number(current.price || (current.pricePaise || 0) / 100).toLocaleString('en-IN')}/month`}</strong></div>
+    {current ? <section className="account-panel current-plan-panel"><div><span className="eyebrow">Your membership{current.isTrial ? ' · Free trial' : ''}</span><h3>{displayPlanName(current.plan)}</h3><strong>{current.isTrial ? 'Four-day free trial' : current.plan === 'Starter' ? '₹0/month' : `₹${Number(current.price || (current.pricePaise || 0) / 100).toLocaleString('en-IN')}/month`}</strong></div>
       {current.isTrial && <><p>Trial activated: {new Date(current.startDate).toLocaleString('en-IN')}</p><p>Trial expires: {new Date(current.expiryDate).toLocaleString('en-IN')}</p><div className="ai-trial-status-facts"><span><strong>{current.remainingBuilds}</strong> of {current.buildLimit} successful project builds remaining</span><span>This trial has no paid billing, auto-renewal, or cashback.</span></div></>}
       {!current.isTrial && current.plan !== 'Starter' && <><p>Started: {current.startDate ? new Date(current.startDate).toLocaleDateString('en-IN') : 'Not available'}</p><p>Expires: {current.expiryDate ? new Date(current.expiryDate).toLocaleDateString('en-IN') : 'Not available'}</p><label className="renew-toggle"><span>Auto Renew</span><input type="checkbox" checked={Boolean(current.autoRenew)} disabled={busy || current.status !== 'active'} onChange={(event) => toggleAutoRenew(event.target.checked)} /><span>{current.autoRenew ? 'ON' : 'OFF'}</span></label><p className="plan-terms">Turning auto-renew off keeps your plan active through its expiry date. Unused AI credits are available only while a paid plan is active.</p></>}
       {current.plan === 'Starter' && <p>Starter is your default plan. Upgrade anytime to add AI features.</p>}
     </section> : <p>Loading your plan...</p>}
-    {!current?.isTrial && data?.trial?.used && !data.trial.active && <section className="account-panel plan-history"><h3>{data.trial.plan} trial · Expired</h3><p>Activated: {data.trial.activatedAt ? new Date(data.trial.activatedAt).toLocaleString('en-IN') : 'Not available'}</p><p>Expired: {data.trial.expiresAt ? new Date(data.trial.expiresAt).toLocaleString('en-IN') : 'Not available'}</p></section>}
-    {data?.history?.length > 0 && <section className="account-panel plan-history"><h3>Subscription history</h3>{data.history.map((item) => <div className="plan-history-row" key={item._id}><strong>{item.plan}</strong><span>{new Date(item.startDate).toLocaleDateString()} – {new Date(item.expiryDate).toLocaleDateString()}</span><span>{item.status}</span></div>)}</section>}
+    {!current?.isTrial && data?.trial?.used && !data.trial.active && <section className="account-panel plan-history"><h3>{displayPlanName(data.trial.plan)} trial · Expired</h3><p>Activated: {data.trial.activatedAt ? new Date(data.trial.activatedAt).toLocaleString('en-IN') : 'Not available'}</p><p>Expired: {data.trial.expiresAt ? new Date(data.trial.expiresAt).toLocaleString('en-IN') : 'Not available'}</p></section>}
+    {data?.history?.length > 0 && <section className="account-panel plan-history"><h3>Subscription history</h3>{data.history.map((item) => <div className="plan-history-row" key={item._id}><strong>{displayPlanName(item.plan)}</strong><span>{new Date(item.startDate).toLocaleDateString()} – {new Date(item.expiryDate).toLocaleDateString()}</span><span>{item.status}</span></div>)}</section>}
   </>;
 }
 
@@ -2265,14 +3370,14 @@ function AITrialActivationPage({ auth, onSignIn, onActivation }) {
   const remainingTime = `${Math.floor(remainingMs / 86400000)}d ${Math.floor((remainingMs % 86400000) / 3600000)}h ${Math.floor((remainingMs % 3600000) / 60000)}m`;
   const unavailable = Boolean(trial?.used || status?.subscription || !trial?.eligible);
 
-  if (!['Premium', 'Exclusive'].includes(plan)) return <main className="page-shell"><div className="container ai-trial-activation"><div className="alert-box">Choose the Premium or Exclusive trial from Plans &amp; AI.</div><Link className="secondary-btn" to="/plans">Back to Plans &amp; AI</Link></div></main>;
+  if (!['Premium', 'Exclusive'].includes(plan)) return <main className="page-shell"><div className="container ai-trial-activation"><div className="alert-box">Choose the Pro or Exclusive trial from Plans &amp; AI.</div><Link className="secondary-btn" to="/plans">Back to Plans &amp; AI</Link></div></main>;
   if (!auth) return <SignInRequiredPage onSignIn={onSignIn} />;
 
   return <main className="page-shell"><div className="container ai-trial-activation">
     <Link className="back-link" to="/plans">← Plans &amp; AI</Link>
     <section className="ai-trial-activation-card">
       <span className="eyebrow">Innovation Labs · Free Trial</span>
-      <h1>{trial?.active ? `${trial.plan} Trial Active` : `${plan} AI Project Builder Trial`}</h1>
+      <h1>{trial?.active ? `${displayPlanName(trial.plan)} Trial Active` : `${displayPlanName(plan)} AI Project Builder Trial`}</h1>
       <p className="ai-trial-activation-lead">Four consecutive days of AI project-building access with two successful project builds.</p>
       <div className="ai-trial-terms-grid"><div><strong>Duration</strong><span>4 days from server-confirmed activation</span></div><div><strong>Project builds</strong><span>{trial?.active ? `${trial.remainingBuilds} of 2 remaining` : '2 successful builds'}</span></div><div><strong>Available features</strong><span>{plan === 'Premium' ? 'Project Builder and AI-assisted component cart' : 'Project Builder, AI-assisted cart and checkout preparation'}</span></div><div><strong>Billing and cashback</strong><span>No paid subscription, recurring billing, automatic payment, or wallet cashback.</span></div></div>
       {trial?.active && <div className="ai-trial-live-status"><span>Activated {new Date(trial.activatedAt).toLocaleString('en-IN')}</span><span>Expires {new Date(trial.expiresAt).toLocaleString('en-IN')}</span><strong>{remainingTime} remaining</strong></div>}
@@ -2284,7 +3389,18 @@ function AITrialActivationPage({ auth, onSignIn, onActivation }) {
   </div></main>;
 }
 
-function AICreditSection({ canAddCredits }) {
+function AICreditSection({ canAddCredits, section }) {
+  const activeSection = section === 'ai-bills' ? 'ai-bills' : 'ai-credits';
+  return <>
+    <nav className="credit-section-nav" aria-label="Credit account pages">
+      <Link to="/account/ai-credits" className={activeSection === 'ai-credits' ? 'active' : ''}>AI Credits</Link>
+      <Link to="/account/ai-bills" className={activeSection === 'ai-bills' ? 'active' : ''}>AI Bill Credits</Link>
+    </nav>
+    {activeSection === 'ai-bills' ? <AIBillCreditSection /> : <AICreditBalanceSection canAddCredits={canAddCredits} />}
+  </>;
+}
+
+function AICreditBalanceSection({ canAddCredits }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   useEffect(() => { requestApi('/api/ai-credits').then(setData).catch((requestError) => setError(requestError.message)); }, []);
@@ -2294,6 +3410,47 @@ function AICreditSection({ canAddCredits }) {
       <section className="credits-balance-panel"><span>Remaining Credits</span><strong>{data.balance.toLocaleString('en-IN')}</strong><p>AI credits are used when you use certain AI features.</p>{canAddCredits && <Link className="primary-btn small" to="/account/ai-credits/add">Add Credits</Link>}</section>
       <section className="account-panel credit-history"><h3>Credit history</h3>{data.transactions.length ? data.transactions.map((transaction) => <article key={transaction._id}><span className={transaction.type === 'added' ? 'credit-added' : 'credit-used'}>{transaction.type === 'added' ? '+' : '−'}{transaction.amount}</span><div><strong>{transaction.action === 'credit_purchase' ? 'Credit Purchase' : transaction.action}</strong><small>{new Date(transaction.createdAt).toLocaleString()} · Balance {transaction.balanceAfter}</small></div></article>) : <AccountEmpty text="No credit transactions yet." />}</section>
     </> : <p>Loading your AI credits...</p>}
+  </>;
+}
+
+function AIBillCreditSection() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let active = true;
+    requestApi('/api/ai-bills')
+      .then((result) => { if (active) setData(result); })
+      .catch((requestError) => { if (active) setError(requestError.message); });
+    return () => { active = false; };
+  }, []);
+  const history = Array.isArray(data?.history) ? data.history.filter((item) => item && typeof item === 'object') : null;
+  const formatBillCount = (value) => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value))
+    ? Number(value).toLocaleString('en-IN')
+    : '—';
+  const resetDate = data?.nextAllowanceReset && !Number.isNaN(new Date(data.nextAllowanceReset).getTime())
+    ? new Date(data.nextAllowanceReset).toLocaleDateString('en-IN')
+    : 'not available';
+  return <>
+    <div className="account-section-heading"><h2>AI Bill Credits</h2><span>Project builds use one bill each</span></div>
+    {error && <div className="alert-box" role="alert">{error}</div>}
+    {data ? <>
+      <section className="credits-balance-panel ai-bill-balance-panel">
+        <span>Available AI Bills</span>
+        <strong>{formatBillCount(data.totalAvailable)}</strong>
+        <p>{formatBillCount(data.includedRemaining)} included this period · {formatBillCount(data.purchasedRemaining)} purchased</p>
+        <p>Included allowance: {formatBillCount(data.includedAllowance)} bills · Resets {resetDate}</p>
+        <Link className="primary-btn small" to="/account/ai-bills/add">Add Bills</Link>
+      </section>
+      <section className="account-panel credit-history">
+        <h3>Bill history</h3>
+        {history === null
+          ? <p className="alert-box" role="alert">Bill history is unavailable because the server returned an incomplete response. Please refresh and try again.</p>
+          : history.length ? history.map((item) => <article key={item._id}>
+            <span className={item.type === 'used' ? 'credit-used' : 'credit-added'}>{item.type === 'used' ? '−' : '+'}{formatBillCount(item.quantity)} bill{item.quantity === 1 ? '' : 's'}</span>
+            <div><strong>{item.type === 'allowance' ? `${item.source || 'Plan'} monthly allowance` : item.type === 'purchase' ? `${item.source || 'AI bill'} purchase` : 'Project build'}</strong><small>{item.createdAt && !Number.isNaN(new Date(item.createdAt).getTime()) ? new Date(item.createdAt).toLocaleString('en-IN') : 'Date unavailable'}</small></div>
+          </article>) : <AccountEmpty text="No AI bill activity yet." />}
+      </section>
+    </> : !error && <p>Loading your AI bill balance...</p>}
   </>;
 }
 
@@ -2307,16 +3464,67 @@ function AddCreditsPage() {
   const [pin, setPin] = useState('');
   const [pinOpen, setPinOpen] = useState(false);
   const [success, setSuccess] = useState(null);
+  const [pendingPayment, setPendingPayment] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
-    requestApi('/api/ai-credits').then(setData).catch((requestError) => setError(requestError.message));
+    let active = true;
+    Promise.all([requestApi('/api/ai-credits'), requestApi('/api/credits/purchases/pending')])
+      .then(([creditResult, pendingResult]) => {
+        if (!active) return;
+        setData(creditResult);
+        setPendingPayment(pendingResult.purchases?.[0] || null);
+      })
+      .catch((requestError) => { if (active) setError(requestError.message); });
+    return () => { active = false; };
   }, []);
 
   const quantity = Number(credits);
   const total = Number.isSafeInteger(quantity) && quantity > 0 ? quantity * Number(data?.pricePerCredit || 2) : 0;
   const validQuantity = Number.isSafeInteger(quantity) && quantity > 0 && quantity <= (data?.maxPurchase || 10000);
+
+  const verifyOnlineCreditPayment = async (purchaseToPay, response) => {
+    try {
+      const verified = await requestApi('/api/credits/razorpay/verify', {
+        method: 'POST',
+        body: JSON.stringify({ ...response, purchaseId: purchaseToPay.purchaseId }),
+      });
+      setPendingPayment(null);
+      setSuccess({ purchase: verified.purchase, balance: verified.balance });
+    } catch (verifyError) {
+      setPendingPayment(purchaseToPay);
+      setError(verifyError.message);
+    } finally { setBusy(false); }
+  };
+
+  const openOnlineCreditCheckout = async (purchaseToPay) => {
+    if (!purchaseToPay || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const order = await requestApi('/api/credits/razorpay/create', { method: 'POST', body: JSON.stringify({ purchaseId: purchaseToPay.purchaseId }) });
+      if (!window.Razorpay) throw new Error('Razorpay checkout is unavailable. Please try again.');
+      const checkout = new window.Razorpay({
+        key: order.keyId,
+        order_id: order.orderId,
+        amount: order.amountPaise,
+        currency: 'INR',
+        name: 'Innovation Labs',
+        description: `${purchaseToPay.credits.toLocaleString('en-IN')} AI credits`,
+        theme: { color: '#00d1ff' },
+        handler: (response) => {
+          setPendingPayment(purchaseToPay);
+          verifyOnlineCreditPayment(purchaseToPay, response);
+        },
+        modal: { ondismiss: () => setBusy(false) },
+      });
+      checkout.open();
+    } catch (requestError) {
+      setError(requestError.message);
+      setBusy(false);
+    }
+  };
 
   const startPurchase = async (event) => {
     event.preventDefault();
@@ -2334,27 +3542,7 @@ function AddCreditsPage() {
         const status = await requestApi(`/api/credits/purchase/${result.purchase.purchaseId}`);
         setWalletBalance(status.walletBalance);
       } else {
-        const order = await requestApi('/api/credits/razorpay/create', { method: 'POST', body: JSON.stringify({ purchaseId: result.purchase.purchaseId }) });
-        if (!window.Razorpay) throw new Error('Razorpay checkout is unavailable. Please try again.');
-        const checkout = new window.Razorpay({
-          key: order.keyId,
-          order_id: order.orderId,
-          amount: order.amountPaise,
-          currency: 'INR',
-          name: 'Innovation Labs',
-          description: `${quantity.toLocaleString('en-IN')} AI credits`,
-          theme: { color: '#00d1ff' },
-          handler: async (response) => {
-            try {
-              const verified = await requestApi('/api/credits/razorpay/verify', { method: 'POST', body: JSON.stringify({ ...response, purchaseId: result.purchase.purchaseId }) });
-              setSuccess({ purchase: verified.purchase, balance: verified.balance });
-            } catch (verifyError) { setError(verifyError.message); }
-            finally { setBusy(false); }
-          },
-          modal: { ondismiss: () => setBusy(false) },
-        });
-        checkout.open();
-        return;
+        await openOnlineCreditCheckout(result.purchase);
       }
     } catch (requestError) {
       setError(requestError.message);
@@ -2378,12 +3566,34 @@ function AddCreditsPage() {
     } finally { setBusy(false); }
   };
 
+  const reconcilePendingCreditPayment = async () => {
+    if (!pendingPayment || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await requestApi(`/api/credits/razorpay/reconcile/${pendingPayment.purchaseId}`, { method: 'POST' });
+      if (result.pending) {
+        setError('Razorpay has not confirmed a captured payment yet. Check again in a moment.');
+      } else {
+        setPendingPayment(null);
+        setSuccess({ purchase: result.purchase, balance: result.balance });
+      }
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally { setBusy(false); }
+  };
+
   if (success) return <CreditPurchaseSuccess success={success} onDone={() => navigate('/account/ai-credits')} />;
 
   return <main className="page-shell add-credits-page"><div className="container narrow-container">
     <Link className="back-link" to="/account/ai-credits">← Back to AI Credits</Link>
     <div className="section-title left"><span className="eyebrow">AI Credits</span><h1>Add Credits</h1><p>Purchase additional AI credits</p></div>
     {error && <div className="alert-box" role="alert">{error}</div>}
+    {pendingPayment && <section className="wallet-credit-summary pending-bill-payment">
+      <strong>Online credit payment pending verification</strong>
+      <p>{pendingPayment.credits.toLocaleString('en-IN')} credits · ₹{pendingPayment.totalAmount.toLocaleString('en-IN')}</p>
+      <button type="button" className="secondary-btn small" disabled={busy} onClick={reconcilePendingCreditPayment}>{busy ? 'Checking payment…' : 'Check Payment Status'}</button>
+    </section>}
     <form className="add-credits-card" onSubmit={startPurchase}>
       <div className="credit-price-note"><span>Price per credit</span><strong>₹{Number(data?.pricePerCredit || 2).toLocaleString('en-IN')}</strong></div>
       <label>How many credits do you want to add?<input inputMode="numeric" pattern="[0-9]*" value={credits} disabled={Boolean(purchase)} onChange={(event) => setCredits(event.target.value.replace(/\D/g, '').slice(0, 5))} placeholder="Enter credits" aria-describedby="credit-total" /></label>
@@ -2396,6 +3606,7 @@ function AddCreditsPage() {
         {walletBalance != null && walletBalance < purchase.totalAmount && <><p className="wallet-insufficient">Insufficient wallet balance. Required: ₹{purchase.totalAmount.toLocaleString('en-IN')} · Available: ₹{walletBalance.toLocaleString('en-IN')}</p><Link className="secondary-btn small" to="/wallet">Add Money to Wallet</Link></>}
       </div>}
       {purchase?.paymentMethod === 'Wallet' && (walletBalance == null || walletBalance >= purchase.totalAmount) && <button type="button" className="primary-btn full" disabled={busy} onClick={() => setPinOpen(true)}>{busy ? 'Processing Payment...' : `Pay ₹${purchase.totalAmount.toLocaleString('en-IN')}`}</button>}
+      {purchase?.paymentMethod === 'Razorpay' && <button type="button" className="primary-btn full" disabled={busy} onClick={() => openOnlineCreditCheckout(purchase)}>{busy ? 'Opening Online Payment...' : 'Continue Online Payment'}</button>}
       {!purchase && <button className="primary-btn full" disabled={busy || !validQuantity}>{busy ? 'Preparing Payment...' : 'Continue'}</button>}
     </form>
     {pinOpen && <div className="wallet-lock-overlay"><div className="wallet-pin-modal"><h2>Confirm Wallet Payment</h2><p>Amount ₹{purchase.totalAmount.toLocaleString('en-IN')} · {purchase.credits.toLocaleString('en-IN')} Credits</p><p>Enter your 4-digit wallet PIN.</p><PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} /><>{error && <p className="voice-error" role="alert">{error}</p>}</><div className="modal-actions"><button className="secondary-btn" disabled={busy} onClick={() => setPinOpen(false)}>Cancel</button><button className="primary-btn" disabled={busy || pin.length !== 4} onClick={confirmWalletPayment}>{busy ? 'Confirming...' : 'Confirm Payment'}</button></div></div></div>}
@@ -2409,7 +3620,185 @@ function CreditPurchaseSuccess({ success, onDone }) {
   return <main className="page-shell confirmation-shell"><div className="container credit-success"><div className="success-badge">✓</div><h1>Payment Successful</h1><p className="confirmation-intro">Credits Added</p><div className="credit-success-grid"><div><span>Credits Added</span><strong>+{success.purchase.credits.toLocaleString('en-IN')}</strong></div><div><span>Amount Paid</span><strong>₹{success.purchase.totalAmount.toLocaleString('en-IN')}</strong></div><div><span>New Credit Balance</span><strong>{Number(success.balance).toLocaleString('en-IN')} Credits</strong></div></div><p>Transaction {success.purchase.purchaseId}</p><button className="primary-btn" onClick={onDone}>Done</button></div></main>;
 }
 
+function AddBillsPage() {
+  const navigate = useNavigate();
+  const [quantityInput, setQuantityInput] = useState('1');
+  const [method, setMethod] = useState('Wallet');
+  const [creditBalance, setCreditBalance] = useState(null);
+  const [purchase, setPurchase] = useState(null);
+  const [walletBalance, setWalletBalance] = useState(null);
+  const [pin, setPin] = useState('');
+  const [pinOpen, setPinOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [pendingPurchaseError, setPendingPurchaseError] = useState('');
+  const [success, setSuccess] = useState(null);
+  const [pendingOnlinePurchase, setPendingOnlinePurchase] = useState(null);
+  const quantity = Number(quantityInput);
+  const validQuantity = Number.isInteger(quantity) && quantity >= 1 && quantity <= 20;
+  const totalAmount = validQuantity ? quantity * 200 : 0;
+  const creditCost = validQuantity ? quantity * 100 : 0;
+
+  useEffect(() => {
+    let active = true;
+    requestApi('/api/ai-bills')
+      .then((billResult) => { if (active) setCreditBalance(billResult.creditBalance); })
+      .catch((requestError) => { if (active) setError(`Bill status could not be loaded: ${requestError.message}`); });
+    requestApi('/api/bills/purchases/pending')
+      .then((pendingResult) => {
+        if (active) setPendingOnlinePurchase(pendingResult.purchases?.[0] || null);
+      })
+      .catch((requestError) => {
+        if (active) setPendingPurchaseError(`Pending online payment recovery is unavailable: ${requestError.message}. Restart or update the backend, then refresh this page.`);
+      });
+    return () => { active = false; };
+  }, []);
+
+  const completeOnlinePayment = async (purchaseId, response) => {
+    try {
+      const verified = await requestApi('/api/bills/razorpay/verify', {
+        method: 'POST',
+        body: JSON.stringify({ ...response, purchaseId }),
+      });
+      setPendingOnlinePurchase(null);
+      setSuccess({ ...verified, creditBalance: creditBalance ?? 0 });
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally { setBusy(false); }
+  };
+
+  const startPurchase = async (event) => {
+    event.preventDefault();
+    if (!validQuantity || busy || purchase) return;
+    setBusy(true);
+    setError('');
+    try {
+      const idempotencyKey = globalThis.crypto?.randomUUID?.() || `bills-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const result = await requestApi('/api/bills/purchase', {
+        method: 'POST',
+        body: JSON.stringify({ quantity, paymentMethod: method, idempotencyKey }),
+      });
+      if (method === 'Wallet') {
+        setPurchase(result.purchase);
+        setWalletBalance(Number(result.walletBalance));
+        setBusy(false);
+        return;
+      }
+      if (!window.Razorpay) throw new Error('Razorpay checkout is unavailable. Please try again.');
+      const checkout = new window.Razorpay({
+        key: result.keyId,
+        order_id: result.orderId,
+        amount: result.amountPaise,
+        currency: 'INR',
+        name: 'Innovation Labs',
+        description: `${quantity} AI bill${quantity === 1 ? '' : 's'}`,
+        theme: { color: '#00d1ff' },
+        handler: (response) => {
+          setPendingOnlinePurchase(result.purchase);
+          completeOnlinePayment(result.purchase.purchaseId, response);
+        },
+        modal: { ondismiss: () => setBusy(false) },
+      });
+      checkout.open();
+    } catch (requestError) {
+      setError(requestError.message);
+      setBusy(false);
+    }
+  };
+
+  const confirmWalletPayment = async () => {
+    if (!purchase || pin.length !== 4 || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await requestApi('/api/bills/wallet/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ purchaseId: purchase.purchaseId, pin }),
+      });
+      setPinOpen(false);
+      setPin('');
+      setSuccess({ ...result, creditBalance: creditBalance ?? 0 });
+    } catch (requestError) {
+      setError(requestError.message);
+      setPin('');
+    } finally { setBusy(false); }
+  };
+
+  const reconcilePendingPurchase = async () => {
+    if (!pendingOnlinePurchase || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await requestApi(`/api/bills/razorpay/reconcile/${pendingOnlinePurchase.purchaseId}`, { method: 'POST' });
+      if (result.pending) {
+        setError('Razorpay has not confirmed a captured payment yet. Check again in a moment.');
+      } else {
+        setPendingOnlinePurchase(null);
+        setSuccess({ ...result, creditBalance: creditBalance ?? 0 });
+      }
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally { setBusy(false); }
+  };
+
+  if (success) return <main className="page-shell confirmation-shell"><div className="container credit-success">
+    <div className="success-badge">✓</div><h1>AI Bills Added</h1>
+    <p className="confirmation-intro">{success.purchase.quantity} bill{success.purchase.quantity === 1 ? '' : 's'} are now available for project builds.</p>
+    <div className="credit-success-grid">
+      <div><span>Purchased Bills</span><strong>+{success.purchase.quantity}</strong></div>
+      <div><span>Payment</span><strong>₹{Number(success.purchase.totalAmount).toLocaleString('en-IN')}</strong></div>
+      <div><span>Available Bills</span><strong>{success.bills.totalAvailable}</strong></div>
+    </div>
+    <p>{success.purchase.creditsDeducted ? `${success.purchase.creditsDeducted} AI credits were also applied.` : 'No AI credits were deducted; bills can be purchased without credits.'}</p>
+    <button className="primary-btn" onClick={() => navigate('/account/ai-bills')}>Go to AI Bill Credits</button>
+  </div></main>;
+
+  return <main className="page-shell add-credits-page"><div className="container narrow-container">
+    <Link className="back-link" to="/account/ai-bills">← Back to AI Bill Credits</Link>
+    <div className="section-title left"><span className="eyebrow">AI Bill Credits</span><h1>Add Bills</h1><p>Each bill can be used for one successful AI project build. Purchased bills do not expire.</p></div>
+    {error && <div className="alert-box" role="alert">{error}</div>}
+    {pendingPurchaseError && <div className="alert-box" role="alert">{pendingPurchaseError}</div>}
+    {pendingOnlinePurchase && <section className="wallet-credit-summary pending-bill-payment">
+      <strong>Online bill payment pending verification</strong>
+      <p>{pendingOnlinePurchase.quantity} bill{pendingOnlinePurchase.quantity === 1 ? '' : 's'} · ₹{Number(pendingOnlinePurchase.totalAmount).toLocaleString('en-IN')}</p>
+      <button type="button" className="secondary-btn small" disabled={busy} onClick={reconcilePendingPurchase}>{busy ? 'Checking payment…' : 'Check Payment Status'}</button>
+    </section>}
+    <form className="add-credits-card" onSubmit={startPurchase}>
+      <div className="credit-price-note"><span>Price per bill</span><strong>₹200</strong></div>
+      <label>How many bills do you want to add?
+        <input inputMode="numeric" pattern="[0-9]*" value={quantityInput} disabled={Boolean(purchase)} onChange={(event) => setQuantityInput(event.target.value.replace(/\D/g, '').slice(0, 2))} aria-describedby="bill-total" />
+      </label>
+      <div className="credit-total" id="bill-total"><span>Total Amount</span><strong>₹{totalAmount.toLocaleString('en-IN')}</strong></div>
+      <div className="wallet-credit-summary">
+        <div><span>AI credit balance</span><strong>{creditBalance == null ? 'Loading…' : `${creditBalance.toLocaleString('en-IN')} credits`}</strong></div>
+        <p>{creditBalance != null && creditBalance >= creditCost && creditCost > 0
+          ? `${creditCost} credits will be applied to this purchase.`
+          : 'AI credits are optional; bills can still be purchased when your balance is low or zero.'}</p>
+      </div>
+      <div className="credit-method-picker"><strong>Choose Payment Method</strong>
+        <label><input type="radio" checked={method === 'Wallet'} disabled={Boolean(purchase)} onChange={() => setMethod('Wallet')} /> Wallet</label>
+        <label><input type="radio" checked={method === 'Razorpay'} disabled={Boolean(purchase)} onChange={() => setMethod('Razorpay')} /> Online Payment</label>
+      </div>
+      {purchase && method === 'Wallet' && <div className="wallet-credit-summary">
+        <div><span>Current Wallet Balance</span><strong>₹{Number(walletBalance || 0).toLocaleString('en-IN')}</strong></div>
+        <div><span>Balance After Payment</span><strong>₹{Math.max(0, Number(walletBalance || 0) - Number(purchase.totalAmount)).toLocaleString('en-IN')}</strong></div>
+        {Number(walletBalance || 0) < Number(purchase.totalAmount) && <><p className="wallet-insufficient">Insufficient wallet balance. Required: ₹{Number(purchase.totalAmount).toLocaleString('en-IN')}.</p><Link className="secondary-btn small" to="/wallet">Add Money to Wallet</Link></>}
+        <button type="button" className="secondary-btn small" disabled={busy} onClick={() => { setPurchase(null); setWalletBalance(null); }}>Change payment method</button>
+      </div>}
+      {purchase?.paymentMethod === 'Wallet' && Number(walletBalance || 0) >= Number(purchase.totalAmount) && <button type="button" className="primary-btn full" disabled={busy} onClick={() => setPinOpen(true)}>{busy ? 'Processing Payment…' : `Pay ₹${Number(purchase.totalAmount).toLocaleString('en-IN')}`}</button>}
+      {!purchase && <button className="primary-btn full" disabled={busy || !validQuantity}>{busy ? 'Preparing Payment…' : 'Continue to Payment'}</button>}
+    </form>
+    {pinOpen && <div className="wallet-lock-overlay"><div className="wallet-pin-modal" role="dialog" aria-modal="true" aria-labelledby="bill-wallet-payment-title">
+      <h2 id="bill-wallet-payment-title">Confirm Wallet Payment</h2><p>₹{Number(purchase.totalAmount).toLocaleString('en-IN')} · {purchase.quantity} AI bill{purchase.quantity === 1 ? '' : 's'}</p><p>Enter your 4-digit wallet PIN.</p>
+      <PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} />
+      {error && <p className="voice-error" role="alert">{error}</p>}
+      <div className="modal-actions"><button className="secondary-btn" disabled={busy} onClick={() => setPinOpen(false)}>Cancel</button><button className="primary-btn" disabled={busy || pin.length !== 4} onClick={confirmWalletPayment}>{busy ? 'Confirming…' : 'Confirm Payment'}</button></div>
+    </div></div>}
+  </div></main>;
+}
+
 function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareCheckout, onOpenCustomBuilding, onNavigate, openSignal, entitlementVersion }) {
+  const location = useLocation();
   const [open, setOpen] = useState(false);
   const [maximized, setMaximized] = useState(false);
   const [input, setInput] = useState('');
@@ -2421,7 +3810,8 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
   const [messages, setMessages] = useState([{ role: 'assistant', text: 'Describe the electronics project you want to build. I can recommend real catalog components, estimate their current cost, and prepare a custom-building brief.' }]);
   const feedRef = useRef(null);
   const appliedActionKeys = useRef(new Set());
-  const buildLimitReached = Boolean(entitlements && entitlements.entitlements.buildLimit != null && entitlements.entitlements.remainingBuilds <= 0);
+  const buildLimitReached = Boolean(entitlements?.accessType === 'trial' && entitlements.entitlements.buildLimit != null && entitlements.entitlements.remainingBuilds <= 0);
+  const noBillsRemaining = Boolean(entitlements?.entitlements?.bills && entitlements.entitlements.bills.totalAvailable <= 0);
 
   useEffect(() => {
     if (openSignal) setOpen(true);
@@ -2429,17 +3819,26 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
 
   useEffect(() => {
     let active = true;
-    requestApi('/api/ai/entitlements')
+    const refreshEntitlements = () => requestApi('/api/ai/entitlements')
       .then((result) => { if (active) setEntitlements(result); })
       .catch((error) => { if (active) setMessages((current) => [...current, { role: 'assistant', text: `AI entitlements are unavailable: ${error.message}` }]); });
-    return () => { active = false; };
-  }, [entitlementVersion]);
+    refreshEntitlements();
+    window.addEventListener('focus', refreshEntitlements);
+    return () => {
+      active = false;
+      window.removeEventListener('focus', refreshEntitlements);
+    };
+  }, [entitlementVersion, location.pathname]);
   useEffect(() => { if (open && feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight; }, [messages, project, open, maximized, busy]);
 
   const showMessage = (text) => setMessages((current) => [...current, { role: 'assistant', text }]);
   const createProject = async (idea) => {
     if (buildLimitReached) {
-      showMessage('You have used all available project builds on this plan. Upgrade your plan to continue.');
+      showMessage('You have used all available project builds in your trial. Choose a paid plan to continue.');
+      return;
+    }
+    if (noBillsRemaining) {
+      showMessage('You have no AI bills remaining. Add bills to keep generating projects.');
       return;
     }
     const budgetMatch = idea.match(/\b(?:under|within|budget(?: of)?)\s*(?:₹|rs\.?\s*)?([\d,]+)/i);
@@ -2460,7 +3859,7 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
 
   const addComponents = async (items) => {
     if (!entitlements?.entitlements?.addComponents) {
-      showMessage('AI-assisted cart addition is locked on this plan. Upgrade to Premium or Exclusive to add recommended components through AI.');
+      showMessage('AI-assisted cart addition is locked on this plan. Upgrade to Pro or Exclusive to add recommended components through AI.');
       return;
     }
     if (!items.length) {
@@ -2524,7 +3923,11 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
     const addAll = /\b(add|put)\b.*\b(all|required|components|parts)\b.*\b(cart|basket)\b|\b(add all|required components)\b/i.test(text);
     const checkoutIntent = /\b(checkout|check out|place (an )?order)\b/i.test(text);
     if (!checkoutIntent && !addAll && buildLimitReached) {
-      showMessage('You have used all available project builds on this plan. Upgrade your plan to continue.');
+      showMessage('You have used all available project builds in your trial. Choose a paid plan to continue.');
+      return;
+    }
+    if (!checkoutIntent && !addAll && noBillsRemaining) {
+      showMessage('You have no AI bills remaining. Add bills to keep generating projects.');
       return;
     }
     setInput('');
@@ -2535,7 +3938,7 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
     }
     if (addAll) {
       if (!entitlements?.entitlements?.addComponents) {
-        showMessage('AI-assisted cart addition is locked on Starter and Medium. Premium and Exclusive paid plans, and their eligible trials, can use this feature.');
+        showMessage('AI-assisted cart addition is locked on Starter and Plus. Pro and Exclusive paid plans, and their eligible trials, can use this feature.');
         return;
       }
       if (!project) {
@@ -2556,14 +3959,15 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
     } catch (error) {
       setRetryIdea(text);
       showMessage(error.message);
-      if (error.status === 403 || error.status === 402) onNavigate('/plans');
+      if (error.status === 403 && /bill/i.test(error.message)) onNavigate('/account/ai-bills/add');
+      else if (error.status === 403 || error.status === 402) onNavigate('/plans');
     } finally { setBusy(false); }
   };
 
   const retryProject = async () => {
     if (!retryIdea || busy) return;
     if (buildLimitReached) {
-      showMessage('You have used all available project builds on this plan. Upgrade your plan to continue.');
+      showMessage('You have used all available project builds in your trial. Choose a paid plan to continue.');
       return;
     }
     const idea = retryIdea;
@@ -2574,7 +3978,8 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
     catch (error) {
       setRetryIdea(idea);
       showMessage(error.message);
-      if (error.status === 403 || error.status === 402) onNavigate('/plans');
+      if (error.status === 403 && /bill/i.test(error.message)) onNavigate('/account/ai-bills/add');
+      else if (error.status === 403 || error.status === 402) onNavigate('/plans');
     } finally { setBusy(false); }
   };
 
@@ -2598,11 +4003,17 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
   return <>
     {!open && <button className="ai-launcher" aria-label="Open Innovation AI Project Builder" onClick={() => setOpen(true)}><span aria-hidden="true">✦</span><span>AI</span></button>}
     {open && <section className={`ai-chat-panel ai-project-builder-panel ${maximized ? 'is-maximized' : ''}`} aria-label="AI Project Builder">
-      <header className="ai-chat-header"><div className="ai-chat-identity"><span className="ai-chat-mark" aria-hidden="true">✦</span><div><strong>Innovation AI</strong><small>{entitlements?.plan || plan}{entitlements?.accessType === 'trial' ? ' · Free Trial' : ' · Project Builder'}</small></div></div><div className="ai-chat-controls"><button title={maximized ? 'Minimize panel' : 'Maximize panel'} aria-label={maximized ? 'Minimize panel' : 'Maximize panel'} onClick={() => setMaximized((value) => !value)}>{maximized ? '↙' : '↗'}</button><button title="Close AI panel" aria-label="Close AI panel" onClick={() => { setOpen(false); setMaximized(false); }}>×</button></div></header>
+      <header className="ai-chat-header"><div className="ai-chat-identity"><span className="ai-chat-mark" aria-hidden="true">✦</span><div><strong>Innovation AI</strong><small>{displayPlanName(entitlements?.plan || plan)}{entitlements?.accessType === 'trial' ? ' · Free Trial' : ' · Project Builder'}</small></div></div><div className="ai-chat-controls"><button title={maximized ? 'Minimize panel' : 'Maximize panel'} aria-label={maximized ? 'Minimize panel' : 'Maximize panel'} onClick={() => setMaximized((value) => !value)}>{maximized ? '↙' : '↗'}</button><button title="Close AI panel" aria-label="Close AI panel" onClick={() => { setOpen(false); setMaximized(false); }}>×</button></div></header>
       <div className="ai-chat-feed" ref={feedRef} aria-live="polite">
-        {entitlements && <div className="ai-builder-entitlement"><span>{entitlements.accessType === 'trial' ? `${entitlements.trial.plan} trial` : entitlements.plan}</span><span>{entitlements.entitlements.buildLimit == null ? 'Unlimited builds' : `${entitlements.entitlements.remainingBuilds} of ${entitlements.entitlements.buildLimit} builds remaining`}</span></div>}
+        {entitlements && <div className="ai-builder-entitlement">
+          <span>{entitlements.accessType === 'trial' ? `${displayPlanName(entitlements.trial.plan)} trial` : displayPlanName(entitlements.plan)}</span>
+          <span>{entitlements.entitlements.bills?.totalAvailable ?? 0} AI bills remaining</span>
+          {entitlements.accessType === 'trial' && <span>{entitlements.entitlements.remainingBuilds} of {entitlements.entitlements.buildLimit} trial builds remaining</span>}
+          {noBillsRemaining && <Link className="ai-exclusive-link" to="/account/ai-bills/add">Add Bills</Link>}
+        </div>}
+        {noBillsRemaining && <div className="ai-message assistant">AI project building is paused because your bill balance is empty. Add bills to continue.</div>}
         {messages.map((item, index) => <div className={`ai-message ${item.role}`} key={`${index}-${item.text}`}>{item.text}{item.text.includes('Upgrade') && <button className="ai-exclusive-link" onClick={() => onNavigate('/plans')}>View Plans &amp; AI</button>}</div>)}
-        {retryIdea && !busy && <button type="button" className="ai-project-retry" disabled={buildLimitReached} onClick={retryProject}>Retry project request</button>}
+        {retryIdea && !busy && <button type="button" className="ai-project-retry" disabled={buildLimitReached || noBillsRemaining} onClick={retryProject}>Retry project request</button>}
         {checkoutEstimate && <section className="ai-checkout-payment-choice" aria-label="Choose checkout payment method"><strong>Choose how to continue</strong><p>Final totals and payment authorization will be handled in secure checkout. Wallet PINs are entered only in the existing trusted PIN dialog.</p><button type="button" disabled={busy} onClick={() => chooseCheckoutPayment('Wallet')}>Continue with Wallet</button><button type="button" disabled={busy} onClick={() => chooseCheckoutPayment('Online Payment')}>Continue with Online Payment</button></section>}
         {project && <section className="ai-project-result" aria-label="Generated project plan">
           <header><span className="eyebrow">Project plan</span><h2>{project.title}</h2><p>{project.description}</p></header>
@@ -2627,23 +4038,30 @@ function AIAssistant({ plan, cart, service, onAddComponentsToCart, onPrepareChec
         </section>}
         {busy && <div className="ai-message assistant ai-progress" role="status"><span className="spinner" /> Working with the secure catalog and current entitlements…</div>}
       </div>
-      <form className="ai-chat-input" onSubmit={send}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Describe a project or ask to add its components" aria-label="Describe an electronics project" maxLength={2000} /><button disabled={busy || !input.trim() || buildLimitReached} aria-label="Send project request">↑</button></form>
+      <form className="ai-chat-input" onSubmit={send}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Describe a project or ask to add its components" aria-label="Describe an electronics project" maxLength={2000} /><button disabled={busy || !input.trim() || buildLimitReached || noBillsRemaining} aria-label="Send project request">↑</button></form>
       <footer className="ai-chat-safety">Project Builder only. Never enter a PIN, password, OTP, or card details here.</footer>
     </section>}
   </>;
 }
 
-function ProductsPage({ cart, wishlist, auth, onSignIn, onTrackViewed, onAddToCart, onAddWishlistItem, onQty, onAddPromoToCart, initialCategory = 'All Products' }) {
+function ProductsPage({ cart, wishlist, auth, onSignIn, onTrackViewed, onTrackSearch, onAddToCart, onAddWishlistItem, onQty, onAddPromoToCart, initialCategory = 'All Products' }) {
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState(() => typeof location.state?.productSearchQuery === 'string' ? location.state.productSearchQuery : '');
   const [category, setCategory] = useState(initialCategory);
   const [collapsed, setCollapsed] = useState(false);
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
   const [catalog, setCatalog] = useState([]);
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState('');
+
+  useEffect(() => {
+    const term = query.trim();
+    if (!auth || location.pathname !== '/products' || category !== 'All Products' || term.length < 2 || !onTrackSearch) return undefined;
+    const timer = window.setTimeout(() => onTrackSearch(term), 800);
+    return () => window.clearTimeout(timer);
+  }, [auth?.id, category, location.pathname, onTrackSearch, query]);
   const [promoCodes, setPromoCodes] = useState([]);
   const [discountOffers, setDiscountOffers] = useState([]);
   const [promoLoading, setPromoLoading] = useState(false);
@@ -2831,7 +4249,11 @@ function ProductsPage({ cart, wishlist, auth, onSignIn, onTrackViewed, onAddToCa
         const inWishlist = wishlist.some((item) => item.productType === 'product' && item.productId === product.id);
         const openDetails = () => navigate(`/products/${encodeURIComponent(product.id)}`);
         const keepCardOpen = (event) => event.stopPropagation();
-        return <article className="product-card product-card-clickable" key={product.id} role="link" tabIndex={0} aria-label={`View details for ${product.name}`} onMouseEnter={() => onTrackViewed(product)} onClick={openDetails} onKeyDown={(event) => {
+        return <article className="product-card product-card-clickable" key={product.id} role="link" tabIndex={0} aria-label={`View details for ${product.name}`} onPointerEnter={(event) => {
+          if (event.pointerType === 'mouse' && window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
+            onTrackViewed?.(product);
+          }
+        }} onClick={openDetails} onKeyDown={(event) => {
           if (event.target !== event.currentTarget || !['Enter', ' '].includes(event.key)) return;
           event.preventDefault();
           openDetails();
@@ -2999,6 +4421,7 @@ function ProductDetailsPage({ auth, onSignIn, onAddToCart, onAddWishlistItem, on
           <a className="product-rating-link" href="#customer-reviews"><ProductStars rating={summary.averageRating} /><strong>{summary.averageRating.toFixed(1)} / 5</strong><span>{summary.totalReviews} customer reviews</span></a>
           <strong className="product-details-price">₹{Number(product.price).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
           <span className={`product-details-stock ${isOutOfStock ? 'out-of-stock' : ''}`}>{isOutOfStock ? 'Out of Stock' : product.inventoryProduct && product.stock != null ? `${product.status} · ${product.stock} available` : 'In Stock'}</span>
+          {product.inventoryProduct && <p className="product-cancellation-policy"><strong>Cancellation Policy:</strong> {product.cancellable === false ? 'Non-Cancellable' : 'Cancellable'}</p>}
           <p className="product-details-description">{product.description}</p>
           {Object.entries(product.technicalSpecs || {}).filter(([, value]) => value != null && String(value).trim()).length > 0 && <section className="product-specifications"><h2>Technical Specifications</h2><dl>{Object.entries(product.technicalSpecs).filter(([, value]) => value != null && String(value).trim()).map(([key, value]) => <div key={key}><dt>{key.replace(/([A-Z])/g, ' $1').replace(/^./, (letter) => letter.toUpperCase())}</dt><dd>{String(value)}</dd></div>)}</dl></section>}
           <div className="product-details-actions">
@@ -3032,7 +4455,7 @@ function ProductDetailsPage({ auth, onSignIn, onAddToCart, onAddWishlistItem, on
   </main>;
 }
 
-function CartPage({ cart, cartError, appliedDiscount, onApplyDiscount, onDiscountValidated, onRemoveDiscount, onRemove, onQty, onMoveToWishlist, onCheckout }) {
+function CartPage({ cart, cartError, cartPriceNotice, onDismissPriceNotice, appliedDiscount, onApplyDiscount, onDiscountValidated, onRemoveDiscount, onRemove, onQty, onMoveToWishlist, onCheckout }) {
   const [discountInput, setDiscountInput] = useState('');
   const [discountError, setDiscountError] = useState('');
   const [discountBusy, setDiscountBusy] = useState(false);
@@ -3084,6 +4507,7 @@ function CartPage({ cart, cartError, appliedDiscount, onApplyDiscount, onDiscoun
           <h2>{cart.length ? 'Selected Items' : 'Your cart is waiting for your next project.'}</h2>
         </div>
         {cartError && <div className="alert-box" role="alert">{cartError}</div>}
+        {cartPriceNotice && <div className="inquiry-success-banner" role="status">{cartPriceNotice}<button className="cart-notice-dismiss" type="button" aria-label="Dismiss price update notice" onClick={onDismissPriceNotice}>×</button></div>}
 
         {cart.length === 0 ? (
           <div className="cart-empty-layout">
@@ -3202,7 +4626,7 @@ function PromoCodePaymentPage({ auth, address, setAddress, savedAddresses, saveA
       setAddressErrors({});
       if (['pending_approval', 'purchased', 'used'].includes(result.status) && result.order) {
         const savedOrder = onPurchased(result.order, result.reservationId);
-        navigate('/order-placed', { state: { order: savedOrder } });
+        navigate(`/order-placed/${encodeURIComponent(savedOrder.orderId || savedOrder.id)}`, { state: { order: savedOrder } });
         return;
       }
     }).catch((requestError) => {
@@ -3237,7 +4661,7 @@ function PromoCodePaymentPage({ auth, address, setAddress, savedAddresses, saveA
     const savedOrder = onPurchased(result.order, reservationId);
     setPinOpen(false);
     setPin('');
-    navigate('/order-placed', { state: { order: savedOrder } });
+    navigate(`/order-placed/${encodeURIComponent(savedOrder.orderId || savedOrder.id)}`, { state: { order: savedOrder } });
   };
 
   const verifyGiftRecipient = async () => {
@@ -3378,7 +4802,7 @@ function PromoCodePaymentPage({ auth, address, setAddress, savedAddresses, saveA
 
   const continueToOrder = () => nextPromoReservationId
     ? navigate(`/products/promo-codes/payment/${encodeURIComponent(nextPromoReservationId)}`)
-    : navigate('/order-placed', { state: { order: success.order } });
+    : navigate(`/order-placed/${encodeURIComponent(success.order.orderId || success.order.id)}`, { state: { order: success.order } });
 
   if (loading) return <main className="page-shell"><div className="container loader-wrap"><div className="spinner" /><p>Loading secure payment...</p></div></main>;
   if (error && !reservation && !success) return <main className="page-shell"><div className="container narrow-container"><div className="alert-box">{error}</div><Link className="secondary-btn" to="/products">Return to Products</Link></div></main>;
@@ -3478,14 +4902,20 @@ function PromoPurchaseSuccess({ success, nextPromoReservationId, onCopy, onConti
   </div></main>;
 }
 
-function CheckoutPage({ auth, cart, selectedService, setSelectedService, projectPreferences, setProjectPreferences, address, setAddress, saveAddress, checkoutStep, setCheckoutStep, onOpenProjectModal, onPay, onWalletPay, paymentTotal, appliedDiscount, codingCharge, buildingCharge, deliveryCharge, subtotal, handlePlaceOrder, onLogin, savedAddresses, authEmail }) {
+function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selectedService, setSelectedService, projectPreferences, address, setAddress, saveAddress, checkoutStep, setCheckoutStep, onOpenProjectModal, onPay, onWalletPay, onRequestExit, checkoutReference, appliedDiscount, onLogin, savedAddresses, authEmail }) {
   const navigate = useNavigate();
   const location = useLocation();
+  const actionInProgressRef = useRef(false);
   const [errors, setErrors] = useState({});
+  const [actionInProgress, setActionInProgress] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState('online');
+  const [checkoutEstimate, setCheckoutEstimate] = useState(null);
+  const [checkoutEstimateError, setCheckoutEstimateError] = useState('');
+  const [checkoutEstimateRetry, setCheckoutEstimateRetry] = useState(0);
   const [walletQuote, setWalletQuote] = useState(null);
   const [walletQuoteError, setWalletQuoteError] = useState('');
   const [walletQuoteLoading, setWalletQuoteLoading] = useState(false);
+  const [walletQuoteRefreshKey, setWalletQuoteRefreshKey] = useState(0);
 
   const hasCoding = selectedService === 'coding' || selectedService === 'full';
   const hasBuilding = selectedService === 'building' || selectedService === 'full';
@@ -3493,6 +4923,56 @@ function CheckoutPage({ auth, cart, selectedService, setSelectedService, project
   const displayedCheckoutStep = digitalOnly ? 3 : checkoutStep;
   const serviceIndex = serviceOptions.findIndex((option) => option.id === selectedService);
   const currentAddress = auth && authEmail ? savedAddresses[authEmail] || address : address;
+  const selectedServiceOption = serviceOptions.find((option) => option.id === selectedService);
+  const cartSubtotal = cart.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0);
+  const showFinalCharges = displayedCheckoutStep >= 2;
+  const checkoutActionLabel = displayedCheckoutStep === 3
+    ? paymentMethod === 'wallet' ? 'Pay Now' : 'Place Order'
+    : displayedCheckoutStep === 4 ? 'Order Confirmed' : 'Next';
+  const formatCheckoutMoney = (value) => `₹${Number(value || 0).toLocaleString('en-IN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+  const estimateText = (value, { freeWhenZero = false } = {}) => checkoutEstimate
+    ? freeWhenZero && Number(value) === 0 ? 'Free' : formatCheckoutMoney(value)
+    : checkoutEstimateError ? 'Unavailable' : 'Calculating…';
+  const quoteContainsValidAmounts = (estimate) => {
+    const requiredAmounts = ['subtotal', 'deliveryCharge', 'codingCharge', 'buildingCharge', 'discount', 'subscriptionDiscount', 'total'];
+    const expectedTotal = Number(estimate.subtotal) + Number(estimate.deliveryCharge)
+      + Number(estimate.codingCharge) + Number(estimate.buildingCharge)
+      - Number(estimate.discount) - Number(estimate.subscriptionDiscount);
+    return Array.isArray(estimate.items)
+      && estimate.items.length === cart.length
+      && requiredAmounts.every((key) => isNonNegativeAmount(estimate[key]))
+      && Math.abs(Number(estimate.total) - Math.max(0, expectedTotal)) < 0.02
+      && estimate.items.every((item, index) => (
+        String(item.id) === String(cart[index]?.id)
+        && Number(item.quantity) === Number(cart[index]?.quantity)
+        && isNonNegativeAmount(item.lineTotal)
+      ));
+  };
+  const hasValidWalletQuote = Boolean(walletQuote
+    && isNonNegativeAmount(walletQuote.balance)
+    && isNonNegativeAmount(walletQuote.total));
+  const walletQuoteMatchesEstimate = Boolean(hasValidWalletQuote && checkoutEstimate
+    && Math.abs(Number(walletQuote.total) - Number(checkoutEstimate.total)) < 0.02);
+  const checkoutActionDisabled = actionInProgress
+    || displayedCheckoutStep === 4
+    || displayedCheckoutStep === 3 && (
+      !checkoutEstimate
+      || Boolean(checkoutEstimateError)
+      || paymentMethod === 'wallet' && (
+        walletQuoteLoading
+        || Boolean(walletQuoteError)
+        || !walletQuoteMatchesEstimate
+        || walletQuote.balance < walletQuote.total
+      )
+    )
+    || displayedCheckoutStep === 3 && (
+      paymentMethod === 'online'
+        ? !checkoutReference
+        : false
+    );
 
   useEffect(() => {
     if (location.state?.aiPaymentMethod === 'Wallet') setPaymentMethod('wallet');
@@ -3510,25 +4990,85 @@ function CheckoutPage({ auth, cart, selectedService, setSelectedService, project
   }, [digitalOnly, checkoutStep, setCheckoutStep]);
 
   useEffect(() => {
-    if (!auth || paymentMethod !== 'wallet') return undefined;
+    if (!auth || displayedCheckoutStep < 2) {
+      setCheckoutEstimate(null);
+      setCheckoutEstimateError('');
+      return undefined;
+    }
     let active = true;
+    const controller = new AbortController();
+    let timeout;
+    setCheckoutEstimate(null);
+    setCheckoutEstimateError('');
+    const quoteRequest = requestApi('/api/checkout/quote', {
+      method: 'POST',
+      body: JSON.stringify({ items: cart, service: selectedService, discountCode: appliedDiscount?.code }),
+      signal: controller.signal,
+    }).then((estimate) => {
+      if (!estimate || !quoteContainsValidAmounts(estimate)) {
+        throw new Error('The server returned an incomplete checkout estimate. Please retry.');
+      }
+      return estimate;
+    });
+    const quoteTimeout = new Promise((resolve, reject) => {
+      timeout = window.setTimeout(() => {
+        reject(new Error('The checkout estimate timed out. Check your connection and retry.'));
+        controller.abort();
+      }, 10000);
+    });
+    Promise.race([quoteRequest, quoteTimeout]).then((estimate) => {
+      if (active) setCheckoutEstimate(estimate);
+    }).catch((error) => {
+      if (active) setCheckoutEstimateError(error.message || 'The latest checkout estimate could not be calculated.');
+    }).finally(() => {
+      window.clearTimeout(timeout);
+    });
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [auth?.id, cart, selectedService, appliedDiscount?.code, displayedCheckoutStep, checkoutEstimateRetry]);
+
+  useEffect(() => {
+    if (!auth?.id || paymentMethod !== 'wallet') {
+      setWalletQuote(null);
+      setWalletQuoteError('');
+      setWalletQuoteLoading(false);
+      return undefined;
+    }
+    let active = true;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 15000);
     setWalletQuoteLoading(true);
     setWalletQuoteError('');
+    setWalletQuote(null);
     requestApi('/api/wallet/quote', {
       method: 'POST',
       body: JSON.stringify({ items: cart, service: selectedService, discountCode: appliedDiscount?.code }),
+      signal: controller.signal,
     }).then((quote) => {
+      if (!quote || !isNonNegativeAmount(quote.balance) || !isNonNegativeAmount(quote.total)) {
+        throw new Error('The server returned an incomplete Wallet balance check. Please retry.');
+      }
       if (active) setWalletQuote(quote);
     }).catch((error) => {
       if (active) {
         setWalletQuote(null);
-        setWalletQuoteError(error.message);
+        setWalletQuoteError(error.name === 'AbortError'
+          ? 'Wallet balance check timed out.'
+          : error.message || 'Wallet balance could not be checked.');
       }
     }).finally(() => {
+      window.clearTimeout(timeout);
       if (active) setWalletQuoteLoading(false);
     });
-    return () => { active = false; };
-  }, [auth, cart, paymentMethod, selectedService, appliedDiscount?.code]);
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [auth?.id, cart, paymentMethod, selectedService, appliedDiscount?.code, walletQuoteRefreshKey]);
 
   if (!auth) {
     return (
@@ -3574,27 +5114,69 @@ function CheckoutPage({ auth, cart, selectedService, setSelectedService, project
     }
   };
 
+  const handleCheckoutAction = async () => {
+    if (actionInProgressRef.current || displayedCheckoutStep === 4) return;
+    actionInProgressRef.current = true;
+    setActionInProgress(true);
+    try {
+      if (displayedCheckoutStep < 3) {
+        await nextStep();
+      } else if (paymentMethod === 'wallet') {
+        await onWalletPay();
+      } else {
+        await onPay();
+      }
+    } finally {
+      actionInProgressRef.current = false;
+      setActionInProgress(false);
+    }
+  };
+
+  const renderCheckoutAction = (className = 'primary-btn') => (
+    <button
+      type="button"
+      className={className}
+      disabled={checkoutActionDisabled}
+      onClick={handleCheckoutAction}
+    >
+      {actionInProgress && displayedCheckoutStep === 3 ? 'Processing...' : checkoutActionLabel}
+    </button>
+  );
+
   return (
     <main className="page-shell">
       <div className="container checkout-shell">
+        {cartPriceNotice && <div className="inquiry-success-banner" role="status">{cartPriceNotice}<button className="cart-notice-dismiss" type="button" aria-label="Dismiss price update notice" onClick={onDismissPriceNotice}>×</button></div>}
         <div className="checkout-header">
           <span className="eyebrow">Secure checkout</span>
           <h2>Place your order</h2>
         </div>
 
-        <div className="progress-steps">
-          {(digitalOnly ? [3, 4] : [1, 2, 3, 4]).map((step) => (
-            <div key={step} className={`step ${displayedCheckoutStep >= step ? 'active' : ''}`}>
-              {step === 1 && 'Project Preferences'}
-              {step === 2 && 'Address'}
-              {step === 3 && 'Payment'}
-              {step === 4 && 'Confirmation'}
-            </div>
-          ))}
+        <div className="progress-steps" aria-label="Checkout progress">
+          {['Project Preferences', 'Address', 'Payment', 'Confirmation'].map((label, index) => {
+            const step = index + 1;
+            const completed = step < displayedCheckoutStep || (step === 4 && checkoutStep === 4);
+            const current = step === displayedCheckoutStep && !completed;
+            return (
+              <div
+                key={step}
+                className={`checkout-progress-step${completed ? ' is-complete' : ''}${current ? ' is-current' : ''}`}
+                aria-current={current ? 'step' : undefined}
+                aria-label={`Step ${step}: ${label}${completed ? ', completed' : current ? ', current step' : ', upcoming'}`}
+              >
+                <span className="checkout-progress-marker" aria-hidden="true">
+                  {completed ? <span className="checkout-progress-check">✓</span> : step}
+                </span>
+                <span className="checkout-progress-label">{label}</span>
+              </div>
+            );
+          })}
         </div>
 
+        <div className="checkout-layout">
+          <div className="checkout-main">
         {displayedCheckoutStep === 1 && (
-          <div className="checkout-card">
+          <div className="checkout-card checkout-step-card" key="checkout-step-1">
             <h3>Step 1 — Project Preferences</h3>
             <div className="service-slider-wrap">
               <label htmlFor="service-slider" className="service-slider-label">Project service level</label>
@@ -3635,13 +5217,13 @@ function CheckoutPage({ auth, cart, selectedService, setSelectedService, project
             </div>
 
             <div className="checkout-actions">
-              <button className="primary-btn" onClick={nextStep}>Next</button>
+              {renderCheckoutAction()}
             </div>
           </div>
         )}
 
         {displayedCheckoutStep === 2 && (
-          <div className="checkout-card">
+          <div className="checkout-card checkout-step-card" key="checkout-step-2">
             <h3>Step 2 — Address</h3>
             <div className="address-grid">
               <label>
@@ -3687,13 +5269,13 @@ function CheckoutPage({ auth, cart, selectedService, setSelectedService, project
 
             <div className="checkout-actions space-between">
               <button className="secondary-btn" onClick={() => setCheckoutStep(1)}>Back</button>
-              <button className="primary-btn" onClick={nextStep}>Next</button>
+              {renderCheckoutAction()}
             </div>
           </div>
         )}
 
         {displayedCheckoutStep === 3 && (
-          <div className="checkout-card">
+          <div className="checkout-card checkout-step-card" key="checkout-step-3">
             <h3>Step 3 — Payment</h3>
             <div className="payment-methods">
               <strong>Payment Method</strong>
@@ -3702,42 +5284,119 @@ function CheckoutPage({ auth, cart, selectedService, setSelectedService, project
             </div>
             {paymentMethod === 'wallet' && <section className="wallet-checkout-summary">
               <h4>Wallet Payment</h4>
-              {walletQuoteLoading ? <p>Checking wallet balance...</p> : walletQuoteError ? <><p>{walletQuoteError}</p><Link to="/wallet">Open Wallet</Link></> : walletQuote && <>
-                <div className="summary-row"><span>Wallet Balance</span><strong>{walletQuote.balance == null ? 'Verify with PIN' : `₹${walletQuote.balance.toLocaleString('en-IN')}`}</strong></div>
-                <div className="summary-row"><span>Order Total</span><strong>₹{walletQuote.total.toLocaleString('en-IN')}</strong></div>
-                {walletQuote.balance != null && walletQuote.balance < walletQuote.total ? <><div className="summary-row"><span>Short by</span><strong>₹{(walletQuote.total - walletQuote.balance).toLocaleString('en-IN')}</strong></div><p className="wallet-insufficient">Insufficient wallet balance. Your order will not be placed.</p><Link className="secondary-btn small" to="/wallet">Recharge Wallet</Link></> : <div className="summary-row total"><span>Amount to Pay</span><strong>₹{walletQuote.total.toLocaleString('en-IN')}</strong></div>}
+              {walletQuoteLoading ? <p>Checking wallet balance...</p> : walletQuoteError ? <><p role="alert">{walletQuoteError}</p><button className="secondary-btn small" type="button" onClick={() => setWalletQuoteRefreshKey((current) => current + 1)}>Retry</button></> : hasValidWalletQuote && !walletQuoteMatchesEstimate ? <><p role="alert">The Wallet amount does not match the latest order total. Refresh the Wallet check before paying.</p><button className="secondary-btn small" type="button" onClick={() => setWalletQuoteRefreshKey((current) => current + 1)}>Refresh Wallet check</button></> : hasValidWalletQuote && <>
+                <div className="summary-row"><span>Current Wallet Balance</span><strong>₹{Number(walletQuote.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
+                <div className="summary-row"><span>Order Amount</span><strong>₹{Number(walletQuote.total).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
+                {walletQuote.balance < walletQuote.total
+                  ? <><div className="summary-row"><span>Additional Amount Required</span><strong>₹{(walletQuote.total - walletQuote.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div><p className="wallet-insufficient">Insufficient Wallet Balance! Your available balance is ₹{Number(walletQuote.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}; the order requires ₹{Number(walletQuote.total).toLocaleString('en-IN', { minimumFractionDigits: 2 })}.</p><Link className="secondary-btn small" to="/wallet">Recharge Wallet</Link></>
+                  : <><div className="summary-row total"><span>Remaining Balance After Payment</span><strong>₹{(walletQuote.balance - walletQuote.total).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div><p>Your balance will be checked again when you confirm payment.</p></>}
               </>}
             </section>}
             <div className="fee-list">
               <h4>Order Summary</h4>
-              {cart.map((item) => (
+              {cart.map((item, index) => (
                 <div className="summary-row" key={item.id}>
                   <span>{item.name} × {item.quantity}</span>
-                  <strong>₹{item.price * item.quantity}</strong>
+                  <strong>{checkoutEstimate
+                    ? formatCheckoutMoney(checkoutEstimate.items[index].lineTotal)
+                    : checkoutEstimateError ? 'Unavailable' : 'Calculating…'}</strong>
                 </div>
               ))}
             </div>
             <div className="fee-list">
-              <div className="summary-row"><span>Product subtotal</span><strong>₹{subtotal}</strong></div>
-              {appliedDiscount && <div className="summary-row cart-discount-summary"><span>Discount Promo Code ({appliedDiscount.code})</span><strong>−₹{Number(appliedDiscount.discountAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}
-              {codingCharge > 0 && <div className="summary-row"><span>Coding charge</span><strong>₹{codingCharge}</strong></div>}
-              {buildingCharge > 0 && <div className="summary-row"><span>Building charge</span><strong>₹{buildingCharge}</strong></div>}
-              {!digitalOnly && <div className="summary-row"><span>Delivery charge</span><strong>{deliveryCharge ? `₹${deliveryCharge}` : 'FREE'}</strong></div>}
-              <div className="summary-row total"><span>Grand total</span><strong>₹{paymentTotal}</strong></div>
+              <div className="summary-row"><span>Product subtotal</span><strong>{estimateText(checkoutEstimate?.subtotal)}</strong></div>
+              {checkoutEstimate && Number(checkoutEstimate.discount) > 0 && <div className="summary-row cart-discount-summary"><span>Discount Promo Code ({checkoutEstimate.discountCode || appliedDiscount?.code})</span><strong>−{formatCheckoutMoney(checkoutEstimate.discount)}</strong></div>}
+              {checkoutEstimate && <div className="summary-row cart-discount-summary"><span>{displayPlanName(checkoutEstimate.subscriptionDiscountPlan)} membership discount ({checkoutEstimate.subscriptionDiscountPercent}% OFF)</span><strong>−{formatCheckoutMoney(checkoutEstimate.subscriptionDiscount)}</strong></div>}
+              <div className="summary-row"><span>Coding charge</span><strong>{estimateText(checkoutEstimate?.codingCharge, { freeWhenZero: true })}</strong></div>
+              <div className="summary-row"><span>Building charge</span><strong>{estimateText(checkoutEstimate?.buildingCharge, { freeWhenZero: true })}</strong></div>
+              <div className="summary-row"><span>Delivery charge</span><strong>{estimateText(checkoutEstimate?.deliveryCharge, { freeWhenZero: true })}</strong></div>
+              <div className="summary-row total"><span>Grand total</span><strong>{estimateText(checkoutEstimate?.total)}</strong></div>
+              {checkoutEstimateError && <p className="checkout-estimate-error" role="alert">{checkoutEstimateError} <button className="secondary-btn small" type="button" onClick={() => setCheckoutEstimateRetry((retry) => retry + 1)}>Retry calculation</button></p>}
+              <p className="checkout-policy-agreement">By placing this order, you agree to our <Link to="/policies#terms">Terms and Policies</Link>.</p>
             </div>
 
             <div className="checkout-actions space-between">
-              <button className="secondary-btn" onClick={() => digitalOnly ? navigate('/cart') : setCheckoutStep(2)}>Back</button>
+              <button className="secondary-btn" onClick={() => digitalOnly ? onRequestExit('/cart') : setCheckoutStep(2)}>Back</button>
               <div className="payment-actions">
-                {paymentMethod === 'online' ? (
-                  <button className="primary-btn" onClick={onPay}>Pay Online</button>
-                ) : (
-                  <button className="primary-btn" disabled={!walletQuote || walletQuoteLoading || (walletQuote.balance != null && walletQuote.balance < walletQuote.total)} onClick={onWalletPay}>Pay with Wallet</button>
-                )}
+                {renderCheckoutAction()}
               </div>
             </div>
           </div>
         )}
+          </div>
+
+          <aside className="checkout-order-summary" aria-labelledby="checkout-order-summary-title">
+            <h3 id="checkout-order-summary-title">Place Your Order</h3>
+            <div className="checkout-order-summary-action">{renderCheckoutAction('primary-btn full')}</div>
+            <div className="checkout-summary-service">
+              <span>Project service</span>
+              <strong>{selectedServiceOption?.title || 'Parts Only'}</strong>
+            </div>
+            <div className="checkout-summary-products">
+              <strong>Products</strong>
+              {cart.length ? cart.map((item, index) => {
+                const quotedItem = checkoutEstimate?.items?.[index];
+                return (
+                  <div className="checkout-summary-product" key={`${item.id || item.name}-${index}`}>
+                    <span>{quotedItem?.name || item.name || 'Product'} × {quotedItem?.quantity ?? item.quantity}</span>
+                    <strong>{showFinalCharges
+                      ? quotedItem ? formatCheckoutMoney(quotedItem.lineTotal) : checkoutEstimateError ? 'Unavailable' : 'Calculating…'
+                      : formatCheckoutMoney(Number(item.price || 0) * Number(item.quantity || 0))}</strong>
+                  </div>
+                );
+              }) : <p>Your cart is empty.</p>}
+            </div>
+            <div className="checkout-summary-row">
+              <span>Product charges</span>
+              <strong>{showFinalCharges
+                ? checkoutEstimate ? formatCheckoutMoney(checkoutEstimate.subtotal) : checkoutEstimateError ? 'Unavailable' : 'Calculating…'
+                : formatCheckoutMoney(cartSubtotal)}</strong>
+            </div>
+            <div className="checkout-summary-row">
+              <span>Delivery charges</span>
+              <strong>{!showFinalCharges
+                ? '—'
+                : checkoutEstimate
+                  ? Number(checkoutEstimate.deliveryCharge) > 0 ? formatCheckoutMoney(checkoutEstimate.deliveryCharge) : 'Free'
+                  : checkoutEstimateError ? 'Unavailable' : 'Calculating…'}</strong>
+            </div>
+            <div className="checkout-summary-row">
+              <span>Coding charges</span>
+              <strong>{!showFinalCharges
+                ? '—'
+                : checkoutEstimate
+                  ? Number(checkoutEstimate.codingCharge) > 0 ? formatCheckoutMoney(checkoutEstimate.codingCharge) : 'Free'
+                  : checkoutEstimateError ? 'Unavailable' : 'Calculating…'}</strong>
+            </div>
+            <div className="checkout-summary-row">
+              <span>Building charges</span>
+              <strong>{!showFinalCharges
+                ? '—'
+                : checkoutEstimate
+                  ? Number(checkoutEstimate.buildingCharge) > 0 ? formatCheckoutMoney(checkoutEstimate.buildingCharge) : 'Free'
+                  : checkoutEstimateError ? 'Unavailable' : 'Calculating…'}</strong>
+            </div>
+            {showFinalCharges && checkoutEstimate && Number(checkoutEstimate.discount) > 0 && <div className="checkout-summary-row is-discount">
+              <span>Discount{checkoutEstimate.discountCode ? ` (${checkoutEstimate.discountCode})` : ''}</span>
+              <strong>−{formatCheckoutMoney(checkoutEstimate.discount)}</strong>
+            </div>}
+            {showFinalCharges && checkoutEstimate && <div className="checkout-summary-row is-discount">
+              <span>{displayPlanName(checkoutEstimate.subscriptionDiscountPlan)} membership discount ({checkoutEstimate.subscriptionDiscountPercent}% OFF)</span>
+              <strong>−{formatCheckoutMoney(checkoutEstimate.subscriptionDiscount)}</strong>
+            </div>}
+            {showFinalCharges && checkoutEstimateError && <div className="checkout-summary-note" role="alert">
+              {checkoutEstimateError}{' '}
+              <button type="button" className="secondary-btn small" onClick={() => setCheckoutEstimateRetry((retry) => retry + 1)}>Retry estimate</button>
+            </div>}
+            <div className="checkout-summary-total">
+              <span>Estimated total</span>
+              <strong>{!showFinalCharges
+                ? '—'
+                : checkoutEstimate ? formatCheckoutMoney(checkoutEstimate.total) : checkoutEstimateError ? 'Unavailable' : 'Calculating…'}</strong>
+            </div>
+            {!showFinalCharges && <p className="checkout-summary-note">Service and delivery charges will be calculated after you continue.</p>}
+          </aside>
+        </div>
       </div>
     </main>
   );
@@ -3746,11 +5405,12 @@ function CheckoutPage({ auth, cart, selectedService, setSelectedService, project
 const accountSections = [
   ['overview', 'Overview'],
   ['plan', 'Plan'],
-  ['ai-credits', 'AI Credits'],
+  ['ai-credits', 'Credits'],
   ['orders', 'My Orders'],
   ['wishlist', 'My Wishlist'],
   ['reward-points', 'Reward Points'],
   ['discount-codes', 'Discount Promo Codes'],
+  ['browsing-history', 'Browsing & Search History'],
   ['scratch-cards', 'My Scratch Cards'],
   ['invoices', 'My Invoices'],
   ['history', 'Order History'],
@@ -3767,6 +5427,29 @@ function AccountLoadingPage() {
   return <main className="page-shell"><div className="container centered-box"><div className="empty-state"><h3>Checking your account...</h3></div></div></main>;
 }
 
+function AdminLoadingPage() {
+  return <main className="page-shell"><div className="container centered-box"><div className="empty-state"><h3>Checking admin access...</h3></div></div></main>;
+}
+
+function AdminSignInPage({ auth, onSignIn, onSignOut }) {
+  return (
+    <main className="page-shell">
+      <div className="container centered-box">
+        <div className="admin-sign-in-card">
+          <span className="eyebrow">Innovation Labs</span>
+          <h1>Admin Sign In</h1>
+          <p>Use your authorized admin account to continue to the admin dashboard.</p>
+          {auth?.email && <div className="admin-sign-in-status">Signed in as {auth.email}</div>}
+          <div className="modal-actions">
+            <button type="button" className="primary-btn" onClick={onSignIn}>Continue with Google</button>
+            {auth && <button type="button" className="secondary-btn" onClick={onSignOut}>Sign Out</button>}
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+}
+
 function SignInRequiredPage({ onSignIn }) {
   return (
     <main className="page-shell">
@@ -3780,9 +5463,9 @@ function SignInRequiredPage({ onSignIn }) {
   );
 }
 
-function AccountPage({ user, canAddCredits, accountData, orders, customOrders, notifications, address, wishlist, onAddWishlistItem, onRemoveWishlistItem, onAddWishlistPromoToCart, onAddToCart, onAddDiscountCodeToCart, loading, error, notice, onSaveAddress, onSavePhone, onMarkRead, onOrderCustomItem, onSignOut, onCancelOrder }) {
+function AccountPage({ user, canAddCredits, accountData, onRefreshOrders, orders, customOrders, notifications, address, wishlist, browsingHistory, browsingSearchHistory, browsingHistoryCatalog, browsingHistoryLoading, browsingHistoryError, onRemoveBrowsingHistory, onRemoveSearchHistory, onClearBrowsingHistory, onClearSearchHistory, onClearAllHistory, onSearchHistoryAgain, onAddWishlistItem, onRemoveWishlistItem, onAddWishlistPromoToCart, onAddToCart, onAddDiscountCodeToCart, loading, error, notice, onSaveAddress, onSavePhone, onMarkRead, onOrderCustomItem, onSignOut, onCancelOrder }) {
   const { section = 'overview' } = useParams();
-  const activeSection = accountSections.some(([id]) => id === section) ? section : 'overview';
+  const activeSection = accountSections.some(([id]) => id === section) || section === 'ai-bills' ? section : 'overview';
   const profile = accountData?.profile || user;
   const stats = accountData?.stats;
   const [editingAddress, setEditingAddress] = useState(false);
@@ -3790,6 +5473,8 @@ function AccountPage({ user, canAddCredits, accountData, orders, customOrders, n
   const [phoneNumber, setPhoneNumber] = useState(profile.phoneNumber || '');
   const [settingsError, setSettingsError] = useState('');
   const [savingSettings, setSavingSettings] = useState(false);
+  const [deliveryNow, setDeliveryNow] = useState(() => Date.now());
+  const deliveryClockRef = useRef({ serverTime: Date.now(), performanceTime: performance.now() });
 
   useEffect(() => {
     setAddressDraft({ ...initialAddress, ...(address || {}) });
@@ -3799,7 +5484,39 @@ function AccountPage({ user, canAddCredits, accountData, orders, customOrders, n
     setPhoneNumber(profile.phoneNumber || '');
   }, [profile.phoneNumber]);
 
-  const itemCountFor = (order) => (order.items || []).reduce((sum, item) => sum + item.quantity, 0);
+  useEffect(() => {
+    if (activeSection !== 'orders') return undefined;
+    const interval = window.setInterval(onRefreshOrders, 10_000);
+    return () => window.clearInterval(interval);
+  }, [activeSection, onRefreshOrders]);
+
+  useEffect(() => {
+    const serverTime = Date.parse(accountData?.serverNow || '');
+    if (!Number.isFinite(serverTime)) return undefined;
+    deliveryClockRef.current = { serverTime, performanceTime: performance.now() };
+    let timer;
+    const updateAtIndiaMidnight = () => {
+      const currentTime = deliveryClockRef.current.serverTime
+        + performance.now() - deliveryClockRef.current.performanceTime;
+      setDeliveryNow(currentTime);
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+      }).formatToParts(new Date(currentTime));
+      const values = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
+      const nextIndiaMidnight = Date.UTC(values.year, values.month - 1, values.day + 1) - (5.5 * 60 * 60 * 1000);
+      timer = window.setTimeout(updateAtIndiaMidnight, Math.max(0, nextIndiaMidnight - currentTime + 25));
+    };
+    updateAtIndiaMidnight();
+    return () => window.clearTimeout(timer);
+  }, [accountData?.serverNow]);
+
+  const itemCountFor = (order) => (order.items || []).reduce(
+    (sum, item) => sum + getOrderItemQuantities(item).activeQuantity,
+    0,
+  );
   const dateFor = (date) => date ? new Date(date).toLocaleDateString() : 'Date unavailable';
   const orderRows = orders.slice().sort((left, right) => new Date(right.date) - new Date(left.date));
   const currentCustomOrders = customOrders.slice().sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt));
@@ -3830,7 +5547,7 @@ function AccountPage({ user, canAddCredits, accountData, orders, customOrders, n
         <div className="account-layout">
           <aside className="account-sidebar" aria-label="Account sections">
             {accountSections.map(([id, label]) => (
-              <Link key={id} to={`/account/${id}`} className={activeSection === id ? 'active' : ''}>
+              <Link key={id} to={`/account/${id}`} className={activeSection === id || (id === 'ai-credits' && activeSection === 'ai-bills') ? 'active' : ''}>
                 {id === 'sign-out' && <span aria-hidden="true">↪</span>}{label}
               </Link>
             ))}
@@ -3871,16 +5588,44 @@ function AccountPage({ user, canAddCredits, accountData, orders, customOrders, n
                     {order.orderType === 'PROMO_CODE' && <PromoOrderAccountDetails order={order} />}
                     <div className="account-order-summary"><strong>{itemCountFor(order)} Items</strong><strong>₹{order.total}</strong></div>
                     <p>Placed: {dateFor(order.date)}</p>
+                    {order.estimatedDelivery && <p className="account-order-delivery">{formatEstimatedDelivery(order.estimatedDelivery, new Date(deliveryNow))}</p>}
                     {order.orderType === 'PROMO_CODE' && order.promoCode && <div className="order-row"><span>Promo Code</span><strong>{order.promoCode}</strong></div>}
                     {order.orderType === 'PROMO_CODE' && order.promoCodeStatus && <div className="order-row"><span>Redemption</span><strong>{order.promoCodeStatus === 'REDEEMED' ? 'Redeemed' : 'Ready to redeem'}</strong></div>}
                     {order.orderType === 'PROMO_CODE' && order.purchaseType === 'offline' && order.orderStatus === 'Pending Admin Approval' && <div className="order-row"><span>Fulfillment</span><strong>Pending admin approval</strong></div>}
-                    <div className="account-order-items">{(order.items || []).map((item) => <span key={item.id}>{item.name} × {item.quantity}</span>)}</div>
-                    {['Declined', 'Rejected'].includes(order.orderStatus) && order.refundCase && <><div className="order-row"><span>Refund Status</span><strong>{refundStatusLabel(order.refundCase.status)}</strong></div><div className="order-row"><span>Refund Amount</span><strong>₹{((order.refundCase.approvedRefundAmountPaise ?? order.refundCase.refundAmountPaise ?? 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></>}
-                    <div className="account-order-top"><span>Payment: {order.paymentStatus}</span><div className="order-actions"><Link className="secondary-btn small" to="/order-placed" state={{ order }}>View Order</Link>{order.refundEligible && !order.cancelEligible && <Link className="secondary-btn small" to={`/refund/${encodeURIComponent(order.id)}`}>Refund</Link>}{order.cancelEligible && !order.refundEligible && <button className="secondary-btn small" onClick={() => onCancelOrder(order)}>Cancel</button>}</div></div>
+                    <div className="account-order-items">{activeOrderItemCount(order) > 0 ? (order.items || []).flatMap((item, index) => {
+                      const { activeQuantity } = getOrderItemQuantities(item);
+                      return activeQuantity > 0 ? [<span key={`${item.id || item.name}-${index}`}>{item.name} × {activeQuantity}</span>] : [];
+                    }) : <span>No active products remain.</span>}</div>
+                    {['Declined', 'Rejected'].includes(order.orderStatus) && order.refundCase && <>
+                      <div className="order-row"><span>Refund Status</span><strong>{order.refundCase.reasonCategory === 'Order Decline' && order.refundCase.status === 'REFUND_COMPLETED' ? 'Refund credited to Innovation Labs Wallet' : refundStatusLabel(order.refundCase.status)}</strong></div>
+                      <div className="order-row"><span>Original Order Amount</span><strong>₹{((order.refundCase.verifiedAmountPaidPaise ?? order.refundCase.originalOrderAmountPaise ?? Math.round(Number(order.total || 0) * 100)) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
+                      {order.refundCase.refundDestination && <div className="order-row"><span>Refund Destination</span><strong>{order.refundCase.refundDestination}</strong></div>}
+                      {order.refundCase.status === 'REFUND_COMPLETED'
+                        ? <div className="order-row"><span>Refund credited</span><strong>₹{((order.refundCase.approvedRefundAmountPaise ?? order.refundCase.refundAmountPaise ?? order.refundCase.verifiedAmountPaidPaise ?? 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
+                        : <div className="order-row"><span>Refund amount under review</span><strong>₹{((order.refundCase.approvedRefundAmountPaise ?? order.refundCase.refundAmountPaise ?? 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}
+                    </>}
+                    <div className="account-order-top"><span>Payment: {order.paymentStatus}</span><div className="order-actions"><Link className="secondary-btn small" to={`/order-placed/${encodeURIComponent(order.orderId || order.id)}`} state={{ order }}>View Order</Link>{order.refundEligible && !order.cancelEligible && <Link className="secondary-btn small" to={`/refund/${encodeURIComponent(order.id)}`}>Refund</Link>}{order.cancelEligible && !order.refundEligible && <button className="secondary-btn small" onClick={() => onCancelOrder(order)}>Cancel</button>}</div></div>
                     {(order.cancellationId || order.orderStatus === 'Cancelled' || order.refundCase) && <div className="order-status-stamps">{(order.cancellationId || order.orderStatus === 'Cancelled') && <span className="order-cancelled-stamp">CANCELLED</span>}{order.refundCase && <span className="refund-order-stamp">{refundStatusLabel(order.refundCase.status).toUpperCase()}</span>}</div>}
                   </article>
                 ))}</div> : <AccountEmpty text="No orders yet." />}
               </>
+            )}
+
+            {activeSection === 'browsing-history' && (
+              <HistoryPage
+                history={browsingHistory}
+                searches={browsingSearchHistory}
+                catalog={browsingHistoryCatalog}
+                loading={browsingHistoryLoading}
+                error={browsingHistoryError}
+                onRemove={onRemoveBrowsingHistory}
+                onRemoveSearch={onRemoveSearchHistory}
+                onClearBrowsing={onClearBrowsingHistory}
+                onClearSearch={onClearSearchHistory}
+                onClearAll={onClearAllHistory}
+                onSearchAgain={onSearchHistoryAgain}
+                embedded
+              />
             )}
 
             {activeSection === 'history' && (
@@ -3896,7 +5641,7 @@ function AccountPage({ user, canAddCredits, accountData, orders, customOrders, n
                           <td>{(order.items || []).map((item) => `${item.name} × ${item.quantity}`).join(', ')}</td>
                           <td>₹{order.subtotal}</td><td>{order.deliveryCharge ? `₹${order.deliveryCharge}` : 'FREE'}</td>
                           <td>₹{order.total}</td><td>{order.orderStatus}</td>
-                          <td><Link to="/order-placed" state={{ order }}>Open</Link></td>
+                          <td><Link to={`/order-placed/${encodeURIComponent(order.orderId || order.id)}`} state={{ order }}>Open</Link></td>
                         </tr>
                       ))}</tbody>
                     </table>
@@ -3960,7 +5705,7 @@ function AccountPage({ user, canAddCredits, accountData, orders, customOrders, n
 
             {activeSection === 'plan' && <AccountPlanSection />}
 
-            {activeSection === 'ai-credits' && <AICreditSection canAddCredits={canAddCredits} />}
+            {['ai-credits', 'ai-bills'].includes(activeSection) && <AICreditSection canAddCredits={canAddCredits} section={activeSection} />}
 
             {activeSection === 'address' && (
               <>
@@ -4019,7 +5764,7 @@ function AccountPage({ user, canAddCredits, accountData, orders, customOrders, n
                 <p>Are you sure you want to sign out from Innovation Labs?</p>
                 <div className="account-form-actions">
                   <Link className="secondary-btn" to="/account/overview">Cancel</Link>
-                  <button className="primary-btn signout-button" onClick={onSignOut}>Sign Out</button>
+                  <button className="primary-btn signout-button" onClick={() => onSignOut()}>Sign Out</button>
                 </div>
               </section>
             )}
@@ -4263,13 +6008,13 @@ function AccountEmpty({ text }) {
   return <div className="account-empty-state"><p>{text}</p></div>;
 }
 
-function PinBoxes({ value, onChange, autoFocus = true, disabled = false }) {
+function PinBoxes({ value, onChange, autoFocus = true, disabled = false, focusVersion = 0 }) {
   const refs = useRef([]);
   const digits = `${value || ''}`.slice(0, 4).split('');
   while (digits.length < 4) digits.push('');
   useEffect(() => {
     if (autoFocus) refs.current[0]?.focus();
-  }, [autoFocus]);
+  }, [autoFocus, focusVersion]);
   const setDigit = (index, digit) => {
     const next = digits.map((item, position) => position === index ? digit.replace(/\D/g, '').slice(-1) : item).join('');
     onChange(next);
@@ -4312,7 +6057,7 @@ function WalletPage({ auth, accessVersion, onRequestUnlock }) {
   const [loading, setLoading] = useState(true);
   const [amount, setAmount] = useState('500');
   const [activeTab, setActiveTab] = useState(() => location.state?.openPromoTab ? 'promo' : 'wallet');
-  const [activeSection, setActiveSection] = useState('overview');
+  const [activeSection, setActiveSection] = useState(() => location.state?.openTransferTab ? 'transfer' : 'overview');
   const [transferIntroOpen, setTransferIntroOpen] = useState(false);
   const [message, setMessage] = useState('');
 
@@ -4395,18 +6140,19 @@ function WalletPage({ auth, accessVersion, onRequestUnlock }) {
       <div className="wallet-workspace-content">
         {activeSection === 'overview' ? <>
           <div className="wallet-header"><span className="eyebrow">Secure payments</span><h1>My Wallet</h1><p>Use your Innovation Labs balance for faster checkout.</p></div>
-          <div className="wallet-balance-card"><span>Available Balance</span><strong>₹{wallet.balance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong><button className="primary-btn small" onClick={() => setActiveTab('recharge')}>Recharge Wallet</button></div>
+          <div className="wallet-balance-card"><span>Available Balance</span><strong>₹{wallet.balance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong><div className="wallet-balance-breakdown"><span>Total Wallet Balance: ₹{Number(wallet.totalBalance ?? wallet.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span></div><button className="primary-btn small" onClick={() => setActiveTab('recharge')}>Recharge Wallet</button></div>
+          <section className="wallet-restricted-balance" aria-label="Restricted wallet balance"><div><span className="wallet-restricted-lock" aria-hidden="true">🔒</span><h2>Restricted Balance</h2></div><strong>₹{Number(wallet.restrictedBalance || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></section>
           <div className="wallet-tabs" role="tablist" aria-label="Wallet overview sections"><button role="tab" aria-selected={activeTab === 'wallet'} className={activeTab === 'wallet' ? 'active' : ''} onClick={() => setActiveTab('wallet')}>Wallet</button><button role="tab" aria-selected={activeTab === 'history'} className={activeTab === 'history' ? 'active' : ''} onClick={() => setActiveTab('history')}>History</button><button role="tab" aria-selected={activeTab === 'recharge'} className={activeTab === 'recharge' ? 'active' : ''} onClick={() => setActiveTab('recharge')}>Recharge</button><button role="tab" aria-selected={activeTab === 'promo'} className={activeTab === 'promo' ? 'active' : ''} onClick={() => setActiveTab('promo')}>Promo Code</button></div>
           {message && <div className="account-notice">{message}</div>}
           {activeTab === 'recharge' && <section className="wallet-panel"><h2>Recharge Wallet</h2><div className="recharge-options">{[500, 1000, 2000].map((value) => <button key={value} className="secondary-btn" onClick={() => setAmount(String(value))}>₹{value.toLocaleString('en-IN')}</button>)}</div><label className="wallet-amount">Custom Recharge<input type="number" min="10" value={amount} onChange={(event) => setAmount(event.target.value)} placeholder="Enter amount" /></label><button className="primary-btn" onClick={recharge}>Pay ₹{Number(amount || 0).toLocaleString('en-IN')}</button></section>}
           {activeTab === 'wallet' && <section className="wallet-panel"><h2>Wallet payments</h2><p>Choose Wallet at checkout to pay securely from this balance. Your PIN is required for every wallet payment.</p></section>}
-          {activeTab === 'history' && <section className="wallet-panel"><h2>Wallet History</h2>{wallet.transactions.length ? <div className="wallet-history">{wallet.transactions.map((transaction) => <article key={transaction.id}><span className={`wallet-amount-sign ${transaction.amount >= 0 ? 'positive' : 'negative'}`}>{transaction.amount >= 0 ? '+' : '-'}₹{Math.abs(transaction.amount).toLocaleString('en-IN')}</span><div><strong>{transaction.type}</strong><p>{transaction.description}</p><small>{new Date(transaction.createdAt).toLocaleString()} · {transaction.status}</small></div></article>)}</div> : <AccountEmpty text="No wallet transactions yet." />}</section>}
+          {activeTab === 'history' && <section className="wallet-panel"><h2>Wallet History</h2>{wallet.transactions.length ? <div className="wallet-history">{wallet.transactions.map((transaction) => <article key={transaction.id}><span className={`wallet-amount-sign ${transaction.amount >= 0 ? 'positive' : 'negative'}`}>{transaction.amount >= 0 ? '+' : '-'}₹{Math.abs(transaction.amount).toLocaleString('en-IN')}</span><div><strong>{transaction.type === 'Order Decline Refund' ? 'Refund credited to Innovation Labs Wallet' : transaction.type}</strong><p>{transaction.description}</p>{transaction.originalPaymentMethod && <p>Original payment: {transaction.originalPaymentMethod}{transaction.originalPaymentReference ? ` · ${transaction.originalPaymentReference}` : ''}</p>}{transaction.refundDestination && <p>Refund destination: {transaction.refundDestination}</p>}<small>{new Date(transaction.createdAt).toLocaleString()} · {transaction.status}</small></div></article>)}</div> : <AccountEmpty text="No wallet transactions yet." />}</section>}
           {activeTab === 'promo' && <PromoWalletPanel promoCodes={promoCodes} onRedeemed={(result) => {
-            setWallet((current) => ({ ...current, balance: result.balance, transactions: [result.transaction, ...current.transactions] }));
+            setWallet((current) => ({ ...current, balance: result.balance, availableBalance: result.availableBalance, totalBalance: result.totalBalance, restrictedBalance: result.restrictedBalance, transactions: [result.transaction, ...current.transactions] }));
             setPromoCodes((current) => current.map((promo) => promo.code === result.transaction.description?.replace('Promo Code: ', '') ? { ...promo, successfulUses: result.successfulUses, remainingUses: result.remainingUses, status: result.fullyRedeemed ? 'fully_redeemed' : 'purchased' } : promo));
             setMessage(`₹${result.amount.toLocaleString('en-IN')} added to your wallet.`);
           }} />}
-        </> : <WalletTransferWorkspace wallet={wallet} onWalletUpdate={setWallet} onBackToOverview={() => setActiveSection('overview')} />}
+        </> : <WalletTransferWorkspace wallet={wallet} onWalletUpdate={setWallet} onBackToOverview={() => setActiveSection('overview')} accessVersion={accessVersion} />}
       </div>
     </div>
     {transferIntroOpen && <div className="wallet-lock-overlay"><section className="wallet-pin-modal transfer-intro-modal" role="dialog" aria-modal="true" aria-labelledby="transfer-intro-title"><h2 id="transfer-intro-title">Transfer Money</h2><p>Securely transfer money from your Innovation Labs Wallet to another user’s wallet using their Wallet ID.</p><p>You will need the recipient’s Wallet ID to continue.</p><div className="modal-actions"><button className="secondary-btn" onClick={() => setTransferIntroOpen(false)}>Cancel</button><button className="primary-btn" onClick={() => { setTransferIntroOpen(false); setActiveSection('transfer'); }}>Continue</button></div></section></div>}
@@ -4467,9 +6213,19 @@ function WalletPromoCode({ promo }) {
   </article>;
 }
 
-function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
+function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, accessVersion }) {
+  const navigate = useNavigate();
   const [view, setView] = useState('checking-id');
+  const [transferTab, setTransferTab] = useState('enter');
   const [walletId, setWalletId] = useState(wallet.walletId || '');
+  const [walletIdChecked, setWalletIdChecked] = useState(false);
+  const [qrData, setQrData] = useState(null);
+  const [qrImage, setQrImage] = useState('');
+  const [qrLoading, setQrLoading] = useState(false);
+  const [qrTransferAvailable, setQrTransferAvailable] = useState(false);
+  const [qrAccessError, setQrAccessError] = useState('');
+  const [qrAccessRefresh, setQrAccessRefresh] = useState(0);
+  const [qrAccessChecking, setQrAccessChecking] = useState(true);
   const [recipientSuffix, setRecipientSuffix] = useState('');
   const [recipient, setRecipient] = useState(null);
   const [recipientConfirmOpen, setRecipientConfirmOpen] = useState(false);
@@ -4488,14 +6244,49 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
 
   useEffect(() => {
     let active = true;
+    let requestInFlight = false;
+    const checkQrAccess = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const result = await requestApi('/api/wallet/transfers/qr/access');
+        if (active) {
+          setQrTransferAvailable(result.available === true);
+          setQrAccessError('');
+        }
+      } catch (requestError) {
+        if (active) {
+          setQrTransferAvailable(false);
+          setQrAccessError(requestError.message || 'QR transfer eligibility could not be verified.');
+        }
+      } finally {
+        requestInFlight = false;
+        if (active) setQrAccessChecking(false);
+      }
+    };
+    setQrTransferAvailable(false);
+    setQrAccessError('');
+    setQrAccessChecking(true);
+    checkQrAccess();
+    const intervalId = window.setInterval(checkQrAccess, 60_000);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [accessVersion, qrAccessRefresh]);
+
+  useEffect(() => {
+    let active = true;
     requestApi('/api/wallet/transfers/account').then((result) => {
       if (!active) return;
       if (result.walletId) {
         setWalletId(result.walletId);
         setView('recipient');
       } else {
+        setWalletId('');
         setView('create-id');
       }
+      setWalletIdChecked(true);
     }).catch((requestError) => {
       if (active) {
         setError(requestError.message);
@@ -4513,6 +6304,83 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
   const validRecipientSuffix = /^[A-Z]{4}\d{4}$/.test(recipientSuffix);
   const availablePaise = Math.round(Number(wallet.balance || 0) * 100);
 
+  useEffect(() => {
+    if (transferTab !== 'show' || !ownWalletId) return undefined;
+    let active = true;
+    setQrLoading(true);
+    requestApi('/api/wallet/transfers/qr', { method: 'POST', body: JSON.stringify({}) })
+      .then((result) => { if (active) setQrData(result); })
+      .catch((requestError) => { if (active) setError(requestError.message); })
+      .finally(() => { if (active) setQrLoading(false); });
+    return () => { active = false; };
+  }, [transferTab, ownWalletId]);
+
+  useEffect(() => {
+    let active = true;
+    if (!qrData?.qrPayload) {
+      setQrImage('');
+      return undefined;
+    }
+    setQrImage('');
+    const renderWalletQr = async () => {
+      try {
+        const qrDataUrl = await QRCode.toDataURL(qrData.qrPayload, {
+          width: 640,
+          margin: 4,
+          color: { dark: '#07151c', light: '#ffffff' },
+          errorCorrectionLevel: 'H',
+        });
+        const [qr, logo] = await Promise.all([qrDataUrl, innovationLabsLogo].map((src) => new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = () => reject(new Error('The QR code logo could not be loaded.'));
+          image.src = src;
+        })));
+        const canvas = document.createElement('canvas');
+        canvas.width = 640;
+        canvas.height = 640;
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Your browser could not prepare the QR code image.');
+        context.imageSmoothingEnabled = false;
+        context.drawImage(qr, 0, 0, canvas.width, canvas.height);
+
+        const panelWidth = 136;
+        const panelHeight = 112;
+        const panelX = (canvas.width - panelWidth) / 2;
+        const panelY = (canvas.height - panelHeight) / 2;
+        context.imageSmoothingEnabled = true;
+        context.fillStyle = '#ffffff';
+        context.beginPath();
+        context.roundRect(panelX, panelY, panelWidth, panelHeight, 14);
+        context.fill();
+        context.strokeStyle = '#00aeca';
+        context.lineWidth = 3;
+        context.stroke();
+        context.save();
+        context.beginPath();
+        context.roundRect(panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16, 8);
+        context.clip();
+        context.drawImage(logo, 105, 175, 1045, 825, panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16);
+        context.restore();
+
+        if (active) setQrImage(canvas.toDataURL('image/png'));
+      } catch (qrError) {
+        if (active) setError(`Your QR code could not be generated: ${qrError.message}`);
+      }
+    };
+    renderWalletQr();
+    return () => { active = false; };
+  }, [qrData]);
+
+  const selectTransferTab = async (nextTab) => {
+    setError('');
+    if (nextTab === 'show' && (!walletIdChecked || !ownWalletId)) {
+      setError('Your Wallet ID has not been generated yet. Generate your Wallet ID first to use QR transfers.');
+      return;
+    }
+    setTransferTab(nextTab);
+  };
+
   const createWalletId = async () => {
     if (creatingId) return;
     setCreatingId(true);
@@ -4520,6 +6388,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
     try {
       const result = await requestApi('/api/wallet/transfers/wallet-id', { method: 'POST', body: JSON.stringify({}) });
       setWalletId(result.walletId);
+      setWalletIdChecked(true);
       onWalletUpdate((current) => ({ ...current, walletId: result.walletId }));
       setView(result.existing ? 'recipient' : 'created-id');
     } catch (requestError) {
@@ -4554,6 +6423,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
 
   const confirmRecipient = () => {
     setRecipientConfirmOpen(false);
+    setTransferTab('enter');
     setAmount('');
     setAmountPaise(0);
     setError('');
@@ -4641,6 +6511,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
   };
 
   const resetTransfer = () => {
+    setTransferTab('enter');
     setRecipient(null);
     setRecipientSuffix('');
     setAmount('');
@@ -4651,28 +6522,525 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview }) {
     transferKeyRef.current = '';
   };
 
+  const showTransferOptions = ['recipient', 'create-id', 'created-id'].includes(view);
+  const shareQr = async () => {
+    if (!qrData?.qrPayload || !navigator.share) return;
+    try {
+      if (qrImage && typeof File !== 'undefined') {
+        const imageBlob = await (await fetch(qrImage)).blob();
+        const imageFile = new File([imageBlob], `innovation-labs-wallet-${qrData.walletId}.png`, { type: 'image/png' });
+        if (navigator.canShare?.({ files: [imageFile] })) {
+          await navigator.share({ title: 'My Innovation Labs Wallet QR', files: [imageFile] });
+          return;
+        }
+      }
+      await navigator.share({ title: 'My Innovation Labs Wallet QR', text: qrData.qrPayload });
+    } catch (shareError) {
+      if (shareError.name !== 'AbortError') setError(`The QR code could not be shared: ${shareError.message}`);
+    }
+  };
+
   return <section className="wallet-transfer-workspace">
-    <header className="wallet-transfer-heading"><span className="eyebrow">Secure wallet transfer</span><h1>{view === 'create-id' || view === 'created-id' ? 'Create Wallet ID' : view === 'success' ? 'Transfer Successful' : 'Transfer Money'}</h1><p>{view === 'checking-id' ? 'Checking your Wallet ID...' : 'Send funds to another Innovation Labs wallet.'}</p></header>
+    <header className="wallet-transfer-heading"><span className="eyebrow">Secure wallet transfer</span><h1>{transferTab === 'show' && showTransferOptions ? 'My Wallet QR Code' : view === 'create-id' || view === 'created-id' ? 'Create Wallet ID' : view === 'success' ? 'Transfer Successful' : 'Transfer Money'}</h1><p>{view === 'checking-id' ? 'Checking your Wallet ID...' : 'Send funds to another Innovation Labs wallet.'}</p></header>
 
     {view === 'checking-id' && <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Checking your Wallet ID...</p></div>}
     {view === 'error' && <section className="wallet-transfer-panel"><div className="voice-error" role="alert">{error}</div><button className="secondary-btn" onClick={() => setView('create-id')}>Retry</button></section>}
 
-    {view === 'create-id' && <section className="wallet-transfer-panel wallet-id-create-panel"><h2>Create your Wallet ID</h2><p>Your Wallet ID is generated securely and saved to your account. Other Innovation Labs users can use it to send money to your wallet.</p><ul className="wallet-id-rules"><li>Automatically generated in the @WL plus 4 letters and 4 numbers format</li><li>Unique and permanent for your account</li><li>Existing Wallet IDs are never replaced</li></ul>{error && <div className="voice-error" role="alert">{error}</div>}<div className="modal-actions"><button className="secondary-btn" onClick={onBackToOverview}>Cancel</button><button className="primary-btn" disabled={creatingId} onClick={createWalletId}>{creatingId ? 'Creating...' : 'Create ID'}</button></div></section>}
+    {showTransferOptions && <nav className="wallet-transfer-options" aria-label="Transfer methods">
+      <button type="button" className={transferTab === 'enter' ? 'active' : ''} aria-current={transferTab === 'enter' ? 'page' : undefined} onClick={() => selectTransferTab('enter')}>Enter Wallet ID</button>
+      <button type="button" className={transferTab === 'show' ? 'active' : ''} aria-current={transferTab === 'show' ? 'page' : undefined} disabled={!walletIdChecked || !ownWalletId} title={!walletIdChecked || !ownWalletId ? 'Generate your Wallet ID first to use QR transfers.' : undefined} onClick={() => selectTransferTab('show')}>Show QR</button>
+    </nav>}
+    {showTransferOptions && walletIdChecked && !ownWalletId && <p className="wallet-qr-unavailable" role="status">Your Wallet ID has not been generated yet. Generate your Wallet ID first to use QR transfers.</p>}
 
-    {view === 'created-id' && <section className="wallet-transfer-panel wallet-id-success-panel"><div className="transfer-success-icon" aria-hidden="true">✓</div><h2>Wallet ID Created</h2><p>Your Wallet ID has been successfully created. You can share it with another Innovation Labs user so they can transfer money to your wallet.</p><strong className="wallet-id-display">{walletId}</strong><button className="primary-btn" onClick={() => { setError(''); setView('recipient'); }}>Continue to Transfer Money</button></section>}
+    {showTransferOptions && transferTab === 'enter' && view === 'create-id' && <section className="wallet-transfer-panel wallet-id-create-panel"><h2>Create your Wallet ID</h2><p>Your Wallet ID is generated securely and saved to your account. Other Innovation Labs users can use it to send money to your wallet.</p><ul className="wallet-id-rules"><li>Automatically generated in the @WL plus 4 letters and 4 numbers format</li><li>Unique and permanent for your account</li><li>Existing Wallet IDs are never replaced</li></ul>{error && <div className="voice-error" role="alert">{error}</div>}<div className="modal-actions"><button className="secondary-btn" onClick={onBackToOverview}>Cancel</button><button className="primary-btn" disabled={creatingId} onClick={createWalletId}>{creatingId ? 'Creating...' : 'Create ID'}</button></div></section>}
 
-    {view === 'recipient' && <section className="wallet-transfer-panel"><h2>Transfer Money</h2><div className="wallet-id-summary"><span>Your Wallet ID</span><strong>{ownWalletId || 'Loading Wallet ID...'}</strong></div><form className="wallet-transfer-form" onSubmit={checkRecipient}><label className="wallet-amount">Recipient Wallet ID<div className="wallet-id-input"><span aria-hidden="true">@WL</span><input value={recipientSuffix} onChange={(event) => { setRecipientSuffix(suffixFromInput(event.target.value)); setError(''); setRecipient(null); transferKeyRef.current = ''; }} maxLength={8} autoComplete="off" aria-label="Recipient letters and numbers" placeholder="ABCD1234" /></div></label>{error && <div className="voice-error" role="alert">{error}</div>}<button className="primary-btn" disabled={recipientBusy || !validRecipientSuffix}>{recipientBusy ? 'Checking recipient...' : 'Check Recipient'}</button></form></section>}
+    {showTransferOptions && transferTab === 'enter' && view === 'created-id' && <section className="wallet-transfer-panel wallet-id-success-panel"><div className="transfer-success-icon" aria-hidden="true">✓</div><h2>Wallet ID Created</h2><p>Your Wallet ID has been successfully created. You can share it with another Innovation Labs user so they can transfer money to your wallet.</p><strong className="wallet-id-display">{walletId}</strong><button className="primary-btn" onClick={() => { setError(''); setView('recipient'); }}>Continue to Transfer Money</button></section>}
+
+    {showTransferOptions && transferTab === 'enter' && view === 'recipient' && <section className="wallet-transfer-panel"><h2>Transfer Money</h2><div className="wallet-id-summary"><span>Your Wallet ID</span><strong>{ownWalletId || 'Loading Wallet ID...'}</strong></div><form className="wallet-transfer-form" onSubmit={checkRecipient}><label className="wallet-amount">Recipient Wallet ID<div className="wallet-id-input"><span aria-hidden="true">@WL</span><input value={recipientSuffix} onChange={(event) => { setRecipientSuffix(suffixFromInput(event.target.value)); setError(''); setRecipient(null); transferKeyRef.current = ''; }} maxLength={8} autoComplete="off" aria-label="Recipient letters and numbers" placeholder="ABCD1234" /></div></label>{error && <div className="voice-error" role="alert">{error}</div>}<button className="primary-btn" disabled={recipientBusy || !validRecipientSuffix}>{recipientBusy ? 'Checking recipient...' : 'Check Recipient'}</button></form></section>}
+
+    {showTransferOptions && transferTab === 'show' && ownWalletId && <section className="wallet-transfer-panel wallet-qr-panel"><h2>My Wallet QR Code</h2>{qrLoading ? <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Preparing your wallet QR code...</p></div> : qrData && <><div className="wallet-qr-image-wrap">{qrImage ? <img src={qrImage} alt="Scannable Innovation Labs wallet QR code" /> : <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Generating QR code...</p></div>}</div><strong>{qrData.fullName}</strong><code className="wallet-id-display">{qrData.walletId}</code><p>Let another Innovation Labs user scan this QR code to send you money.</p><div className="wallet-qr-actions">{qrImage && <a className="secondary-btn" href={qrImage} download={`innovation-labs-wallet-${qrData.walletId}.png`}>Download QR</a>}{typeof navigator.share === 'function' && <button className="primary-btn" onClick={shareQr}>Share QR</button>}</div>{qrTransferAvailable ? <button type="button" className="wallet-scan-bar" onClick={() => navigate('/wallet/scan-pay')}><span className="wallet-scan-icon" aria-hidden="true">▦</span><span><strong>Scan Another Wallet QR</strong><small>Scan another user's QR code to send money.</small></span><span className="wallet-scan-chevron" aria-hidden="true">›</span></button> : <section className="wallet-scan-locked" aria-label="Exclusive QR transfer feature"><div className="wallet-scan-locked-heading"><span className="wallet-scan-lock-icon" aria-hidden="true">🔒</span><div><strong>Scan Another Wallet QR</strong><small>{qrAccessChecking ? 'Checking subscription...' : 'Exclusive Feature'}</small></div></div><p>{qrAccessChecking ? 'Checking your plan eligibility...' : qrAccessError || 'Upgrade to the Exclusive plan to unlock QR Code Money Transfers.'}</p>{!qrAccessChecking && (qrAccessError ? <button type="button" className="secondary-btn small" onClick={() => setQrAccessRefresh((value) => value + 1)}>Retry eligibility check</button> : <Link className="primary-btn small" to="/plans">Upgrade to Exclusive</Link>)}</section>}</>}{error && <div className="voice-error" role="alert">{error}</div>}</section>}
+
 
     {view === 'amount' && recipient && <section className="wallet-transfer-panel"><h2>Transfer Money</h2><div className="wallet-transfer-recipient"><span>Recipient</span><strong>{recipient.walletId}</strong><p>Recipient: {recipient.displayName}</p></div><form className="wallet-transfer-form" onSubmit={continueToConfirmation}><label className="wallet-amount">Amount (₹)<input type="number" inputMode="decimal" min="0.01" step="0.01" value={amount} disabled={checkingBalance} onChange={(event) => { setAmount(event.target.value); setError(''); transferKeyRef.current = ''; }} placeholder="0.00" /></label><div className="wallet-transfer-balance"><span>Available Balance</span><strong>₹{Number(wallet.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{error && <div className="voice-error" role="alert">{error}</div>}<button className="primary-btn" disabled={!amount || checkingBalance}>{checkingBalance ? 'Checking balance...' : 'Continue'}</button></form></section>}
 
     {view === 'confirm' && recipient && <section className="wallet-transfer-panel"><h2>Confirm Transfer</h2><dl className="wallet-transfer-summary"><div><dt>Recipient</dt><dd>{recipient.walletId}<small>{recipient.displayName}</small></dd></div><div><dt>Amount</dt><dd>₹{(amountPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div><div><dt>Your wallet balance</dt><dd>₹{((balanceAtConfirmationPaise ?? availablePaise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div><div><dt>Balance after transfer</dt><dd>₹{(((balanceAtConfirmationPaise ?? availablePaise) - amountPaise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div></dl><p>Are you sure you want to transfer ₹{(amountPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}?</p>{error && <div className="voice-error" role="alert">{error}</div>}<div className="modal-actions"><button className="secondary-btn" onClick={() => { setView('amount'); setError(''); }}>Back</button><button className="primary-btn" onClick={() => { setPin(''); setError(''); setPinOpen(true); }}>Confirm Transfer</button></div></section>}
 
-    {view === 'success' && transfer && <section className="wallet-transfer-panel wallet-transfer-success"><div className="transfer-success-icon" aria-hidden="true">✓</div><h2>Transfer Successful</h2><strong className="transfer-success-amount">₹{Number(transfer.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong><p>Money was successfully transferred to:</p><strong>{transfer.recipientWalletId}</strong><dl className="wallet-transfer-summary"><div><dt>Transfer ID</dt><dd>{transfer.transferId}</dd></div><div><dt>Your new wallet balance</dt><dd>₹{Number(wallet.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div></dl><button className="primary-btn" onClick={resetTransfer}>Back to Transfer Money</button></section>}
+    {view === 'success' && transfer && <section className="wallet-transfer-panel wallet-transfer-success"><div className="transfer-success-icon" aria-hidden="true">✓</div><h2>Payment Successful!</h2><strong className="transfer-success-amount">₹{Number(transfer.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong><p>Transferred to {transfer.recipientName || recipient?.displayName || 'recipient'}.</p><strong>{transfer.recipientWalletId}</strong><dl className="wallet-transfer-summary"><div><dt>Transaction ID</dt><dd>{transfer.transferId}</dd></div><div><dt>Date and time</dt><dd>{transfer.completedAt ? new Date(transfer.completedAt).toLocaleString() : 'Just now'}</dd></div><div><dt>Your new wallet balance</dt><dd>₹{Number(wallet.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div></dl><button className="primary-btn" onClick={resetTransfer}>Back to Transfer Money</button></section>}
 
-    {recipientConfirmOpen && recipient && <div className="wallet-lock-overlay"><section className="wallet-pin-modal transfer-intro-modal" role="dialog" aria-modal="true" aria-labelledby="recipient-confirm-title"><h2 id="recipient-confirm-title">Confirm Recipient</h2><p>You are about to send money to:</p><strong className="wallet-id-display">{recipient.walletId}</strong><p>Recipient: {recipient.displayName}</p><p>Please verify that this is the correct recipient before continuing.</p><div className="modal-actions"><button className="secondary-btn" onClick={() => setRecipientConfirmOpen(false)}>Cancel</button><button className="primary-btn" onClick={confirmRecipient}>Yes, Continue</button></div></section></div>}
+    {recipientConfirmOpen && recipient && <div className="wallet-lock-overlay"><section className="wallet-pin-modal transfer-intro-modal" role="dialog" aria-modal="true" aria-labelledby="recipient-confirm-title"><h2 id="recipient-confirm-title">Is your recipient this person?</h2><p>You are about to send money to:</p><strong className="wallet-id-display">{recipient.displayName}</strong><p>Wallet ID: {recipient.walletId}</p><div className="modal-actions"><button className="secondary-btn" onClick={() => { setRecipientConfirmOpen(false); setRecipient(null); }}>Cancel / No</button><button className="primary-btn" onClick={confirmRecipient}>Confirm / Yes</button></div></section></div>}
 
     {pinOpen && <div className="wallet-lock-overlay"><form className="wallet-pin-modal transfer-pin-modal" role="dialog" aria-modal="true" aria-labelledby="transfer-pin-title" onSubmit={submitTransfer}><h2 id="transfer-pin-title">Wallet Security</h2><p>Enter your 4-digit Wallet PIN to confirm this transfer.</p><PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy} />{error && <p className="voice-error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => { setPinOpen(false); setPin(''); }}>Cancel</button><button type="submit" className="primary-btn" disabled={busy || pin.length !== 4}>{busy ? 'Processing transfer...' : 'Confirm Transfer'}</button></div></form></div>}
   </section>;
+}
+
+function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
+  const navigate = useNavigate();
+  const [wallet, setWallet] = useState(null);
+  const [recipient, setRecipient] = useState(null);
+  const [transfer, setTransfer] = useState(null);
+  const [stage, setStage] = useState('scan');
+  const [amount, setAmount] = useState('');
+  const [amountPaise, setAmountPaise] = useState(0);
+  const [remarks, setRemarks] = useState('');
+  const [pin, setPin] = useState('');
+  const [pinVisible, setPinVisible] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [qrTransferAvailable, setQrTransferAvailable] = useState(false);
+  const [qrAccessLoading, setQrAccessLoading] = useState(true);
+  const [qrAccessError, setQrAccessError] = useState('');
+  const [qrAccessRefresh, setQrAccessRefresh] = useState(0);
+  const [scannerActive, setScannerActive] = useState(false);
+  const [scannerBusy, setScannerBusy] = useState(false);
+  const [torchSupported, setTorchSupported] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [receiptError, setReceiptError] = useState('');
+  const scannerRef = useRef(null);
+  const scannerStartingRef = useRef(false);
+  const scannerAttemptedRef = useRef(false);
+  const scanBusyRef = useRef(false);
+  const transferKeyRef = useRef('');
+  const recipientQrPayloadFromRecipient = useRef('');
+  const onRequestUnlockRef = useRef(onRequestUnlock);
+  onRequestUnlockRef.current = onRequestUnlock;
+  const availableBalance = Number(wallet?.availableBalance ?? wallet?.balance ?? 0);
+
+  useEffect(() => {
+    if (!auth) return undefined;
+    let active = true;
+    let requestInFlight = false;
+    const checkQrAccess = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const result = await requestApi('/api/wallet/transfers/qr/access');
+        if (active) {
+          setQrTransferAvailable(result.available === true);
+          setQrAccessError('');
+        }
+      } catch (requestError) {
+        if (active) {
+          setQrTransferAvailable(false);
+          setQrAccessError(requestError.message || 'QR transfer eligibility could not be verified.');
+        }
+      } finally {
+        requestInFlight = false;
+        if (active) setQrAccessLoading(false);
+      }
+    };
+    setQrAccessLoading(true);
+    checkQrAccess();
+    const intervalId = window.setInterval(checkQrAccess, 60_000);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [auth?.id, qrAccessRefresh]);
+
+  useEffect(() => {
+    if (!auth || !qrTransferAvailable) {
+      setWallet(null);
+      setLoading(false);
+      return undefined;
+    }
+    let active = true;
+    setLoading(true);
+    requestApi('/api/wallet').then((result) => {
+      if (!active) return;
+      if (result.setupRequired) {
+        onRequestUnlockRef.current();
+        return;
+      }
+      setWallet(result.wallet);
+    }).catch((requestError) => {
+      if (!active) return;
+      if (requestError.status === 423) {
+        onRequestUnlockRef.current();
+        return;
+      }
+      setError(requestError.message || 'Wallet access could not be verified.');
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => { active = false; };
+  }, [auth?.id, accessVersion, qrTransferAvailable]);
+
+  const stopScanner = useCallback(async () => {
+    const scanner = scannerRef.current;
+    scannerRef.current = null;
+    setScannerActive(false);
+    setTorchOn(false);
+    setTorchSupported(false);
+    if (!scanner) return;
+    if (scanner.isScanning) await scanner.stop();
+    scanner.clear();
+  }, []);
+
+  useEffect(() => {
+    if (qrTransferAvailable) return;
+    stopScanner().catch((stopError) => {
+      console.error('Could not stop the wallet QR scanner after access changed.', stopError);
+    });
+  }, [qrTransferAvailable, stopScanner]);
+
+  const resolveQrPayload = useCallback(async (qrPayload) => {
+    if (scanBusyRef.current) return;
+    scanBusyRef.current = true;
+    recipientQrPayloadFromRecipient.current = qrPayload.trim();
+    setError('');
+    try {
+      await stopScanner();
+      const result = await requestApi('/api/wallet/transfers/qr/resolve', {
+        method: 'POST',
+        body: JSON.stringify({ qrPayload }),
+      });
+      setRecipient(result.recipient);
+      setStage('amount');
+      setAmount('');
+      setRemarks('');
+      transferKeyRef.current = '';
+    } catch (requestError) {
+      setError(requestError.message || 'This QR code could not be verified.');
+    } finally {
+      scanBusyRef.current = false;
+      setScannerBusy(false);
+    }
+  }, [stopScanner]);
+
+  const startScanner = useCallback(async () => {
+    if (scannerStartingRef.current || scannerRef.current?.isScanning) return;
+    if (!window.isSecureContext && window.location.hostname !== 'localhost') {
+      setError('Camera scanning requires a secure HTTPS connection.');
+      return;
+    }
+    if (!document.getElementById('wallet-qr-scanner')) return;
+    scannerStartingRef.current = true;
+    setScannerBusy(true);
+    setError('');
+    let scanner;
+    try {
+      const { Html5Qrcode } = await import('html5-qrcode');
+      scanner = new Html5Qrcode('wallet-qr-scanner');
+      scannerRef.current = scanner;
+      await scanner.start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: { width: 250, height: 250 } },
+        resolveQrPayload,
+        () => {},
+      );
+      if (scannerRef.current !== scanner) {
+        if (scanner.isScanning) await scanner.stop();
+        scanner.clear();
+        return;
+      }
+      setScannerActive(true);
+      const cameraCapabilities = scanner.getRunningTrackCameraCapabilities?.();
+      const torchFeature = cameraCapabilities?.torchFeature?.();
+      setTorchSupported(Boolean(torchFeature?.isSupported?.()));
+    } catch (scannerError) {
+      if (scanner) {
+        try {
+          if (scanner.isScanning) await scanner.stop();
+          scanner.clear();
+        } catch (cleanupError) {
+          console.error('Could not clean up the wallet QR scanner after startup failed.', cleanupError);
+        }
+      }
+      scannerRef.current = null;
+      setScannerActive(false);
+      setTorchSupported(false);
+      setError(scannerError?.name === 'NotAllowedError'
+        ? 'Camera permission was denied. Allow camera access in your browser settings, then try again.'
+        : scannerError?.name === 'NotFoundError'
+          ? 'No camera was found on this device. Upload a QR image to continue.'
+          : scannerError?.message || 'The scanner could not start. Check camera permissions and try again.');
+    } finally {
+      scannerStartingRef.current = false;
+      setScannerBusy(false);
+    }
+  }, [resolveQrPayload]);
+
+  useEffect(() => {
+    if (!qrTransferAvailable || stage !== 'scan' || !wallet || loading || scannerAttemptedRef.current) return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      scannerAttemptedRef.current = true;
+      startScanner();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [qrTransferAvailable, stage, wallet, loading, startScanner]);
+
+  useEffect(() => () => {
+    const scanner = scannerRef.current;
+    scannerRef.current = null;
+    if (scanner) {
+      const stopAndClear = async () => {
+        if (scanner.isScanning) await scanner.stop();
+        scanner.clear();
+      };
+      stopAndClear().catch((scannerError) => {
+        console.error('Could not stop the wallet QR scanner during page cleanup.', scannerError);
+      });
+    }
+  }, []);
+
+  const chooseQrImage = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setError('Choose an image file containing an Innovation Labs wallet QR code.');
+      return;
+    }
+    setError('');
+    setScannerBusy(true);
+    let scanner;
+    try {
+      await stopScanner();
+      const { Html5Qrcode } = await import('html5-qrcode');
+      scanner = new Html5Qrcode('wallet-qr-scanner');
+      scannerRef.current = scanner;
+      const decodedText = await scanner.scanFile(file, true);
+      await resolveQrPayload(decodedText);
+    } catch (scanError) {
+      setError(scanError.message?.includes('No QR code')
+        ? 'No QR code was found in that image. Choose a clearer image and try again.'
+        : scanError.message || 'The QR image could not be read.');
+    } finally {
+      if (scannerRef.current === scanner) {
+        scannerRef.current = null;
+        try { scanner?.clear(); } catch (clearError) {
+          console.error('Could not clear the QR image scanner.', clearError);
+        }
+      }
+      setScannerBusy(false);
+    }
+  };
+
+  const toggleTorch = async () => {
+    const scanner = scannerRef.current;
+    if (!scanner || !torchSupported) return;
+    try {
+      await scanner.applyVideoConstraints({ advanced: [{ torch: !torchOn }] });
+      setTorchOn((current) => !current);
+    } catch (torchError) {
+      setError(torchError.message || 'The flashlight could not be changed on this camera.');
+    }
+  };
+
+  const appendAmount = (key) => {
+    setError('');
+    setAmount((current) => {
+      let next = current;
+      if (key === 'delete') return next.slice(0, -1);
+      if (key === '.') {
+        if (!next) return '0.';
+        if (next.includes('.')) return next;
+        return `${next}.`;
+      }
+      if (next.length >= 9 || next.includes('.') && next.split('.')[1].length >= 2) return next;
+      if (next === '0') return key;
+      return `${next}${key}`;
+    });
+    transferKeyRef.current = '';
+  };
+
+  const continueToPin = async () => {
+    if (busy) return;
+    if (!recipient || !/^(?:\d+)(?:\.\d{1,2})?$/.test(amount)) {
+      setError('Enter a valid amount using up to two decimal places.');
+      return;
+    }
+    const paise = Math.round(Number(amount) * 100);
+    if (!Number.isSafeInteger(paise) || paise <= 0) {
+      setError('Enter an amount greater than ₹0.');
+      return;
+    }
+    if (paise > Math.round(availableBalance * 100)) {
+      setError('The amount cannot exceed your available wallet balance.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const quote = await requestApi('/api/wallet/transfers/quote', {
+        method: 'POST',
+        body: JSON.stringify({
+          recipientWalletId: recipient.walletId,
+          amountPaise: paise,
+          qrPayload: recipientQrPayloadFromRecipient.current,
+        }),
+      });
+      setAmountPaise(paise);
+      setWallet((current) => current ? { ...current, balance: quote.availableBalance, availableBalance: quote.availableBalance } : current);
+      setPin('');
+      setPinVisible(false);
+      setStage('pin');
+    } catch (requestError) {
+      setError(requestError.message || 'The transfer could not be verified.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitPayment = async (event) => {
+    event.preventDefault();
+    if (busy || pin.length !== 4 || !recipient || amountPaise <= 0) return;
+    setBusy(true);
+    setError('');
+    if (!transferKeyRef.current) {
+      transferKeyRef.current = globalThis.crypto?.randomUUID?.()
+        || `transfer-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    }
+    try {
+      const result = await requestApi('/api/wallet/transfers/execute', {
+        method: 'POST',
+        body: JSON.stringify({
+          recipientWalletId: recipient.walletId,
+          amountPaise,
+          pin,
+          idempotencyKey: transferKeyRef.current,
+          qrPayload: recipientQrPayloadFromRecipient.current,
+          remarks,
+        }),
+      });
+      setTransfer(result.transfer);
+      setWallet((current) => current ? {
+        ...current,
+        balance: result.senderBalance,
+        availableBalance: result.senderBalance,
+      } : current);
+      setPin('');
+      setStage('success');
+      requestApi('/api/wallet').then((updated) => {
+        if (updated.wallet) setWallet(updated.wallet);
+      }).catch((refreshError) => setReceiptError(`Payment completed, but the wallet display could not be refreshed: ${refreshError.message}`));
+    } catch (requestError) {
+      setPin('');
+      if (requestError.status === 402 || requestError.status === 409) setStage('amount');
+      setError(requestError.message || 'We could not complete the transfer. No money was deducted.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const downloadReceipt = () => {
+    if (!transfer) return;
+    const completedAt = transfer.completedAt ? new Date(transfer.completedAt) : new Date();
+    const receipt = [
+      'INNOVATION LABS — WALLET TRANSFER RECEIPT',
+      '',
+      `Status: ${transfer.status || 'COMPLETED'}`,
+      `Amount: ₹${Number(transfer.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`,
+      `Paid to: ${recipient?.displayName || transfer.recipientName || 'Recipient'}`,
+      `Wallet ID: ${recipient?.username || recipient?.walletId || transfer.recipientWalletId}`,
+      `Transaction ID: ${transfer.transferId}`,
+      `Date & time: ${completedAt.toLocaleString('en-IN')}`,
+      ...(remarks ? [`Remarks: ${remarks}`] : []),
+    ].join('\n');
+    const url = URL.createObjectURL(new Blob([receipt], { type: 'text/plain;charset=utf-8' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `innovation-labs-transfer-${transfer.transferId}.txt`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const backToWallet = () => navigate('/wallet', { state: { openTransferTab: true } });
+  const amountValue = Number(amount || 0);
+
+  if (qrAccessLoading) return <main className="page-shell"><div className="container loader-wrap" role="status"><div className="spinner" /><p>Checking Exclusive subscription access...</p></div></main>;
+  if (qrAccessError) return <main className="page-shell wallet-qr-payment-page"><div className="container narrow-container wallet-qr-payment-shell"><Link className="wallet-payment-back" to="/wallet">← <span>Transfer Money</span></Link><section className="wallet-scan-locked" role="alert"><div className="wallet-scan-locked-heading"><span className="wallet-scan-lock-icon" aria-hidden="true">🔒</span><div><strong>QR transfer access unavailable</strong></div></div><p>{qrAccessError}</p><button type="button" className="secondary-btn" onClick={() => setQrAccessRefresh((value) => value + 1)}>Check again</button></section></div></main>;
+  if (!qrTransferAvailable) return <main className="page-shell wallet-qr-payment-page"><div className="container narrow-container wallet-qr-payment-shell"><Link className="wallet-payment-back" to="/wallet">← <span>Transfer Money</span></Link><section className="wallet-scan-locked wallet-scan-locked-page" aria-labelledby="qr-exclusive-title"><div className="wallet-scan-locked-heading"><span className="wallet-scan-lock-icon" aria-hidden="true">🔒</span><div><strong id="qr-exclusive-title">Exclusive Feature</strong></div></div><p>Upgrade to the Exclusive plan to unlock QR Code Money Transfers.</p><div className="wallet-scan-locked-actions"><Link className="primary-btn" to="/plans">Upgrade to Exclusive</Link><Link className="secondary-btn" to="/wallet">Back to Wallet</Link></div></section></div></main>;
+  if (loading) return <main className="page-shell"><div className="container loader-wrap"><div className="spinner" /><p>Verifying wallet access...</p></div></main>;
+  if (!wallet) return <main className="page-shell"><div className="container narrow-container"><button className="secondary-btn" onClick={backToWallet}>← Back to Transfer Money</button>{error && <div className="alert-box" role="alert">{error}</div>}</div></main>;
+
+  return <main className="page-shell wallet-qr-payment-page">
+    <div className="container narrow-container wallet-qr-payment-shell">
+      <button type="button" className="wallet-payment-back" onClick={backToWallet}>← <span>Transfer Money</span></button>
+      <header className="wallet-payment-header">
+        <span className="eyebrow">INNOVATION LABS WALLET</span>
+        <h1>{stage === 'success' ? 'Payment complete' : stage === 'pin' ? 'Authorize payment' : stage === 'amount' ? 'Review payment' : 'Scan & Pay'}</h1>
+        <p>{stage === 'scan' ? 'Align the recipient’s Innovation Labs QR code inside the frame.' : stage === 'amount' ? 'Enter the amount you want to send.' : stage === 'pin' ? 'Confirm securely with your Innovation Labs Wallet PIN.' : 'Your transfer was completed securely.'}</p>
+      </header>
+
+      {error && <div className="wallet-payment-error" role="alert">{error}</div>}
+      {stage === 'scan' && <section className="wallet-payment-card wallet-payment-scan-stage">
+        <div className="wallet-qr-scanner-frame wallet-payment-scanner-frame">
+          <div id="wallet-qr-scanner" aria-label="Camera QR scanning area" />
+          <span className="qr-scan-corner top-left" /><span className="qr-scan-corner top-right" />
+          <span className="qr-scan-corner bottom-left" /><span className="qr-scan-corner bottom-right" />
+        </div>
+        <p className="wallet-payment-scanner-note">{scannerActive ? 'Align the recipient’s Innovation Labs QR code inside the frame.' : scannerBusy ? 'Starting secure camera access…' : 'Camera unavailable? Upload a QR image instead.'}</p>
+        <div className="wallet-payment-scan-actions">
+          {torchSupported && <button type="button" className={`wallet-payment-tool${torchOn ? ' active' : ''}`} onClick={toggleTorch} aria-pressed={torchOn}>☼ <span>{torchOn ? 'Flashlight on' : 'Flashlight'}</span></button>}
+          <label className="wallet-payment-tool wallet-payment-upload">▧ <span>Upload QR image</span><input type="file" accept="image/*" onChange={chooseQrImage} disabled={scannerBusy} /></label>
+          {!scannerActive && <button type="button" className="wallet-payment-tool" onClick={() => { scannerAttemptedRef.current = true; startScanner(); }} disabled={scannerBusy}>{scannerBusy ? 'Starting…' : 'Start camera'}</button>}
+          {scannerActive && <button type="button" className="wallet-payment-tool" onClick={() => stopScanner().catch((stopError) => setError(`The scanner could not be stopped: ${stopError.message}`))}>Stop camera</button>}
+        </div>
+      </section>}
+
+      {stage === 'amount' && recipient && <section className="wallet-payment-card wallet-payment-amount-stage">
+        <div className="wallet-payment-recipient">
+          {recipient.profilePicture
+            ? <img src={recipient.profilePicture} alt="" />
+            : <span className="wallet-payment-avatar" aria-hidden="true">{recipient.displayName?.trim()?.[0]?.toUpperCase() || 'I'}</span>}
+          <div><small>Sending money to</small><strong>{recipient.displayName}</strong><span>{recipient.username || recipient.walletId}</span></div>
+          <span className="wallet-recipient-verified" aria-label="Recipient verified">✓</span>
+        </div>
+        <div className="wallet-payment-amount-entry">
+          <span>Enter Amount</span>
+          <label className="wallet-payment-amount-display"><span>₹</span><input aria-label="Transfer amount" inputMode="none" readOnly value={amount} placeholder="0" /></label>
+          <small>Available balance · ₹{availableBalance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</small>
+        </div>
+        <div className="wallet-payment-keypad" aria-label="Amount keypad">
+          {['1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', 'delete'].map((key) => <button type="button" key={key} aria-label={key === 'delete' ? 'Delete last digit' : key} onClick={() => appendAmount(key)}>{key === 'delete' ? '⌫' : key}</button>)}
+        </div>
+        <label className="wallet-payment-remarks"><span>Remarks <small>(Optional)</small></span><input maxLength={120} value={remarks} onChange={(event) => { setRemarks(event.target.value); transferKeyRef.current = ''; }} placeholder="Add a note" /></label>
+        <button type="button" className="wallet-payment-primary" disabled={busy || !amountValue || amountValue * 100 > Math.round(availableBalance * 100)} onClick={continueToPin}>{busy ? 'Checking balance…' : `PAY ₹${amountValue.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`}</button>
+      </section>}
+
+      {stage === 'pin' && recipient && <section className="wallet-payment-card wallet-payment-pin-stage">
+        <div className="wallet-payment-recipient compact">
+          {recipient.profilePicture ? <img src={recipient.profilePicture} alt="" /> : <span className="wallet-payment-avatar" aria-hidden="true">{recipient.displayName?.trim()?.[0]?.toUpperCase() || 'I'}</span>}
+          <div><small>Paying</small><strong>{recipient.displayName}</strong><span>{recipient.username || recipient.walletId}</span></div>
+        </div>
+        <strong className="wallet-payment-pin-amount">₹{(amountPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+        <h2>Enter Wallet PIN</h2>
+        <p>Use your Innovation Labs Wallet PIN. Never enter your bank or UPI PIN here.</p>
+        <div className={`wallet-payment-pin-dots${pinVisible ? ' visible' : ''}`} aria-label={`${pin.length} of 4 Wallet PIN digits entered`}>
+          {[0, 1, 2, 3].map((index) => <span key={index}>{pin[index] ? pinVisible ? pin[index] : '•' : ''}</span>)}
+          <button type="button" onClick={() => setPinVisible((visible) => !visible)} aria-pressed={pinVisible}>{pinVisible ? 'Hide' : 'Show'}</button>
+        </div>
+        <div className="wallet-payment-keypad wallet-payment-pin-keypad" aria-label="Wallet PIN keypad">
+          {['1', '2', '3', '4', '5', '6', '7', '8', '9', 'delete', '0', 'clear'].map((key) => <button type="button" key={key} aria-label={key === 'delete' ? 'Delete last digit' : key === 'clear' ? 'Clear PIN' : key} disabled={busy} onClick={() => {
+            setError('');
+            setPin((current) => key === 'delete' ? current.slice(0, -1) : key === 'clear' ? '' : current.length < 4 ? `${current}${key}` : current);
+          }}>{key === 'delete' ? '⌫' : key === 'clear' ? '×' : key}</button>)}
+        </div>
+        <div className="wallet-payment-pin-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => { setPin(''); setError(''); setStage('amount'); }}>Cancel</button><button type="button" className="wallet-payment-primary" disabled={busy || pin.length !== 4} onClick={submitPayment}>{busy ? 'Processing securely…' : 'Confirm Payment'}</button></div>
+      </section>}
+
+      {stage === 'success' && transfer && <section className="wallet-payment-card wallet-payment-success">
+        <span className="wallet-payment-success-icon" aria-hidden="true">✓</span>
+        <h2>Payment Successful!</h2>
+        <strong className="wallet-payment-success-amount">₹{Number(transfer.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+        <span className="wallet-payment-paid-label">Paid to</span>
+        <div className="wallet-payment-recipient success-recipient">
+          {recipient?.profilePicture ? <img src={recipient.profilePicture} alt="" /> : <span className="wallet-payment-avatar" aria-hidden="true">{recipient?.displayName?.trim()?.[0]?.toUpperCase() || 'I'}</span>}
+          <div><strong>{recipient?.displayName || transfer.recipientName}</strong><span>{recipient?.username || transfer.recipientWalletId}</span></div>
+        </div>
+        <dl className="wallet-payment-receipt-details">
+          <div><dt>Transaction ID</dt><dd>{transfer.transferId}</dd></div>
+          <div><dt>Date &amp; Time</dt><dd>{transfer.completedAt ? new Date(transfer.completedAt).toLocaleString('en-IN') : 'Just now'}</dd></div>
+          <div><dt>Status</dt><dd>Successful</dd></div>
+          <div><dt>Updated wallet balance</dt><dd>₹{availableBalance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
+        </dl>
+        {receiptError && <p className="wallet-payment-receipt-error" role="status">{receiptError}</p>}
+        <div className="wallet-payment-success-actions"><button type="button" className="secondary-btn" onClick={downloadReceipt}>Download receipt</button><button type="button" className="wallet-payment-primary" onClick={backToWallet}>DONE</button></div>
+      </section>}
+    </div>
+  </main>;
 }
 
 function WalletAccessPinModal({ mode, checking = false, onCancel, onSubmit }) {
@@ -4694,27 +7062,33 @@ function WalletAccessPinModal({ mode, checking = false, onCancel, onSubmit }) {
     }
   };
   return <div className="wallet-lock-overlay"><form className="wallet-pin-modal wallet-access-modal" role="dialog" aria-modal="true" aria-labelledby="wallet-security-title" onSubmit={submit}>
-    <h2 id="wallet-security-title">{mode === 'setup' ? 'Create your Wallet Security PIN' : 'Wallet Security'}</h2>
+    <h2 id="wallet-security-title">{mode === 'setup' ? 'Create your Wallet Security PIN' : 'Verify Wallet Access'}</h2>
     <p>{mode === 'setup' ? 'Create a 4-digit PIN to protect your wallet.' : 'Please enter your designated 4-digit PIN.'}</p>
     <PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} autoFocus={!checking} disabled={busy || checking} />
     {error && <p className="voice-error" role="alert">{error}</p>}
-    <div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={onCancel}>Back</button><button type="submit" className="primary-btn" disabled={busy || checking || pin.length !== 4}>{checking ? 'Checking...' : busy ? 'Verifying...' : mode === 'setup' ? 'Create PIN' : 'Unlock Wallet'}</button></div>
+    <div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={onCancel}>Back</button><button type="submit" className="primary-btn" disabled={busy || checking || pin.length !== 4}>{checking ? 'Checking...' : busy ? 'Verifying...' : mode === 'setup' ? 'Create PIN' : 'Verify'}</button></div>
   </form></div>;
 }
 
-function WalletPinModal({ onCancel, onSubmit }) {
+function WalletPinModal({ onCancel, onSubmit, onViewResult }) {
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
   const submit = async () => {
+    if (busy || pin.length !== 4) return;
+    setBusy(true);
+    setError('');
     try {
       await onSubmit(pin);
     } catch (requestError) {
       setError(requestError.status >= 500 || !requestError.status
         ? 'Something went wrong while processing your payment. Please try again.'
         : requestError.message || 'Payment could not be completed. Please try again.');
+    } finally {
+      setBusy(false);
     }
   };
-  return <div className="modal-content wallet-pin-modal"><h3>Confirm Wallet Payment</h3><p>Enter your 4-digit Wallet PIN to authorize this payment.</p><PinBoxes value={pin} onChange={setPin} /><>{error && <p className="voice-error" role="alert">{error}</p>}</><div className="modal-actions"><button className="secondary-btn" onClick={onCancel}>Cancel</button><button className="primary-btn" disabled={pin.length !== 4} onClick={submit}>Confirm Payment</button></div></div>;
+  return <div className="modal-content wallet-pin-modal"><h2 id="wallet-payment-pin-title">Enter Your Wallet PIN</h2><p>Enter your 4-digit Innovation Labs Wallet PIN to authorize this payment. Your PIN is verified securely and never shown.</p><PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy} /><>{error && <p className="voice-error" role="alert">{error}</p>}</><div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={onCancel}>Cancel</button><button type="button" className="primary-btn" disabled={busy || pin.length !== 4} onClick={submit}>{busy ? 'Verifying...' : 'Confirm Payment'}</button></div>{error && <button type="button" className="secondary-btn small" disabled={busy} onClick={onViewResult}>View Payment Result</button>}</div>;
 }
 
 function RefundTimeline({ refund }) {
@@ -4936,6 +7310,7 @@ function AdminRefundDetailPage({ auth, onUpdated }) {
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
   const [busy, setBusy] = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
   const [declineReason, setDeclineReason] = useState('');
@@ -5025,6 +7400,7 @@ function AdminRefundDetailPage({ auth, onUpdated }) {
 
 function AdminVerificationModal({ onCancel, onVerify }) {
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -5046,14 +7422,19 @@ function AdminVerificationModal({ onCancel, onVerify }) {
   return <form className="modal-content admin-verify-form" onSubmit={submit}>
     <div><span className="eyebrow">Restricted access</span><h3>Admin Verification</h3></div>
     <label htmlFor="admin-password">Enter Admin Password</label>
-    <input id="admin-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} autoFocus required />
+    <div className="admin-password-field">
+      <input id="admin-password" type={showPassword ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} autoFocus required />
+      <button type="button" className="small tertiary-btn" onClick={() => setShowPassword((current) => !current)}>{showPassword ? 'Hide' : 'Show'}</button>
+    </div>
     {error && <div className="voice-error" role="alert">{error}</div>}
-    <div className="modal-actions"><button className="secondary-btn" type="button" disabled={busy} onClick={onCancel}>Cancel</button><button className="primary-btn" disabled={busy || !password}>{busy ? 'Verifying...' : 'Verify'}</button></div>
+    <div className="modal-actions"><button className="secondary-btn" type="button" disabled={busy} onClick={onCancel}>Cancel</button><button className="primary-btn" disabled={busy || !password}>{busy ? 'Verifying...' : 'Sign In'}</button></div>
   </form>;
 }
 
 function AdminDashboardPage() {
   const adminSections = [
+    ['/admin/subscription-finished', 'Subscription Finished', 'Search paid subscriptions that have expired and review their purchase details.'],
+    ['/admin/account-restrictions', 'Account Restrictions', 'Review age-restricted accounts and require re-verification before access is restored.'],
     ['/admin/orders', 'Orders', 'Review the live order queue, approvals, and delivery estimates.'],
     ['/admin/rewards', 'Reward Points', 'Review reward balances, earning history, conversions, and earning rules.'],
     ['/admin/product-reviews', 'Product Reviews', 'Moderate verified customer product reviews and uploaded images.'],
@@ -5064,10 +7445,71 @@ function AdminDashboardPage() {
     ['/admin/inventory', 'Inventory', 'Track product stock levels, availability, and restock signals.'],
     ['/admin/custom-requests', 'Custom Requests', 'Review and manage customer requests for unavailable parts.'],
     ['/admin/credit-purchases', 'AI Credits', 'Review purchased credits, payment methods, and statuses.'],
+    ['/admin/ai-bill-credits', 'AI Bill Credits', 'Review bill purchases, monthly allowances, and project-build usage.'],
     ['/admin/settings', 'Settings', 'Adjust operational limits and shop capacity.'],
     ['/admin/refunds', 'Refunds', 'Review returned orders and process approved wallet refunds.'],
   ];
   return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Innovation Labs</span><h2>Admin Panel</h2></div><div className="admin-dashboard-grid">{adminSections.map(([to, title, description]) => <Link className="admin-dashboard-card" to={to} key={to}><span className="eyebrow">Manage</span><h3>{title}</h3><p>{description}</p><strong>Open section <span aria-hidden="true">→</span></strong></Link>)}</div></div>;
+}
+
+function AdminAccountRestrictionsPage() {
+  const [accounts, setAccounts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busyUserId, setBusyUserId] = useState('');
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  const loadAccounts = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const result = await requestApi('/api/admin/account-restrictions');
+      setAccounts(result.accounts || []);
+    } catch (requestError) {
+      setError(requestError.message || 'Restricted accounts could not be loaded.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { loadAccounts(); }, []);
+
+  const reactivate = async (account) => {
+    setBusyUserId(account.userId);
+    setError('');
+    setNotice('');
+    try {
+      const result = await requestApi(`/api/admin/account-restrictions/${encodeURIComponent(account.userId)}/reactivate`, { method: 'PATCH' });
+      setNotice(result.message);
+      setAccounts((current) => current.filter((entry) => entry.userId !== account.userId));
+    } catch (requestError) {
+      setError(requestError.message || 'The account could not be reactivated.');
+    } finally {
+      setBusyUserId('');
+    }
+  };
+
+  return <div className="admin-panel-wrap admin-feature-page">
+    <div className="section-title left"><span className="eyebrow">Admin · Account Safety</span><h2>Account Restrictions</h2></div>
+    <p>Restricted users must complete age verification again after reactivation; reactivation alone does not grant website access.</p>
+    {error && <div className="alert-box" role="alert">{error}</div>}
+    {notice && <div className="account-notice" role="status">{notice}</div>}
+    {loading ? <p className="account-loading">Loading restricted accounts...</p> : accounts.length ? <div className="orders-list">
+      {accounts.map((account) => <article className="admin-panel" key={account.userId}>
+        <div className="account-panel-heading"><h3>{account.name}</h3><span>{account.status} · {account.ageVerificationStatus}</span></div>
+        <dl>
+          <div><dt>Email</dt><dd>{account.email}</dd></div>
+          <div><dt>Date of birth entered</dt><dd>{account.dateOfBirth || 'Not recorded'}</dd></div>
+          <div><dt>Restricted</dt><dd>{account.restrictedAt ? new Date(account.restrictedAt).toLocaleString('en-IN') : 'Date not recorded'}</dd></div>
+          <div><dt>Reason</dt><dd>{account.restrictionReason}</dd></div>
+          <div><dt>Account status</dt><dd>{account.status}</dd></div>
+        </dl>
+        <button className="primary-btn small" type="button" disabled={busyUserId === account.userId} onClick={() => reactivate(account)}>
+          {busyUserId === account.userId ? 'Reactivating...' : 'REACTIVATE ACCOUNT'}
+        </button>
+      </article>)}
+    </div> : <AccountEmpty text="There are no age-restricted accounts." />}
+  </div>;
 }
 
 function AdminProductReviewsPage() {
@@ -5409,7 +7851,7 @@ function AdminInvoicesPage() {
       <p>Payment: {selectedInvoice.paymentMethod} · {selectedInvoice.paymentStatus}</p>
       <p>Transaction: {selectedInvoice.paymentId || 'Not available'}</p>
       <div className="inventory-table-wrap"><table className="promo-table"><thead><tr><th>Item</th><th>Type</th><th>Qty</th><th>Unit price</th><th>Total</th></tr></thead><tbody>{(selectedInvoice.items || []).map((item, index) => <tr key={`${item.name}-${index}`}><td>{item.name}</td><td>{item.category || item.productType || 'Product'}</td><td>{item.quantity}</td><td>₹{Number(item.price || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td><td>₹{(Number(item.price || 0) * Number(item.quantity || 1)).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td></tr>)}</tbody></table></div>
-      <div className="invoice-detail-totals"><div>Subtotal <strong>₹{(selectedInvoice.subtotalPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{selectedInvoice.discountAmountPaise > 0 && <div>Discount {selectedInvoice.discountCode && `(${selectedInvoice.discountCode})`} <strong>−₹{(selectedInvoice.discountAmountPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}{selectedInvoice.serviceChargePaise > 0 && <div>Service charges <strong>₹{(selectedInvoice.serviceChargePaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}<div>Shipping <strong>₹{(selectedInvoice.shippingPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{selectedInvoice.taxPaise > 0 && <div>Tax <strong>₹{(selectedInvoice.taxPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}<div>Total paid <strong>₹{(selectedInvoice.totalPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></div>
+      <div className="invoice-detail-totals"><div>Subtotal <strong>₹{(selectedInvoice.subtotalPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{selectedInvoice.discountAmountPaise > 0 && <div>Discount {selectedInvoice.discountCode && `(${selectedInvoice.discountCode})`} <strong>−₹{(selectedInvoice.discountAmountPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}{selectedInvoice.subscriptionDiscountAmountPaise > 0 && <div>{displayPlanName(selectedInvoice.subscriptionDiscountPlan)} membership discount ({selectedInvoice.subscriptionDiscountPercent}% OFF) <strong>−₹{(selectedInvoice.subscriptionDiscountAmountPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}{selectedInvoice.serviceChargePaise > 0 && <div>Service charges <strong>₹{(selectedInvoice.serviceChargePaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}<div>Shipping <strong>₹{(selectedInvoice.shippingPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{selectedInvoice.taxPaise > 0 && <div>Tax <strong>₹{(selectedInvoice.taxPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}<div>Total paid <strong>₹{(selectedInvoice.totalPaise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></div>
       <div className="modal-actions"><button type="button" className="secondary-btn" onClick={() => setSelectedInvoice(null)}>Close</button><button type="button" className="primary-btn" onClick={() => download(selectedInvoice)}>Download PDF</button></div>
     </section></div>}
   </div>;
@@ -5417,8 +7859,11 @@ function AdminInvoicesPage() {
 
 function AdminWorkspaceLayout({ currentPath, children }) {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const { auth: adminAuth, onSignOut } = useContext(AdminSessionContext);
   const sections = [
     { path: '/admin', label: 'Dashboard' },
+    { path: '/admin/subscription-finished', label: 'Subscription Finished' },
+    { path: '/admin/account-restrictions', label: 'Account Restrictions' },
     { path: '/admin/orders', label: 'Orders' },
     { path: '/admin/rewards', label: 'Reward Points' },
     { path: '/admin/product-reviews', label: 'Product Reviews' },
@@ -5428,7 +7873,10 @@ function AdminWorkspaceLayout({ currentPath, children }) {
     { path: '/admin/invoices', label: 'Invoices' },
     { path: '/admin/inventory', label: 'Inventory' },
     { path: '/admin/custom-requests', label: 'Custom Requests' },
+    { path: '/admin/inquiries', label: 'Inquiries' },
+    { path: '/admin/not-ordered', label: 'Not Ordered' },
     { path: '/admin/credit-purchases', label: 'AI Credits' },
+    { path: '/admin/ai-bill-credits', label: 'AI Bill Credits' },
     { path: '/admin/settings', label: 'Settings' },
     { path: '/admin/refunds', label: 'Refunds' },
   ];
@@ -5437,7 +7885,10 @@ function AdminWorkspaceLayout({ currentPath, children }) {
   return <main className="page-shell"><div className="container admin-workspace-shell">
     <header className="admin-workspace-header">
       <div><span className="eyebrow">Innovation Labs · {currentSection.label}</span><h1>Admin Dashboard</h1><p>Manage your store operations and customer experience.</p></div>
-      <span className="admin-workspace-context"><span aria-hidden="true" /> Operations Workspace</span>
+      <div className="admin-workspace-header-actions">
+        <span className="admin-workspace-context"><span aria-hidden="true" /> Operations Workspace</span>
+        {adminAuth && <button className="secondary-btn small" type="button" onClick={onSignOut}>Sign Out</button>}
+      </div>
     </header>
     <button className="admin-mobile-nav-toggle" type="button" aria-expanded={mobileNavOpen} aria-controls="admin-primary-navigation" onClick={() => setMobileNavOpen((open) => !open)}>{mobileNavOpen ? 'Close navigation' : 'Admin navigation'}<span aria-hidden="true">{mobileNavOpen ? '×' : '☰'}</span></button>
     {mobileNavOpen && <button className="admin-mobile-nav-backdrop" type="button" aria-label="Close admin navigation" onClick={() => setMobileNavOpen(false)} />}
@@ -5457,10 +7908,19 @@ const summarizeOrderProducts = (order) => {
     return order?.orderType === 'PROMO_CODE' ? 'Promo Code' : 'No product details';
   }
 
-  const summary = items.map((item) => `${String(item.name || item.productName || 'Item')} × ${Number(item.quantity || 1)}`);
+  const summary = items.flatMap((item) => {
+    const { activeQuantity } = getOrderItemQuantities(item);
+    return activeQuantity > 0 ? [`${String(item.name || item.productName || 'Item')} × ${activeQuantity}`] : [];
+  });
+  if (!summary.length) return 'No active products';
   if (summary.length <= 2) return summary.join(', ');
   return `${summary.slice(0, 2).join(', ')} + ${summary.length - 2} more`;
 };
+
+const activeOrderItemCount = (order) => (order.items || []).reduce(
+  (sum, item) => sum + getOrderItemQuantities(item).activeQuantity,
+  0,
+);
 
 function AdminOrdersPage({ auth }) {
   const [orders, setOrders] = useState([]);
@@ -5483,25 +7943,73 @@ function AdminOrdersPage({ auth }) {
 
 function AdminOrdersPageV2({ auth }) {
   const [orders, setOrders] = useState([]);
+  const [subscriptionOrders, setSubscriptionOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
   useEffect(() => {
     if (!auth?.isAdmin) return;
-    requestApi('/api/admin/orders')
-      .then((result) => setOrders(result.orders || []))
-      .catch((requestError) => setError(requestError.message))
-      .finally(() => setLoading(false));
+    let active = true;
+    const refreshOrders = () => {
+      requestApi('/api/admin/orders')
+        .then((result) => {
+          if (!active) return;
+          setOrders(result.orders || []);
+          setSubscriptionOrders(result.subscriptionOrders || []);
+          setError('');
+        })
+        .catch((requestError) => {
+          if (active) setError(requestError.message);
+        })
+        .finally(() => {
+          if (active) setLoading(false);
+        });
+    };
+    refreshOrders();
+    const interval = window.setInterval(refreshOrders, 30_000);
+    window.addEventListener('focus', refreshOrders);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refreshOrders);
+    };
   }, [auth]);
 
   if (!auth?.isAdmin) return <div className="empty-state"><h3>Admin access is required.</h3></div>;
   if (loading) return <div className="empty-state"><h3>Loading live orders...</h3></div>;
 
-  return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Admin</span><h2>Orders</h2></div>{error && <div className="alert-box">{error}</div>}{orders.length ? <div className="orders-list">{orders.map((order) => {
+  const formatDate = (value) => value
+    ? new Date(value).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })
+    : '—';
+  const formatAmount = (value) => `₹${(Number(value || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+  const hasOrders = subscriptionOrders.length > 0 || orders.length > 0;
+
+  return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Admin</span><h2>Orders</h2></div>{error && <div className="alert-box">{error}</div>}{hasOrders ? <div className="orders-list">
+    {subscriptionOrders.map((order) => <article className="order-card admin-subscription-order" key={order.id}>
+      <span className="admin-subscription-label">SUBSCRIPTION ORDER</span>
+      <div className="admin-subscription-name">{displayPlanName(order.plan)}</div>
+      <div className="order-row"><span>Customer</span><strong>{order.customerName}</strong></div>
+      <div className="order-row"><span>Email</span><strong>{order.customerEmail || '—'}</strong></div>
+      <div className="order-row"><span>Order / Transaction ID</span><strong>#{order.orderId}</strong></div>
+      <div className="order-row"><span>Subscription</span><strong>{displayPlanName(order.plan)}</strong></div>
+      <div className="order-row"><span>Duration</span><strong>{order.durationMonths} Month{order.durationMonths === 1 ? '' : 's'}</strong></div>
+      <div className="order-row"><span>Purchase date</span><strong>{formatDate(order.purchaseDate)}</strong></div>
+      <div className="order-row"><span>Starting date</span><strong>{formatDate(order.startDate)}</strong></div>
+      <div className="order-row"><span>Expiration date</span><strong>{formatDate(order.expiryDate)}</strong></div>
+      <div className="order-row"><span>Total amount</span><strong>{formatAmount(order.amountPaise)}</strong></div>
+      <div className="order-row"><span>Payment method</span><strong>{order.paymentMethod === 'Wallet' ? 'Innovation Labs Wallet' : order.paymentMethod}</strong></div>
+      <div className="order-row"><span>Payment status</span><strong>{order.paymentStatus}</strong></div>
+      <div className="order-row"><span>Subscription status</span><strong>{order.subscriptionStatus}</strong></div>
+    </article>)}
+    {orders.map((order) => {
     const orderId = order.orderId || order._id;
     const orderStatus = order.orderStatus || 'Processing';
     const productSummary = summarizeOrderProducts(order);
-    return <div className="order-card" key={order._id || orderId}><div className="order-row"><span>Order ID</span><strong>#{orderId}</strong></div><div className="order-row"><span>Order Type</span><strong>{order.orderType === 'PROMO_CODE' ? 'Promo Code (Digital)' : 'Product'}</strong></div>{order.orderType !== 'PROMO_CODE' && <div className="order-row"><span>Products</span><strong>{productSummary}</strong></div>}<div className="order-row"><span>Customer</span><strong>{order.userName}</strong></div><div className="order-row"><span>Items</span><strong>{(order.items || []).reduce((sum, item) => sum + (Number(item.quantity) || 0), 0)}</strong></div>{order.orderType === 'PROMO_CODE' && <><div className="order-row"><span>Promo Code</span><strong>{order.promoCode || '—'}</strong></div><div className="order-row"><span>Value</span><strong>₹{(Number(order.promoCodeAmountPaise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></>}{order.orderType !== 'PROMO_CODE' && <div className="order-row"><span>Total</span><strong>₹{Number(order.total || 0).toLocaleString('en-IN')}</strong></div>}<div className="order-row"><span>Payment</span><strong>{order.paymentMethod || 'Not set'}</strong></div><div className="order-row"><span>Status</span><strong>{orderStatus}</strong></div>{order.estimatedDelivery && order.deliveryRequired !== false && <div className="order-row"><span>ETA</span><strong>{new Date(order.estimatedDelivery).toLocaleDateString()}</strong></div>}{order.orderStatus === 'Cancelled' && <span className="order-cancelled-stamp">CANCELLED</span>}<div className="custom-order-actions"><Link className="primary-btn small" to={`/admin/orders/${encodeURIComponent(orderId)}`}>View Details</Link>{order.orderType !== 'PROMO_CODE' && ['Processing', 'Pending Review', 'Pending', 'Accepted'].includes(orderStatus) && <Link className="secondary-btn small" to={`/admin/orders/${encodeURIComponent(orderId)}`}>Manage</Link>}</div></div>;
+    const subscription = order.currentSubscription;
+    const canManageRemainingItems = order.orderType !== 'PROMO_CODE'
+      && activeOrderItemCount(order) > 0
+      && ['Processing', 'Pending Review', 'Pending', 'Accepted'].includes(orderStatus);
+    return <div className="order-card" key={order._id || orderId}><div className="order-row"><span>Order ID</span><strong>#{orderId}</strong></div><div className="order-row"><span>Order Type</span><strong>{order.orderType === 'PROMO_CODE' ? 'Promo Code (Digital)' : 'Product'}</strong></div>{order.orderType !== 'PROMO_CODE' && <div className="order-row"><span>Products</span><strong>{productSummary}</strong></div>}<div className="order-row"><span>Customer</span><strong>{order.userName}</strong></div><div className="order-row admin-current-subscription"><span>Current Subscription</span><strong>{subscription?.displayName || 'No Active Subscription'}{subscription?.expiryDate && <small>{subscription.status === 'Active' ? 'Expires' : 'Expired'} {new Date(subscription.expiryDate).toLocaleDateString()}</small>}</strong></div><div className="order-row"><span>Items</span><strong>{activeOrderItemCount(order)} active</strong></div>{order.orderType === 'PROMO_CODE' && <><div className="order-row"><span>Promo Code</span><strong>{order.promoCode || '—'}</strong></div><div className="order-row"><span>Value</span><strong>₹{(Number(order.promoCodeAmountPaise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></>}{order.orderType !== 'PROMO_CODE' && <div className="order-row"><span>Total</span><strong>₹{Number(order.total || 0).toLocaleString('en-IN')}</strong></div>}<div className="order-row"><span>Payment</span><strong>{order.paymentMethod || 'Not set'}</strong></div><div className="order-row"><span>Status</span><strong>{orderStatus}</strong></div>{order.estimatedDelivery && order.deliveryRequired !== false && <div className="order-row"><span>ETA</span><strong>{new Date(order.estimatedDelivery).toLocaleDateString()}</strong></div>}{order.orderStatus === 'Cancelled' && <span className="order-cancelled-stamp">CANCELLED</span>}<div className="custom-order-actions"><Link className="primary-btn small" to={`/admin/orders/${encodeURIComponent(orderId)}`}>View Details</Link>{canManageRemainingItems && <Link className="secondary-btn small" to={`/admin/orders/${encodeURIComponent(orderId)}`}>Manage</Link>}</div></div>;
   })}</div> : <div className="empty-state"><h3>No orders yet.</h3></div>}</div>;
 }
 
@@ -5510,6 +8018,7 @@ function AdminOrderDetailPage({ auth }) {
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState(null);
   const [estimatedDelivery, setEstimatedDelivery] = useState('');
@@ -5540,7 +8049,9 @@ function AdminOrderDetailPage({ auth }) {
   }, [auth, orderId]);
 
   const canAccept = order && order.orderType !== 'PROMO_CODE' && !['Accepted', 'Declined', 'Cancelled', 'Completed', 'Delivered'].includes(order.orderStatus || '');
-  const canDecline = order && order.orderType !== 'PROMO_CODE' && ['Processing', 'Pending Review', 'Pending', 'Accepted'].includes(order.orderStatus || '');
+  const canDecline = order && order.orderType !== 'PROMO_CODE'
+    && activeOrderItemCount(order) > 0
+    && ['Processing', 'Pending Review', 'Pending', 'Accepted'].includes(order.orderStatus || '');
 
   const submitAccept = async () => {
     if (!order || !estimatedDelivery) {
@@ -5573,6 +8084,9 @@ function AdminOrderDetailPage({ auth }) {
         body: JSON.stringify({ reason: declineReason || 'Order declined by admin.' }),
       });
       setOrder((current) => ({ ...(current || {}), ...result.order }));
+      if (result.refund?.status === 'REFUND_COMPLETED') {
+        setSuccess(`Order declined. ₹${(Number(result.refund.approvedRefundAmountPaise ?? result.refund.refundAmountPaise ?? result.refund.verifiedAmountPaidPaise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })} was credited to the customer's Innovation Labs Wallet.`);
+      }
       setModal(null);
       setDeclineReason('');
     } catch (requestError) {
@@ -5587,7 +8101,9 @@ function AdminOrderDetailPage({ auth }) {
   if (!order) return <div className="admin-panel-wrap"><div className="alert-box">{error || 'Order not found.'}</div><Link className="secondary-btn" to="/admin/orders">Back to Orders</Link></div>;
 
   const address = order.address || {};
-  const productItems = Array.isArray(order.items) ? order.items : [];
+  const productItems = Array.isArray(order.items)
+    ? order.items.map((item) => ({ ...item, adminCurrentSubscription: order.currentSubscription }))
+    : [];
   const orderStatus = order.orderStatus || 'Processing';
   const shippingAddress = [address.fullName, address.addressLine1, address.addressLine2, address.city, address.state, address.pinCode, address.country].filter(Boolean).join(', ') || 'Not provided';
 
@@ -5601,7 +8117,7 @@ function AdminOrderDetailPage({ auth }) {
     </div>;
   }
 
-  return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Admin · Order Details</span><h2>{order.orderId || order._id}</h2><Link className="secondary-btn small" to="/admin/orders">← Back to Orders</Link></div>{error && <div className="alert-box" role="alert">{error}</div>}<div className="refund-admin-grid"><section className="refund-admin-panel"><h2>Order Overview</h2><dl><div><dt>Order ID</dt><dd>#{order.orderId || order._id}</dd></div><div><dt>Order Type</dt><dd>{order.orderType === 'PROMO_CODE' ? 'Promo Code' : 'Product'}</dd></div><div><dt>Status</dt><dd>{orderStatus}</dd></div><div><dt>Payment</dt><dd>{order.paymentMethod || 'Not set'} · {order.paymentStatus || 'Pending'}</dd></div><div><dt>Created</dt><dd>{new Date(order.createdAt || Date.now()).toLocaleString()}</dd></div>{order.estimatedDelivery && order.deliveryRequired !== false && <div><dt>Estimated Delivery</dt><dd>{new Date(order.estimatedDelivery).toLocaleDateString()}</dd></div>}{order.orderType === 'PROMO_CODE' && <div><dt>Promo Code</dt><dd>{order.promoCode || '—'}</dd></div>}</dl></section><section className="refund-admin-panel"><h2>Customer Information</h2><dl><div><dt>Name</dt><dd>{order.userName || 'Not provided'}</dd></div><div><dt>Email</dt><dd>{order.userEmail || 'Not provided'}</dd></div><div><dt>Phone</dt><dd>{address.phoneNumber || 'Not provided'}</dd></div></dl></section><section className="refund-admin-panel"><h2>Products Ordered</h2>{order.orderType === 'PROMO_CODE' ? <div className="refund-request-items"><div><span>Promo Code</span><strong>{order.promoCode || '—'}</strong></div><div><span>Value</span><strong>₹{(Number(order.promoCodeAmountPaise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></div> : productItems.length ? <div className="refund-request-items">{productItems.map((item, index) => <div key={`${item.id || item.name || 'item'}-${index}`}><span>{item.name || item.productName || 'Product'} × {Number(item.quantity || 1)}</span><strong>₹{(Number(item.price || 0) * Number(item.quantity || 1)).toLocaleString('en-IN')}</strong></div>)}</div> : <p>No product details available.</p>}</section><section className="refund-admin-panel"><h2>Requirements</h2><dl><div><dt>Service</dt><dd>{order.service || 'Not requested'}</dd></div><div><dt>Project Requirements</dt><dd>{order.projectDescription || 'Not requested'}</dd></div></dl></section><section className="refund-admin-panel"><h2>Delivery Information</h2>{order.orderType === 'PROMO_CODE' ? <p>Delivery: Not required.</p> : <dl><div><dt>Delivery Address</dt><dd>{shippingAddress}</dd></div><div><dt>Estimated Delivery</dt><dd>{order.estimatedDelivery ? new Date(order.estimatedDelivery).toLocaleDateString() : 'Not assigned yet'}</dd></div></dl>}</section><section className="refund-admin-panel"><h2>Payment Information</h2><dl><div><dt>Payment Method</dt><dd>{order.paymentMethod || 'Not set'}</dd></div><div><dt>Payment Status</dt><dd>{order.paymentStatus || 'Pending'}</dd></div><div><dt>Total Paid</dt><dd>₹{Number(order.total || 0).toLocaleString('en-IN')}</dd></div></dl></section><section className="refund-admin-panel"><h2>Price Breakdown</h2><dl><div><dt>Products</dt><dd>₹{Number(order.subtotal || 0).toLocaleString('en-IN')}</dd></div>{order.codingCharge ? <div><dt>Coding</dt><dd>₹{Number(order.codingCharge || 0).toLocaleString('en-IN')}</dd></div> : null}{order.buildingCharge ? <div><dt>Building</dt><dd>₹{Number(order.buildingCharge || 0).toLocaleString('en-IN')}</dd></div> : null}{order.deliveryRequired !== false && <div><dt>Delivery</dt><dd>₹{Number(order.deliveryCharge || 0).toLocaleString('en-IN')}</dd></div>}<div><dt>Grand Total</dt><dd>₹{Number(order.total || 0).toLocaleString('en-IN')}</dd></div></dl></section><section className="refund-admin-panel"><h2>Status History</h2>{Array.isArray(order.statusHistory) && order.statusHistory.length ? <ul className="refund-timeline">{order.statusHistory.map((entry, index) => <li key={`${entry.status}-${index}`}><strong>{entry.status}</strong><span>{new Date(entry.createdAt || Date.now()).toLocaleString()}</span><p>{entry.note || 'No note provided.'}</p></li>)}</ul> : <p>No status history available.</p>}</section></div><div className="refund-admin-actions">{canAccept && <button className="primary-btn" disabled={busy} onClick={() => setModal('accept')}>Accept</button>}{canDecline && <button className="secondary-btn" disabled={busy} onClick={() => setModal('decline')}>Decline</button>}</div>{modal && <div className="wallet-lock-overlay"><section className="wallet-pin-modal" role="dialog" aria-modal="true"><h2>{modal === 'accept' ? 'Accept Order?' : 'Decline Order?'}</h2>{modal === 'accept' ? <><p>Are you sure you want to accept this order?</p><label>Estimated Delivery Date<input type="date" value={estimatedDelivery} onChange={(event) => setEstimatedDelivery(event.target.value)} /></label></> : <><p>Are you sure you want to decline this order?</p><label>Reason<textarea value={declineReason} onChange={(event) => setDeclineReason(event.target.value)} rows="4" placeholder="Optional reason" /></label></>}{modal === 'accept' && !estimatedDelivery && <p className="voice-error" role="alert">Choose a delivery date first.</p>}<div className="modal-actions"><button className="secondary-btn" disabled={busy} onClick={() => setModal(null)}>Cancel</button><button className="primary-btn" disabled={busy || (modal === 'accept' && !estimatedDelivery)} onClick={modal === 'accept' ? submitAccept : submitDecline}>{busy ? 'Processing...' : modal === 'accept' ? 'Confirm Acceptance' : 'Confirm Decline'}</button></div></section></div>}</div>;
+  return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Admin · Order Details</span><h2>{order.orderId || order._id}</h2><Link className="secondary-btn small" to="/admin/orders">← Back to Orders</Link></div>{error && <div className="alert-box" role="alert">{error}</div>}{success && <div className="success-banner" role="status">{success}</div>}<div className="refund-admin-grid"><section className="refund-admin-panel"><h2>Order Overview</h2><dl><div><dt>Order ID</dt><dd>#{order.orderId || order._id}</dd></div><div><dt>Order Type</dt><dd>{order.orderType === 'PROMO_CODE' ? 'Promo Code' : 'Product'}</dd></div><div><dt>Status</dt><dd>{orderStatus}</dd></div><div><dt>Payment</dt><dd>{order.paymentMethod || 'Not set'} · {order.paymentStatus || 'Pending'}</dd></div><div><dt>Created</dt><dd>{new Date(order.createdAt || Date.now()).toLocaleString()}</dd></div>{order.estimatedDelivery && order.deliveryRequired !== false && <div><dt>Estimated Delivery</dt><dd>{new Date(order.estimatedDelivery).toLocaleDateString()}</dd></div>}{order.orderType === 'PROMO_CODE' && <div><dt>Promo Code</dt><dd>{order.promoCode || '—'}</dd></div>}</dl></section><section className="refund-admin-panel"><h2>Customer Information</h2><dl><div><dt>Name</dt><dd>{order.userName || 'Not provided'}</dd></div><div><dt>Email</dt><dd>{order.userEmail || 'Not provided'}</dd></div><div><dt>Phone</dt><dd>{address.phoneNumber || 'Not provided'}</dd></div></dl></section><section className="refund-admin-panel"><h2>Products Ordered</h2>  {order.orderType === 'PROMO_CODE' ? <div className="refund-request-items"><div><span>Promo Code</span><strong>{order.promoCode || '—'}</strong></div><div><span>Value</span><strong>₹{(Number(order.promoCodeAmountPaise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></div> : productItems.length ? <OrderItemStatusList items={productItems} orderStatus={orderStatus} /> : <p>No product details available.</p>}</section><section className="refund-admin-panel"><h2>Requirements</h2><dl><div><dt>Service</dt><dd>{order.service || 'Not requested'}</dd></div><div><dt>Project Requirements</dt><dd>{order.projectDescription || 'Not requested'}</dd></div></dl></section><section className="refund-admin-panel"><h2>Delivery Information</h2>{order.orderType === 'PROMO_CODE' ? <p>Delivery: Not required.</p> : <dl><div><dt>Delivery Address</dt><dd>{shippingAddress}</dd></div><div><dt>Estimated Delivery</dt><dd>{order.estimatedDelivery ? new Date(order.estimatedDelivery).toLocaleDateString() : 'Not assigned yet'}</dd></div></dl>}</section><section className="refund-admin-panel"><h2>Payment Information</h2><dl><div><dt>Payment Method</dt><dd>{order.paymentMethod || 'Not set'}</dd></div><div><dt>Payment Status</dt><dd>{order.paymentStatus || 'Pending'}</dd></div><div><dt>Total Paid</dt><dd>₹{Number(order.total || 0).toLocaleString('en-IN')}</dd></div></dl></section><section className="refund-admin-panel"><h2>Price Breakdown</h2><dl><div><dt>Products</dt><dd>₹{Number(order.subtotal || 0).toLocaleString('en-IN')}</dd></div>{order.codingCharge ? <div><dt>Coding</dt><dd>₹{Number(order.codingCharge || 0).toLocaleString('en-IN')}</dd></div> : null}{order.buildingCharge ? <div><dt>Building</dt><dd>₹{Number(order.buildingCharge || 0).toLocaleString('en-IN')}</dd></div> : null}{order.deliveryRequired !== false && <div><dt>Delivery</dt><dd>₹{Number(order.deliveryCharge || 0).toLocaleString('en-IN')}</dd></div>}<div><dt>Grand Total</dt><dd>₹{Number(order.total || 0).toLocaleString('en-IN')}</dd></div></dl></section><section className="refund-admin-panel"><h2>Status History</h2>{Array.isArray(order.statusHistory) && order.statusHistory.length ? <ul className="refund-timeline">{order.statusHistory.map((entry, index) => <li key={`${entry.status}-${index}`}><strong>{entry.status}</strong><span>{new Date(entry.createdAt || Date.now()).toLocaleString()}</span><p>{entry.note || 'No note provided.'}</p></li>)}</ul> : <p>No status history available.</p>}</section></div><div className="refund-admin-actions">{canAccept && <button className="primary-btn" disabled={busy} onClick={() => setModal('accept')}>Accept</button>}{canDecline && <button className="secondary-btn" disabled={busy} onClick={() => setModal('decline')}>Decline</button>}</div>{modal && <div className="wallet-lock-overlay"><section className="wallet-pin-modal" role="dialog" aria-modal="true"><h2>{modal === 'accept' ? 'Accept Order?' : 'Decline Order?'}</h2>{modal === 'accept' ? <><p>Are you sure you want to accept this order?</p><label>Estimated Delivery Date<input type="date" value={estimatedDelivery} onChange={(event) => setEstimatedDelivery(event.target.value)} /></label></> : <><p>Are you sure you want to decline this order?</p><label>Reason<textarea value={declineReason} onChange={(event) => setDeclineReason(event.target.value)} rows="4" placeholder="Optional reason" /></label></>}{modal === 'accept' && !estimatedDelivery && <p className="voice-error" role="alert">Choose a delivery date first.</p>}<div className="modal-actions"><button className="secondary-btn" disabled={busy} onClick={() => setModal(null)}>Cancel</button><button className="primary-btn" disabled={busy || (modal === 'accept' && !estimatedDelivery)} onClick={modal === 'accept' ? submitAccept : submitDecline}>{busy ? 'Processing...' : modal === 'accept' ? 'Confirm Acceptance' : 'Confirm Decline'}</button></div></section></div>}</div>;
 }
 
 function InventoryPage({ auth }) {
@@ -5611,9 +8127,11 @@ function InventoryPage({ auth }) {
   const [form, setForm] = useState({ productId: '', name: '', category: 'Other Components', pricePaise: '0', stock: '0', description: '', images: '', technicalSpecs: '{}' });
   const [saving, setSaving] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
-  const [editStock, setEditStock] = useState('');
+  const [editForm, setEditForm] = useState(null);
+  const [imageSlideIndex, setImageSlideIndex] = useState(0);
   const [editError, setEditError] = useState('');
-  const [savingStock, setSavingStock] = useState(false);
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [inventoryNotice, setInventoryNotice] = useState('');
 
   useEffect(() => {
     if (!auth?.isAdmin) return;
@@ -5660,23 +8178,62 @@ function InventoryPage({ auth }) {
 
   const saveStockEdit = async (event) => {
     event.preventDefault();
-    if (!/^\d+$/.test(editStock) || !Number.isSafeInteger(Number(editStock))) {
+    if (!editingItem || !editForm) return;
+    const stock = Number(editForm.stock);
+    if (!editForm.name.trim()) {
+      setEditError('Product name cannot be empty.');
+      return;
+    }
+    if (!/^\d+(?:\.\d{1,2})?$/.test(editForm.price)) {
+      setEditError('Price must be a valid non-negative amount in rupees.');
+      return;
+    }
+    const [rupees, paise = ''] = editForm.price.split('.');
+    const pricePaise = Number(rupees) * 100 + Number(paise.padEnd(2, '0'));
+    if (!Number.isSafeInteger(pricePaise)) {
+      setEditError('Price is too large to save.');
+      return;
+    }
+    if (!/^\d+$/.test(editForm.stock) || !Number.isSafeInteger(stock)) {
       setEditError('Stock must be a non-negative whole number.');
       return;
     }
-    setSavingStock(true);
+    let technicalSpecs;
+    try {
+      technicalSpecs = JSON.parse(editForm.technicalSpecs || '{}');
+    } catch {
+      setEditError('Technical specifications must be valid JSON.');
+      return;
+    }
+    if (!technicalSpecs || Array.isArray(technicalSpecs) || typeof technicalSpecs !== 'object') {
+      setEditError('Technical specifications must be a JSON object.');
+      return;
+    }
+    setSavingEdit(true);
     setEditError('');
     try {
-      const result = await requestApi(`/api/admin/inventory/${encodeURIComponent(editingItem.productId)}/stock`, {
-        method: 'PATCH',
-        body: JSON.stringify({ stock: Number(editStock) }),
+      const result = await requestApi(`/api/admin/inventory/${encodeURIComponent(editingItem.productId)}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          name: editForm.name.trim(),
+          pricePaise,
+          stock,
+          description: editForm.description,
+          images: editForm.images.map((image) => image.trim()).filter(Boolean),
+          category: editForm.category,
+          technicalSpecs,
+          cancellable: editForm.cancellable,
+        }),
       });
       setInventory((current) => current.map((item) => item.productId === result.inventoryItem.productId ? result.inventoryItem : item));
       setEditingItem(null);
+      setEditForm(null);
+      setInventoryNotice(`${result.inventoryItem.name} was updated successfully.`);
+      setError('');
     } catch (requestError) {
       setEditError(requestError.message);
     } finally {
-      setSavingStock(false);
+      setSavingEdit(false);
     }
   };
 
@@ -5687,6 +8244,7 @@ function InventoryPage({ auth }) {
     <div className="admin-panel-wrap">
       <div className="section-title left"><span className="eyebrow">Admin</span><h2>Inventory</h2></div>
       {error && <div className="alert-box">{error}</div>}
+      {inventoryNotice && <div className="inquiry-success-banner" role="status">{inventoryNotice}</div>}
       <form className="admin-form" onSubmit={saveInventoryItem}>
         <div className="admin-form-grid">
           <label>Product ID<input value={form.productId} onChange={(event) => setForm((current) => ({ ...current, productId: event.target.value }))} placeholder="arduino-uno" required /></label>
@@ -5700,43 +8258,150 @@ function InventoryPage({ auth }) {
         <label>Technical specifications (JSON object)<textarea rows="3" value={form.technicalSpecs} onChange={(event) => setForm((current) => ({ ...current, technicalSpecs: event.target.value }))} placeholder={'{"Voltage":"5V","Interface":"I2C"}'} /></label>
         <button className="primary-btn" disabled={saving}>{saving ? 'Saving...' : 'Save Inventory Item'}</button>
       </form>
-      {inventory.length ? <div className="inventory-table-wrap"><table className="promo-table"><thead><tr><th>Product</th><th>Category</th><th>Price</th><th>Stock</th><th>Status</th><th>Actions</th></tr></thead><tbody>{inventory.map((item) => <tr key={item._id}><td><strong>{item.name}</strong><br /><small>{item.productId}</small></td><td>{item.category || 'Other Components'}</td><td>₹{(Number(item.pricePaise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td><td>{item.stock}</td><td><span className={`status-pill status-${String(item.status).toLowerCase().replace(/\s+/g, '-')}`}>{item.status}</span></td><td><button className="secondary-btn small" type="button" onClick={() => { setEditingItem(item); setEditStock(String(item.stock)); setEditError(''); }}>Edit</button></td></tr>)}</tbody></table></div> : <div className="empty-state"><h3>No inventory entries yet.</h3></div>}
-      {editingItem && <Modal onClose={() => setEditingItem(null)}><form className="modal-content inventory-edit-form" onSubmit={saveStockEdit}><span className="eyebrow">Edit Inventory</span><h3>{editingItem.name}</h3><p>{editingItem.productId}</p><p>Current stock: <strong>{editingItem.stock}</strong></p><label>New stock<input type="number" min="0" step="1" value={editStock} onChange={(event) => setEditStock(event.target.value)} required autoFocus /></label>{editError && <div className="alert-box" role="alert">{editError}</div>}<div className="modal-actions"><button className="secondary-btn" type="button" onClick={() => setEditingItem(null)}>Cancel</button><button className="primary-btn" disabled={savingStock}>{savingStock ? 'Saving...' : 'Save Changes'}</button></div></form></Modal>}
+      {inventory.length ? <div className="inventory-table-wrap"><table className="promo-table"><thead><tr><th>Product</th><th>Category</th><th>Price</th><th>Stock</th><th>Status</th><th>Actions</th></tr></thead><tbody>{inventory.map((item) => <tr key={item._id}><td><strong>{item.name}</strong><br /><small>{item.productId}</small></td><td>{item.category || 'Other Components'}</td><td>₹{(Number(item.pricePaise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td><td>{item.stock}</td><td><span className={`status-pill status-${String(item.status).toLowerCase().replace(/\s+/g, '-')}`}>{item.status}</span></td><td><button className="secondary-btn small" type="button" onClick={() => {
+        setEditingItem(item);
+        setEditForm({
+          name: item.name || '',
+          price: String(Number(item.pricePaise || 0) / 100),
+          stock: String(item.stock ?? 0),
+          description: item.description || '',
+          images: item.images?.length ? [...item.images] : [''],
+          category: item.category || 'Other Components',
+          technicalSpecs: JSON.stringify(item.technicalSpecs || {}, null, 2),
+          cancellable: item.cancellable !== false,
+        });
+        setImageSlideIndex(0);
+        setEditError('');
+        setInventoryNotice('');
+      }}>Edit</button></td></tr>)}</tbody></table></div> : <div className="empty-state"><h3>No inventory entries yet.</h3></div>}
+      {editingItem && editForm && <Modal className="inventory-edit-modal" onClose={() => { if (!savingEdit) { setEditingItem(null); setEditForm(null); } }}><form className="modal-content inventory-edit-form" onSubmit={saveStockEdit}>
+        <div className="inventory-edit-modal-header"><span className="eyebrow">Edit Inventory</span><h3>{editingItem.productId}</h3></div>
+        <label>Product Name<input value={editForm.name} maxLength={120} onChange={(event) => setEditForm((current) => ({ ...current, name: event.target.value }))} required autoFocus /></label>
+        <label>Price (₹)<input type="number" min="0" step="0.01" value={editForm.price} onChange={(event) => setEditForm((current) => ({ ...current, price: event.target.value }))} required /></label>
+        <label>Stock Quantity<input type="number" min="0" step="1" value={editForm.stock} onChange={(event) => setEditForm((current) => ({ ...current, stock: event.target.value }))} required /></label>
+        <label>Product Description<textarea rows="4" maxLength={1000} value={editForm.description} onChange={(event) => setEditForm((current) => ({ ...current, description: event.target.value }))} /></label>
+        <label className="inventory-cancellable-setting"><span><strong>NON-CANCELLABLE</strong><small>When enabled, customers cannot cancel this product.</small></span><input type="checkbox" checked={Boolean(editForm.cancellable === false)} onChange={(event) => setEditForm((current) => ({ ...current, cancellable: !event.target.checked }))} /></label>
+        <section className="inventory-image-slider" aria-label="Product image slider editor">
+          <div className="inventory-image-slider-heading"><strong>Product Images</strong><span>{editForm.images.length ? `${imageSlideIndex + 1} / ${editForm.images.length}` : '0 / 0'}</span></div>
+          <div className="inventory-image-slide">
+            {editForm.images[imageSlideIndex] && <img src={editForm.images[imageSlideIndex]} alt={`Product image ${imageSlideIndex + 1}`} />}
+            {!editForm.images[imageSlideIndex] && <span>Image preview</span>}
+            <button type="button" className="inventory-image-arrow previous" aria-label="Previous image" disabled={imageSlideIndex === 0} onClick={() => setImageSlideIndex((index) => Math.max(0, index - 1))}>‹</button>
+            <button type="button" className="inventory-image-arrow next" aria-label="Next image" disabled={imageSlideIndex >= editForm.images.length - 1} onClick={() => setImageSlideIndex((index) => Math.min(editForm.images.length - 1, index + 1))}>›</button>
+          </div>
+          <label>Image URL<input type="url" maxLength={2048} value={editForm.images[imageSlideIndex] || ''} placeholder="https://example.com/product-image.jpg" onChange={(event) => setEditForm((current) => ({
+            ...current,
+            images: current.images.map((image, index) => index === imageSlideIndex ? event.target.value : image),
+          }))} /></label>
+          <div className="inventory-image-slide-actions">
+            <button type="button" className="secondary-btn small" disabled={editForm.images.length >= 8} onClick={() => {
+              const nextIndex = editForm.images.length;
+              setEditForm((current) => ({ ...current, images: [...current.images, ''] }));
+              setImageSlideIndex(nextIndex);
+            }}>Add Image</button>
+            <button type="button" className="secondary-btn small" disabled={!editForm.images.length} onClick={() => {
+              setEditForm((current) => ({ ...current, images: current.images.filter((_, index) => index !== imageSlideIndex) }));
+              setImageSlideIndex((index) => Math.max(0, index - 1));
+            }}>Remove Image</button>
+          </div>
+        </section>
+        <label>Product Category<input value={editForm.category} maxLength={80} onChange={(event) => setEditForm((current) => ({ ...current, category: event.target.value }))} required /></label>
+        <label>Technical Specifications (JSON object)<textarea rows="5" value={editForm.technicalSpecs} onChange={(event) => setEditForm((current) => ({ ...current, technicalSpecs: event.target.value }))} /></label>
+        {editError && <div className="alert-box" role="alert">{editError}</div>}
+        <div className="modal-actions"><button className="secondary-btn" type="button" disabled={savingEdit} onClick={() => { setEditingItem(null); setEditForm(null); }}>Cancel</button><button className="primary-btn" disabled={savingEdit}>{savingEdit ? 'Saving Changes…' : 'Save Changes'}</button></div>
+      </form></Modal>}
     </div>
   );
 }
 
 function AdminSettingsPage({ auth }) {
-  const [settings, setSettings] = useState({ maxActiveOrders: 50 });
+  const defaultPlanSettings = {
+    Starter: { price: 0, walletLimit: 5000, cashback: 0 },
+    Medium: { price: 6999, walletLimit: 10000, cashback: 0 },
+    Premium: { price: 9999, walletLimit: 15000, cashback: 199 },
+    Exclusive: { price: 1999, walletLimit: 20000, cashback: 299 },
+  };
+  const plansInRupees = (plans) => Object.fromEntries(Object.entries(plans || {}).map(([name, plan]) => [name, {
+    price: Number(plan.pricePaise || 0) / 100,
+    walletLimit: Number(plan.walletLimitPaise || 0) / 100,
+    cashback: Number(plan.cashbackPaise || 0) / 100,
+  }]));
+  const [settings, setSettings] = useState({ maxActiveOrders: 50, subscriptionGraceHours: 48, plans: defaultPlanSettings });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
 
   useEffect(() => {
     if (!auth?.isAdmin) return;
     requestApi('/api/admin/settings')
-      .then((result) => setSettings(result.settings || { maxActiveOrders: 50 }))
+      .then((result) => setSettings((current) => ({
+        ...current,
+        ...(result.settings || {}),
+        plans: result.settings?.plans ? plansInRupees(result.settings.plans) : current.plans,
+      })))
       .catch((requestError) => setError(requestError.message))
       .finally(() => setLoading(false));
   }, [auth]);
 
-  const updateLimit = async () => {
-    setSaving(true);
+  const updateSettings = async (event) => {
+    event.preventDefault();
+    setSaving(true); setError(''); setSuccess('');
     try {
-      const result = await requestApi('/api/admin/settings/max-active-orders', { method: 'PATCH', body: JSON.stringify({ value: Number(settings.maxActiveOrders) }) });
-      setSettings(result.settings || settings);
-      setError('');
-    } catch (requestError) {
-      setError(requestError.message);
-    } finally {
-      setSaving(false);
-    }
+      const plans = Object.fromEntries(Object.entries(settings.plans).map(([name, plan]) => [name, {
+        pricePaise: Math.round(Number(plan.price) * 100),
+        walletLimitPaise: Math.round(Number(plan.walletLimit) * 100),
+        cashbackPaise: Math.round(Number(plan.cashback) * 100),
+      }]));
+      const [planResult, limitResult] = await Promise.all([
+        requestApi('/api/admin/settings/subscription-plans', { method: 'PATCH', body: JSON.stringify({ plans }) }),
+        requestApi('/api/admin/settings/max-active-orders', { method: 'PATCH', body: JSON.stringify({ value: Number(settings.maxActiveOrders) }) }),
+      ]);
+      const savedSettings = { ...(planResult.settings || {}), ...(limitResult.settings || {}) };
+      if (savedSettings) {
+        setSettings((current) => ({
+          ...current,
+          ...savedSettings,
+          plans: savedSettings.plans ? plansInRupees(savedSettings.plans) : current.plans,
+        }));
+      }
+      setSuccess('Subscription and operational settings saved.');
+    } catch (requestError) { setError(requestError.message); }
+    finally { setSaving(false); }
   };
+
+  const updatePlan = (planName, field, value) => setSettings((current) => ({
+    ...current,
+    plans: { ...current.plans, [planName]: { ...current.plans[planName], [field]: value } },
+  }));
 
   if (!auth?.isAdmin) return <div className="empty-state"><h3>Admin access is required.</h3></div>;
   if (loading) return <div className="empty-state"><h3>Loading settings...</h3></div>;
 
-  return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Admin</span><h2>Operational Settings</h2></div>{error && <div className="alert-box">{error}</div>}<div className="account-card"><div className="order-row"><span>Max active orders</span><strong>{settings.maxActiveOrders}</strong></div><label className="wallet-amount">Order capacity<input type="number" min="1" value={settings.maxActiveOrders} onChange={(event) => setSettings((current) => ({ ...current, maxActiveOrders: event.target.value }))} /></label><button className="primary-btn" disabled={saving} onClick={updateLimit}>{saving ? 'Saving...' : 'Update limit'}</button></div></div>;
+  return <div className="admin-panel-wrap">
+    <div className="section-title left"><span className="eyebrow">Admin</span><h2>Operational Settings</h2></div>
+    {error && <div className="alert-box" role="alert">{error}</div>}
+    {success && <div className="success-banner" role="status">{success}</div>}
+    <form className="admin-settings-grid" onSubmit={updateSettings}>
+      <section className="account-card admin-settings-card"><div className="account-panel-heading"><h3>Subscription Plans</h3><span>Monetary values in ₹</span></div>
+        <div className="admin-plan-settings-grid">
+          {Object.entries(settings.plans).map(([planName, plan]) => <section className="admin-plan-setting" key={planName}>
+            <h4>{displayPlanName(planName)}</h4>
+            <label>Subscription price (₹)<input type="number" min="0" step="0.01" value={plan.price} onChange={(event) => updatePlan(planName, 'price', event.target.value)} required /></label>
+            <label>Wallet limit (₹)<input type="number" min="0" step="0.01" value={plan.walletLimit} onChange={(event) => updatePlan(planName, 'walletLimit', event.target.value)} required /></label>
+            <label>Activation cashback (₹)<input type="number" min="0" step="0.01" value={plan.cashback} onChange={(event) => updatePlan(planName, 'cashback', event.target.value)} required /></label>
+          </section>)}
+        </div>
+      </section>
+      <section className="account-card admin-settings-card"><div className="account-panel-heading"><h3>Expiry &amp; Capacity</h3><span>Applies to all customers</span></div>
+        <div className="admin-settings-fields">
+          <label>Subscription grace period (hours)<input type="number" value={48} readOnly aria-describedby="subscription-grace-help" /><small id="subscription-grace-help">The 48-hour grace period is fixed for all subscriptions.</small></label>
+          <label>Maximum active orders per customer<input type="number" min="1" step="1" value={settings.maxActiveOrders} onChange={(event) => setSettings((current) => ({ ...current, maxActiveOrders: event.target.value }))} required /></label>
+        </div>
+      </section>
+      <div className="admin-settings-actions"><button className="primary-btn" disabled={saving}>{saving ? 'Saving...' : 'Save settings'}</button></div>
+    </form>
+  </div>;
 }
 
 function AdminCreditPurchasesPage({ auth }) {
@@ -5753,6 +8418,48 @@ function AdminCreditPurchasesPage({ auth }) {
   if (!auth?.isAdmin) return <div className="empty-state"><h3>Admin access is required.</h3></div>;
   if (loading) return <div className="empty-state"><h3>Loading credit purchases...</h3></div>;
   return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Admin</span><h2>AI Credit Purchases</h2></div>{error && <div className="alert-box">{error}</div>}{purchases.length ? <div className="inventory-table-wrap"><table className="promo-table"><thead><tr><th>Customer</th><th>Transaction</th><th>Credits</th><th>Amount</th><th>Payment</th><th>Status</th><th>Date</th></tr></thead><tbody>{purchases.map((purchase) => <tr key={purchase.purchaseId}><td><strong>{purchase.user.name || purchase.user.email}</strong><br /><small>{purchase.user.email || purchase.user.id}</small></td><td>{purchase.purchaseId}</td><td>{purchase.credits.toLocaleString('en-IN')}</td><td>₹{purchase.totalAmount.toLocaleString('en-IN')}</td><td>{purchase.paymentMethod}</td><td>{purchase.status}</td><td>{new Date(purchase.completedAt || purchase.createdAt || Date.now()).toLocaleString()}</td></tr>)}</tbody></table></div> : <div className="empty-state"><h3>No credit purchases yet.</h3></div>}</div>;
+}
+
+function AdminAIBillCreditsPage({ auth }) {
+  const [data, setData] = useState({ purchases: [], transactions: [] });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    if (!auth?.isAdmin) { setLoading(false); return; }
+    requestApi('/api/admin/ai-bill-purchases')
+      .then(setData)
+      .catch((requestError) => setError(requestError.message))
+      .finally(() => setLoading(false));
+  }, [auth]);
+  if (!auth?.isAdmin) return <div className="empty-state"><h3>Admin access is required.</h3></div>;
+  if (loading) return <div className="empty-state"><h3>Loading AI bill history...</h3></div>;
+  return <div className="admin-panel-wrap">
+    <div className="section-title left"><span className="eyebrow">Admin</span><h2>AI Bill Credits</h2></div>
+    {error && <div className="alert-box" role="alert">{error}</div>}
+    <section className="account-panel">
+      <h3>Bill purchases</h3>
+      {data.purchases.length ? <div className="inventory-table-wrap"><table className="promo-table">
+        <thead><tr><th>Customer</th><th>Reference</th><th>Bills</th><th>Payment</th><th>Credits used</th><th>Status</th><th>Date</th></tr></thead>
+        <tbody>{data.purchases.map((purchase) => <tr key={purchase.purchaseId}>
+          <td><strong>{purchase.user.name || purchase.user.email || purchase.user.id}</strong><br /><small>{purchase.user.email}</small></td>
+          <td>{purchase.purchaseId}</td><td>{purchase.quantity}</td><td>₹{purchase.totalAmount.toLocaleString('en-IN')} · {purchase.paymentMethod}</td>
+          <td>{purchase.creditsDeducted}</td><td>{purchase.status}</td><td>{new Date(purchase.createdAt).toLocaleString('en-IN')}</td>
+        </tr>)}</tbody>
+      </table></div> : <p className="account-empty">No AI bill purchases yet.</p>}
+    </section>
+    <section className="account-panel credit-history">
+      <h3>Allowance and usage ledger</h3>
+      {data.transactions.length ? <div className="inventory-table-wrap"><table className="promo-table">
+        <thead><tr><th>Customer</th><th>Activity</th><th>Quantity</th><th>Period / reference</th><th>Remaining</th><th>Date</th></tr></thead>
+        <tbody>{data.transactions.map((transaction) => <tr key={transaction.reference}>
+          <td><strong>{transaction.user?.name || transaction.user?.email || transaction.userId}</strong><br /><small>{transaction.user?.email || transaction.userId}</small></td>
+          <td>{transaction.type}{transaction.source ? ` · ${transaction.source}` : ''}</td><td>{transaction.quantity}</td>
+          <td>{transaction.periodKey || transaction.reference}</td><td>{transaction.includedRemaining ?? '—'} included · {transaction.purchasedRemaining ?? '—'} purchased</td>
+          <td>{new Date(transaction.createdAt).toLocaleString('en-IN')}</td>
+        </tr>)}</tbody>
+      </table></div> : <p className="account-empty">No allowance or usage records yet.</p>}
+    </section>
+  </div>;
 }
 
 function AdminPromoCodesPage({ auth }) {
@@ -5867,7 +8574,58 @@ function AccountOrderRow({ order, dateFor, itemCountFor }) {
   );
 }
 
-function OrdersPage({ orders, auth, loading, error, onSignIn, onCancelOrder }) {
+function OrdersPage({ orders, auth, loading, error, serverNow, onRefreshOrders, onSignIn, onCancelOrder }) {
+  const [deliveryNow, setDeliveryNow] = useState(() => Date.now());
+  const deliveryClockRef = useRef({ serverTime: Date.now(), performanceTime: performance.now() });
+
+  useEffect(() => {
+    if (!auth) return undefined;
+    onRefreshOrders();
+    const interval = window.setInterval(onRefreshOrders, 30_000);
+    const refreshOnFocus = () => {
+      if (document.visibilityState === 'visible') onRefreshOrders();
+    };
+    window.addEventListener('focus', refreshOnFocus);
+    document.addEventListener('visibilitychange', refreshOnFocus);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refreshOnFocus);
+      document.removeEventListener('visibilitychange', refreshOnFocus);
+    };
+  }, [auth?.id, onRefreshOrders]);
+
+  useEffect(() => {
+    const serverTime = Date.parse(serverNow || '');
+    if (!Number.isFinite(serverTime)) return undefined;
+    deliveryClockRef.current = { serverTime, performanceTime: performance.now() };
+    const currentTime = deliveryClockRef.current.serverTime
+      + performance.now() - deliveryClockRef.current.performanceTime;
+    setDeliveryNow(currentTime);
+    const nextArrivalAt = orders
+      .map((order) => {
+        if (!order.estimatedDelivery || order.deliveryBanner === 'ORDER CANCELLED' || order.arrived) return null;
+        const estimatedDelivery = new Date(order.estimatedDelivery);
+        if (!Number.isFinite(estimatedDelivery.getTime())) return null;
+        const parts = new Intl.DateTimeFormat('en-US', {
+          timeZone: 'Asia/Kolkata',
+          year: 'numeric',
+          month: 'numeric',
+          day: 'numeric',
+        }).formatToParts(estimatedDelivery);
+        const values = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
+        return Date.UTC(values.year, values.month - 1, values.day, 6, 30);
+      })
+      .filter((timestamp) => Number.isFinite(timestamp) && timestamp > currentTime)
+      .sort((left, right) => left - right)[0];
+    if (!nextArrivalAt) return undefined;
+    const timer = window.setTimeout(() => {
+      setDeliveryNow(deliveryClockRef.current.serverTime
+        + performance.now() - deliveryClockRef.current.performanceTime);
+      onRefreshOrders();
+    }, Math.max(0, nextArrivalAt - currentTime + 20));
+    return () => window.clearTimeout(timer);
+  }, [serverNow, orders, onRefreshOrders]);
+
   if (!auth) {
     return (
       <main className="page-shell">
@@ -5898,23 +8656,39 @@ function OrdersPage({ orders, auth, loading, error, onSignIn, onCancelOrder }) {
         ) : (
           <div className="orders-list">
             {orders.filter((order) => order.email === auth.email).map((order) => (
-              <div key={order.id} className="order-card">
-                <div className="order-row"><span>Order ID</span><strong>{order.id}</strong></div>
-                <div className="order-row"><span>Date</span><strong>{new Date(order.date).toLocaleDateString()}</strong></div>
-                <div className="order-row"><span>Items</span><strong>{order.items.reduce((sum, item) => sum + item.quantity, 0)}</strong></div>
-                {order.orderType === 'PROMO_CODE' && <div className="order-row"><span>Purchase Type</span><strong><span className={`promo-purchase-badge ${order.purchaseType || 'online'}`}>{order.purchaseType === 'offline' ? 'OFFLINE PURCHASE' : 'ONLINE PURCHASE'}</span></strong></div>}
-                {order.orderType === 'PROMO_CODE' && <PromoOrderAccountDetails order={order} />}
-                <div className="order-row"><span>Amount</span><strong>₹{order.total}</strong></div>
-                {order.orderType === 'PROMO_CODE' && order.purchaseType === 'offline' && !order.promoCode && <div className="order-row"><span>Promo Code</span><strong>Hidden until fulfillment</strong></div>}
-                {order.orderType === 'PROMO_CODE' && order.promoCode && <div className="order-row"><span>Promo Code</span><strong>{order.promoCode}</strong></div>}
-                {order.orderType === 'PROMO_CODE' && order.promoCodeStatus && <div className="order-row"><span>Redemption</span><strong>{order.promoCodeStatus === 'REDEEMED' ? 'Redeemed' : order.purchaseType === 'offline' && !order.promoCode ? 'Hidden until fulfillment' : 'Ready to redeem'}</strong></div>}
-                {order.orderType === 'PROMO_CODE' && order.purchaseType === 'offline' && order.orderStatus === 'Pending Admin Approval' && <div className="order-row"><span>Fulfillment</span><strong>Pending admin approval</strong></div>}
-                <div className="order-row"><span>Payment</span><strong>{order.paymentStatus}</strong></div>
-                <div className="order-row"><span>Status</span><strong>{order.orderStatus}</strong></div>
-                {['Declined', 'Rejected'].includes(order.orderStatus) && order.refundCase && <><div className="order-row"><span>Refund Status</span><strong>{refundStatusLabel(order.refundCase.status)}</strong></div><div className="order-row"><span>Refund Amount</span><strong>₹{((order.refundCase.approvedRefundAmountPaise ?? order.refundCase.refundAmountPaise ?? 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></>}
-                <div className="order-actions"><Link to="/order-placed" state={{ order }} className="primary-btn small">View Details</Link>{order.refundEligible && !order.cancelEligible && <Link className="secondary-btn small" to={`/refund/${encodeURIComponent(order.id)}`}>Refund</Link>}{order.cancelEligible && !order.refundEligible && <button className="secondary-btn small" onClick={() => onCancelOrder(order)}>Cancel</button>}</div>
-                {(order.cancellationId || order.orderStatus === 'Cancelled' || order.refundCase) && <div className="order-status-stamps">{(order.cancellationId || order.orderStatus === 'Cancelled') && <span className="order-cancelled-stamp">CANCELLED</span>}{order.refundCase && <span className="refund-order-stamp">{refundStatusLabel(order.refundCase.status).toUpperCase()}</span>}</div>}
-              </div>
+              <article key={order.id} className="order-card order-card-clean">
+                <p className="account-order-delivery">
+                  {order.deliveryBanner
+                    ? order.deliveryBanner
+                    : ['Cancelled', 'Declined'].includes(order.orderStatus) || order.cancelledAt
+                      ? 'ORDER CANCELLED'
+                      : order.arrived || ['Delivered', 'Completed'].includes(order.orderStatus)
+                        ? 'ARRIVED'
+                        : order.deliveryRequired === false
+                    ? 'DIGITAL DELIVERY'
+                    : order.estimatedDelivery
+                      ? formatEstimatedDelivery(order.estimatedDelivery, new Date(deliveryNow))
+                      : order.orderStatus === 'Accepted' ? 'DELIVERY DATE NOT SET' : 'DELIVERY ESTIMATE PENDING'}
+                </p>
+                {activeOrderItemCount(order) > 0 ? <ul className="order-card-products" aria-label="Active products in this order">
+                  {(order.items || []).flatMap((item, index) => {
+                    const { activeQuantity } = getOrderItemQuantities(item);
+                    return activeQuantity > 0 ? [
+                    <li className="order-card-product" key={`${item.id || item.name}-${index}`}>
+                      <img src={item.image || fallbackProductImage} alt="" loading="lazy" onError={(event) => { event.currentTarget.onerror = null; event.currentTarget.src = fallbackProductImage; }} />
+                      <span className="order-card-product-name">{item.name || 'Product'}</span>
+                      <span className="order-card-product-quantity">Qty {activeQuantity}</span>
+                    </li>
+                    ] : [];
+                  })}
+                </ul> : <p className="account-order-delivery">No active products remain in this order.</p>}
+                <div className="order-actions">
+                  <Link to={`/order-placed/${encodeURIComponent(order.orderId || order.id)}`} state={{ order }} className="primary-btn small">VIEW DETAILS</Link>
+                  {order.cancelEligible && !order.arrived && !order.cancelledAt && !['Cancelled', 'Declined', 'Delivered', 'Completed'].includes(order.orderStatus)
+                    && <button className="secondary-btn small" onClick={() => onCancelOrder(order)}>CANCEL ORDER</button>}
+                  {order.refundEligible && !order.cancelEligible && <Link className="secondary-btn small" to={`/refund/${encodeURIComponent(order.id)}`}>Refund</Link>}
+                </div>
+              </article>
             ))}
           </div>
         )}
@@ -6080,11 +8854,98 @@ function AdminCustomRequestsPage({ auth, customOrders, error, prices, setPrices,
   );
 }
 
-function OrderPlacedPage({ order }) {
+function CheckoutPaymentResultPage() {
+  const { reference } = useParams();
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [refreshVersion, setRefreshVersion] = useState(0);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError('');
+    requestApi(`/api/checkout-attempts/${encodeURIComponent(reference)}`)
+      .then((response) => {
+        if (active) setResult(response);
+      })
+      .catch((requestError) => {
+        if (active) setError(requestError.message || 'The payment status could not be verified.');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
+  }, [reference, refreshVersion]);
+
+  if (loading) {
+    return <main className="page-shell"><div className="container centered-box" role="status"><span className="order-buffer-spinner" /><p>Checking payment status...</p></div></main>;
+  }
+  if (error || !result?.attempt) {
+    return <main className="page-shell"><div className="container narrow-container"><div className="alert-box" role="alert">{error || 'The payment status is unavailable.'}</div><div className="order-result-actions"><button type="button" className="secondary-btn" onClick={() => setRefreshVersion((version) => version + 1)}>Check Again</button><Link className="primary-btn" to="/checkout">Return to Checkout</Link></div></div></main>;
+  }
+
+  const { attempt, order } = result;
+  const paymentConfirmed = attempt.paymentStatus === 'Paid' && order?.paymentStatus === 'Paid';
+  const paymentFailed = attempt.paymentStatus === 'Failed';
+  const paymentReview = attempt.paymentStatus === 'Paid' && !order;
+  const paymentMethod = order?.paymentMethod || (String(attempt.paymentReference || '').startsWith('wallet-payment:') ? 'Wallet' : 'Razorpay');
+  const amount = Number(order?.total ?? attempt.total);
+  const paidAt = order?.paymentVerifiedAt || order?.createdAt || attempt.completedAt;
+  return <main className="page-shell order-confirmation-shell">
+    <div className="container order-confirmation-container">
+      <header className="order-confirmation-header">
+        <div className={`order-success-circle ${paymentFailed ? 'is-cancelled' : ''} is-visible`} role="img" aria-label={paymentConfirmed ? 'Payment confirmed' : paymentFailed ? 'Payment failed' : 'Payment pending'}>
+          <span className={paymentFailed ? 'order-crossmark' : 'order-checkmark'} aria-hidden="true" />
+        </div>
+        <h1 className="order-confirmation-title">{paymentConfirmed ? 'Payment Successful' : paymentFailed ? 'Payment Failed' : paymentReview ? 'Payment Under Review' : 'Payment Status Pending'}</h1>
+        <p className="order-confirmation-intro">
+          {paymentConfirmed
+            ? 'The server confirmed your payment and order.'
+            : paymentFailed
+              ? 'The payment was not completed. No successful payment is recorded for this checkout.'
+              : paymentReview
+                ? 'The payment was received, but the server has not yet linked it to an order. Do not retry the payment while it is under review.'
+              : 'The server has not confirmed a completed payment yet. Do not retry until you verify the latest status.'}
+        </p>
+      </header>
+      <section className="order-confirmation-card order-staged-card" aria-labelledby="checkout-result-title">
+        <h2 id="checkout-result-title">Payment Details</h2>
+        <dl className="order-information-list">
+          {Number.isFinite(amount) && <div><dt>Amount</dt><dd>₹{amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</dd></div>}
+          <div><dt>Payment Status</dt><dd>{attempt.paymentStatus}</dd></div>
+          {paymentConfirmed && <div><dt>Order</dt><dd>{order.orderId}</dd></div>}
+          <div><dt>Payment Method</dt><dd>{paymentMethod}</dd></div>
+          {attempt.paymentReference && <div><dt>Transaction ID</dt><dd>{attempt.paymentReference}</dd></div>}
+          {paidAt && <div><dt>Date and Time</dt><dd>{new Date(paidAt).toLocaleString()}</dd></div>}
+          {paymentFailed && <div><dt>Reason</dt><dd>{attempt.reason || 'The payment was declined. Please retry or use another payment method.'}</dd></div>}
+          {!paymentConfirmed && !paymentFailed && attempt.reason && <div><dt>Details</dt><dd>{attempt.reason}</dd></div>}
+        </dl>
+      </section>
+      <div className="order-result-actions">
+        {paymentConfirmed && order?.orderId && <Link className="primary-btn" to={`/order-placed/${encodeURIComponent(order.orderId)}`} state={{ order }}>View Order</Link>}
+        {paymentFailed && <Link className="primary-btn" to="/checkout">Retry Payment</Link>}
+        {!paymentConfirmed && !paymentFailed && <button type="button" className="primary-btn" onClick={() => setRefreshVersion((version) => version + 1)}>Check Status Again</button>}
+        <Link className="secondary-btn" to={paymentConfirmed ? '/products' : paymentReview ? '/orders' : '/checkout'}>{paymentConfirmed ? 'Continue Shopping' : paymentReview ? 'View Orders' : 'Return to Checkout'}</Link>
+      </div>
+    </div>
+  </main>;
+}
+
+function OrderPlacedPage({ order: initialOrder }) {
+  const { orderId: routeOrderId } = useParams();
+  const routedInitialOrder = !routeOrderId || String(initialOrder?.orderId || initialOrder?.id) === routeOrderId
+    ? initialOrder
+    : null;
+  const [order, setOrder] = useState(routedInitialOrder || null);
+  const [orderLoading, setOrderLoading] = useState(Boolean(routeOrderId || routedInitialOrder?.orderId || routedInitialOrder?.id));
+  const [orderLoadError, setOrderLoadError] = useState('');
+  const [orderLoadVersion, setOrderLoadVersion] = useState(0);
   const [stage, setStage] = useState(0);
   const [copyState, setCopyState] = useState('Copy Code');
   const [discountRevealOpen, setDiscountRevealOpen] = useState(false);
   const [rewardPopupOpen, setRewardPopupOpen] = useState(false);
+  const requestedOrderKey = routeOrderId || routedInitialOrder?.orderId || routedInitialOrder?.id;
   const orderKey = order?.orderId || order?.id;
   const rewardPointsEarned = Number(order?.rewardPointsEarned || 0);
   const rewardWasEarned = rewardPointsEarned > 0 && order?.paymentStatus === 'Paid' && !['Cancelled', 'Declined', 'Rejected', 'Failed'].includes(order?.orderStatus);
@@ -6121,15 +8982,38 @@ function OrderPlacedPage({ order }) {
   const maskedPhone = address.phoneNumber ? String(address.phoneNumber).replace(/\d(?=\d{2})/g, '*') : '';
 
   useEffect(() => {
+    let active = true;
+    setOrder(routedInitialOrder || null);
+    setOrderLoadError('');
+    if (!requestedOrderKey) {
+      setOrderLoading(false);
+      return () => { active = false; };
+    }
+    setOrderLoading(true);
+    requestApi(`/api/orders/${encodeURIComponent(requestedOrderKey)}`)
+      .then((result) => {
+        if (active) setOrder(result.order);
+      })
+      .catch((requestError) => {
+        if (active) setOrderLoadError(requestError.message || 'The latest order status could not be loaded.');
+      })
+      .finally(() => {
+        if (active) setOrderLoading(false);
+      });
+    return () => { active = false; };
+  }, [requestedOrderKey, orderLoadVersion, routedInitialOrder]);
+
+  useEffect(() => {
     if (!orderKey) return undefined;
     setStage(0);
+    if (orderLoading) return undefined;
     const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
     const stageTimes = reducedMotion
       ? [500, 620, 740, 860, 980, 1100, 1220, 1340]
       : [1300, 1850, 2200, 2520, 2790, 3060, 3330, 3600];
     const timers = stageTimes.map((delay, index) => setTimeout(() => setStage(index + 1), delay));
     return () => timers.forEach(clearTimeout);
-  }, [orderKey]);
+  }, [orderKey, orderLoading]);
 
   useEffect(() => {
     setDiscountRevealOpen(false);
@@ -6154,18 +9038,30 @@ function OrderPlacedPage({ order }) {
     }
   };
 
+  if (orderLoadError) {
+    return <main className="page-shell"><div className="container centered-box"><div className="alert-box" role="alert">{orderLoadError}</div><button type="button" className="secondary-btn" onClick={() => setOrderLoadVersion((version) => version + 1)}>Retry</button></div></main>;
+  }
+  if (orderLoading && !order) {
+    return <main className="page-shell"><div className="container centered-box" role="status"><span className="order-buffer-spinner" /><p>Loading order status...</p></div></main>;
+  }
   if (!order) {
     return <main className="page-shell"><div className="container centered-box"><h2>No order found.</h2></div></main>;
   }
+  const allItemsCancelled = Boolean(order.allItemsCancelled)
+    || (order.items || []).length > 0 && (order.items || []).every((item) =>
+      Number(item.cancelledQuantity || 0) >= Number(item.quantity || 0));
+  const isCancelledOrder = order.orderStatus === 'Cancelled' || allItemsCancelled;
+  const paymentConfirmed = order.paymentStatus === 'Paid';
+  const paymentFailed = order.paymentStatus === 'Failed';
 
   return (
     <>
     <main className="page-shell order-confirmation-shell">
       <div className="container order-confirmation-container">
-        {stage === 0 ? <div className="order-processing" role="status" aria-live="polite"><span className="order-buffer-spinner" aria-hidden="true" /><p>Processing Order</p></div> : <>
+        {stage === 0 || orderLoading ? <div className="order-processing" role="status" aria-live="polite"><span className="order-buffer-spinner" aria-hidden="true" /><p>Processing Order</p></div> : <>
           <header className="order-confirmation-header">
-            <div className={`order-success-circle ${stage >= 1 ? 'is-visible' : ''}`} role="img" aria-label="Order successfully placed"><span className="order-checkmark" aria-hidden="true" /></div>
-            {stage >= 2 && <><h1 className="order-confirmation-title">{order.orderStatus === 'Declined' ? 'Order Declined' : order.orderStatus === 'Rejected' ? 'Order Rejected' : isGiftOrder ? 'Gift Order Confirmed' : 'Order Placed'}</h1><p className="order-confirmation-intro">{order.orderStatus === 'Declined' ? 'Your order was declined by the admin. The refundable parts amount has been credited to your wallet.' : order.orderStatus === 'Rejected' ? 'Your offline Promo Code order was rejected. The eligible purchase amount was refunded to your wallet.' : order.orderType === 'PROMO_CODE' && order.purchaseType === 'offline' && order.orderStatus === 'Pending Admin Approval' ? 'Your payment is confirmed. This offline order is pending admin approval; the Promo Code and wallet credit will be activated only after acceptance.' : isGiftOrder ? 'Your gift order was successfully placed. The promo code is assigned to the recipient account.' : isPromoCodeOrder ? 'Your digital Promo Code purchase has been confirmed. The code is ready to redeem in your Wallet.' : 'Your order has been successfully placed. Our team will review your order and update the delivery timeline.'}</p></>}
+            <div className={`order-success-circle ${isCancelledOrder || paymentFailed ? 'is-cancelled' : ''} ${stage >= 1 ? 'is-visible' : ''}`} role="img" aria-label={paymentConfirmed ? 'Payment confirmed' : paymentFailed ? 'Payment failed' : 'Payment status pending'}><span className={isCancelledOrder || paymentFailed ? 'order-crossmark' : 'order-checkmark'} aria-hidden="true" /></div>
+            {stage >= 2 && <><h1 className="order-confirmation-title">{paymentConfirmed ? 'Payment Successful' : paymentFailed ? 'Payment Failed' : 'Payment Status Pending'}</h1><p className="order-confirmation-intro">{paymentFailed ? 'The payment was not completed. No successful payment is recorded for this order.' : !paymentConfirmed ? 'The payment has not been confirmed by the server. Please check the status before taking further action.' : allItemsCancelled ? 'Payment was confirmed, but all products in this order have since been cancelled.' : order.orderStatus === 'Declined' ? 'Your order was declined by the admin. The full paid amount has been credited to your Wallet.' : order.orderStatus === 'Rejected' ? 'Your offline Promo Code order was rejected. The eligible purchase amount was refunded to your wallet.' : order.orderType === 'PROMO_CODE' && order.purchaseType === 'offline' && order.orderStatus === 'Pending Admin Approval' ? 'Your payment is confirmed. This offline order is pending admin approval; the Promo Code and wallet credit will be activated only after acceptance.' : isGiftOrder ? 'Your gift order was successfully placed. The promo code is assigned to the recipient account.' : isPromoCodeOrder ? 'Your digital Promo Code purchase has been confirmed. The code is ready to redeem in your Wallet.' : 'Your order has been successfully placed. Our team will review your order and update the delivery timeline.'}</p></>}
           </header>
           {stage >= 2 && rewardWasEarned && <section className="reward-points-confirmation" aria-label="Reward points earned"><span aria-hidden="true">🎁</span><div><strong>{rewardPointsEarned.toLocaleString('en-IN')} Reward Points Earned</strong><small>These points have been added to your account.</small></div></section>}
           {stage >= 2 && rewardWasEarned && rewardPopupOpen && <div className="wallet-lock-overlay reward-success-overlay"><section className="wallet-pin-modal reward-success-dialog" role="dialog" aria-modal="true" aria-labelledby="reward-success-title"><span className="reward-success-icon" aria-hidden="true">🎉</span><h2 id="reward-success-title">You earned reward points!</h2><strong>{rewardPointsEarned.toLocaleString('en-IN')} Reward Points</strong><p>They have been credited to your account for this completed purchase.</p><button type="button" className="primary-btn" onClick={() => setRewardPopupOpen(false)}>View Order Confirmation</button></section></div>}
@@ -6193,7 +9089,8 @@ function OrderPlacedPage({ order }) {
               <div><dt>Order Date</dt><dd>{orderDate ? new Date(orderDate).toLocaleString() : 'Not available'}</dd></div>
               <div><dt>Payment Status</dt><dd>{order.paymentStatus || 'Not available'}</dd></div>
               <div><dt>Payment Method</dt><dd>{order.paymentMethod || 'Razorpay'}</dd></div>
-              <div><dt>Total Paid</dt><dd>₹{money(order.total)}</dd></div>
+              <div><dt>{paymentConfirmed ? 'Amount Paid' : 'Order Amount'}</dt><dd>₹{money(order.total)}</dd></div>
+              {paymentConfirmed && <div><dt>Transaction ID</dt><dd>{order.originalPaymentReference || order.razorpayId || 'Not available'}</dd></div>}
               {order.paymentMethod === 'Wallet' && order.walletBalanceAfter != null && Number.isFinite(Number(order.walletBalanceAfter)) && <div><dt>Wallet Balance Remaining</dt><dd>₹{money(order.walletBalanceAfter)}</dd></div>}
             </dl>
           </section>}
@@ -6202,7 +9099,10 @@ function OrderPlacedPage({ order }) {
 
           {stage >= 5 && !isPromoCodeOrder && <section className="order-confirmation-card order-staged-card" aria-labelledby="order-products-title">
             <h2 id="order-products-title">Products</h2>
-            {(order.items || []).length ? <ul className="order-product-list">{order.items.map((item, index) => <li key={`${item.id || item.name}-${index}`}><span>{item.name} × {item.quantity}</span><strong>₹{money(Number(item.price || 0) * Number(item.quantity || 0))}</strong></li>)}</ul> : <p>No product details are available.</p>}
+            {(order.items || []).length ? <OrderItemStatusList items={order.items} orderStatus={order.orderStatus} /> : <p>No product details are available.</p>}
+            {(order.items || []).some((item) => item.cancellable === false)
+              && (order.items || []).some((item) => item.cancellable !== false)
+              && <p className="non-cancellable-order-notice">Your order contains a non-cancellable product. Only eligible products can be cancelled. The amount for the non-cancellable product will not be refunded through customer-initiated cancellation.</p>}
           </section>}
 
           {stage >= 5 && !isPromoCodeOrder && order.projectDescription && <section className="order-confirmation-card order-staged-card" aria-labelledby="order-customization-title">
@@ -6226,7 +9126,7 @@ function OrderPlacedPage({ order }) {
           </section>}
 
           {stage >= 7 && order.refundCase && <OrderRefundStatus refundCase={order.refundCase} />}
-          {stage >= 8 && <p className="order-confirmation-thank-you">{order.orderStatus === 'Declined' ? 'Your refund is complete.' : 'Thank you for your order!'}</p>}
+          {stage >= 8 && <><p className="order-confirmation-thank-you">{order.orderStatus === 'Declined' ? 'Your refund is complete.' : paymentConfirmed ? 'Thank you for your order!' : 'Please review your payment status before retrying.'}</p><div className="order-result-actions">{paymentFailed ? <Link className="primary-btn" to="/checkout">Retry Payment</Link> : <Link className="primary-btn" to="/orders">View Order</Link>}<Link className="secondary-btn" to={paymentConfirmed ? '/products' : '/checkout'}>{paymentConfirmed ? 'Continue Shopping' : 'Return to Checkout'}</Link></div></>}
         </>}
       </div>
     </main>
@@ -6254,19 +9154,22 @@ function OrderRefundStatus({ refundCase }) {
       <div><dt>Refund Case</dt><dd>{refundCase.refundCaseId}</dd></div>
       <div><dt>Refund Status</dt><dd>{refundStatusLabel(refund?.status || refundCase.status)}</dd></div>
       {isDeclineRefund && <>
-        <div><dt>Parts Amount</dt><dd>₹{Number(orderSnapshot.subtotal || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
-        <div><dt>Coding Charge</dt><dd>₹{Number(orderSnapshot.codingCharge || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
-        <div><dt>Building Charge</dt><dd>₹{Number(orderSnapshot.buildingCharge || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
-        <div><dt>Delivery Charge (not refunded)</dt><dd>₹{Number(orderSnapshot.deliveryCharge || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
+        <div><dt>Parts Amount Included</dt><dd>₹{Number(orderSnapshot.subtotal || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
+        <div><dt>Coding Charge Included</dt><dd>₹{Number(orderSnapshot.codingCharge || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
+        <div><dt>Building Charge Included</dt><dd>₹{Number(orderSnapshot.buildingCharge || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
+        <div><dt>Delivery Charge Included</dt><dd>₹{Number(orderSnapshot.deliveryCharge || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
+        {Number(orderSnapshot.discountAmountPaise || 0) > 0 && <div><dt>Discount Applied</dt><dd>−₹{(Number(orderSnapshot.discountAmountPaise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>}
+        {Number(orderSnapshot.subscriptionDiscountAmountPaise || 0) > 0 && <div><dt>{displayPlanName(orderSnapshot.subscriptionDiscountPlan)} membership discount ({orderSnapshot.subscriptionDiscountPercent}% OFF)</dt><dd>−₹{(Number(orderSnapshot.subscriptionDiscountAmountPaise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>}
         <div><dt>Total Amount Paid</dt><dd>₹{Number(orderSnapshot.total || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
       </>}
       {refund && <>
-        <div><dt>{walletCreditedRefund ? 'Refundable Amount' : 'Approved Refund'}</dt><dd>₹{((refund.approvedRefundAmountPaise ?? refund.refundAmountPaise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
-        {walletCreditedRefund && <div><dt>Amount Credited to Wallet</dt><dd>₹{((refund.approvedRefundAmountPaise ?? refund.refundAmountPaise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>}
+        <div><dt>{isDeclineRefund ? 'Full Amount Paid' : walletCreditedRefund ? 'Refundable Amount' : 'Approved Refund'}</dt><dd>₹{((refund.verifiedAmountPaidPaise ?? refund.approvedRefundAmountPaise ?? refund.refundAmountPaise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
+        {walletCreditedRefund && <div><dt>Amount Credited to Wallet</dt><dd>₹{((refund.approvedRefundAmountPaise ?? refund.refundAmountPaise ?? refund.verifiedAmountPaidPaise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>}
+        {isDeclineRefund && <div><dt>Refund Destination</dt><dd>Innovation Labs Wallet</dd></div>}
         <div><dt>Wallet Transaction Reference</dt><dd>{refund.walletTransactionReferenceId || 'Not available'}</dd></div>
       </>}
     </dl>
-    {isDeclineRefund && <p>Your order was declined by the admin. The refundable parts amount has been credited to your wallet.</p>}
+    {isDeclineRefund && refund?.status === 'REFUND_COMPLETED' && <p>Your order was declined by the admin. Refund credited to Innovation Labs Wallet.</p>}
     {isOfflinePromoRefund && <p>Your offline Promo Code order was rejected. The refunded purchase amount has been credited to your wallet.</p>}
     {refund && <RefundTimeline refund={refund} />}
     {error && <p>{error}</p>}
@@ -6274,10 +9177,65 @@ function OrderRefundStatus({ refundCase }) {
   </section>;
 }
 
-function Modal({ children, onClose }) {
+function AdminSubscriptionFinishedPage() {
+  const [subscriptions, setSubscriptions] = useState([]);
+  const [search, setSearch] = useState('');
+  const [submittedSearch, setSubmittedSearch] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError('');
+    requestApi(`/api/admin/subscriptions/finished${submittedSearch ? `?search=${encodeURIComponent(submittedSearch)}` : ''}`)
+      .then((result) => {
+        if (active) setSubscriptions(result.subscriptions || []);
+      })
+      .catch((requestError) => {
+        if (active) setError(requestError.message || 'Expired subscriptions could not be loaded.');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
+  }, [submittedSearch]);
+
+  const formatDate = (value) => value
+    ? new Date(value).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })
+    : '—';
+  const formatAmount = (value) => `₹${(Number(value || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+
+  return <div className="admin-panel-wrap">
+    <div className="section-title left"><span className="eyebrow">Admin</span><h2>SUBSCRIPTION FINISHED</h2><p>Paid subscriptions that have reached their recorded expiration date.</p></div>
+    <form className="admin-search-form" onSubmit={(event) => { event.preventDefault(); setSubmittedSearch(search.trim()); }}>
+      <label htmlFor="finished-subscription-search">Search by customer, email, or subscription</label>
+      <div><input id="finished-subscription-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Name, email, or plan" /><button className="primary-btn small" type="submit">Search</button></div>
+    </form>
+    {error && <div className="alert-box" role="alert">{error}</div>}
+    {loading ? <div className="empty-state"><h3>Loading expired subscriptions...</h3></div>
+      : subscriptions.length ? <div className="orders-list">{subscriptions.map((subscription) => <article className="order-card" key={subscription.id}>
+        <div className="order-row"><span>Customer</span><strong>{subscription.customerName}</strong></div>
+        <div className="order-row"><span>Email</span><strong>{subscription.customerEmail || '—'}</strong></div>
+        <div className="order-row"><span>Subscription</span><strong className="admin-subscription-plan">{displayPlanName(subscription.plan)}</strong></div>
+        <div className="order-row"><span>Order / Transaction ID</span><strong>#{subscription.orderId}</strong></div>
+        <div className="order-row"><span>Purchased on</span><strong>{formatDate(subscription.purchaseDate)}</strong></div>
+        <div className="order-row"><span>Starting date</span><strong>{formatDate(subscription.startDate)}</strong></div>
+        <div className="order-row"><span>Expiration date</span><strong>{formatDate(subscription.expiryDate)}</strong></div>
+        <div className="order-row"><span>Duration</span><strong>{subscription.durationMonths} Month{subscription.durationMonths === 1 ? '' : 's'}</strong></div>
+        <div className="order-row"><span>Monthly price</span><strong>{formatAmount(subscription.monthlyPricePaise)}</strong></div>
+        <div className="order-row"><span>Total paid</span><strong>{formatAmount(subscription.amountPaise)}</strong></div>
+        <div className="order-row"><span>Payment method</span><strong>{subscription.paymentMethod}</strong></div>
+        <div className="order-row"><span>Status</span><strong>Expired</strong></div>
+      </article>)}</div>
+      : <div className="empty-state"><h3>No expired subscriptions found.</h3></div>}
+  </div>;
+}
+
+function Modal({ children, onClose, className = '', labelledBy }) {
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-box" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+      <div className={`modal-box ${className}`.trim()} role="dialog" aria-modal="true" aria-labelledby={labelledBy} onClick={(e) => e.stopPropagation()}>
         <button className="modal-close" onClick={onClose} aria-label="Close">×</button>
         {children}
       </div>
@@ -6300,18 +9258,44 @@ function PromoGiftReceivedModal({ notification, onClose, onView }) {
 function GoogleLoginModal({ onSuccess, onClose }) {
   const googleRef = useRef(null);
   const onSuccessRef = useRef(onSuccess);
+  const [pendingCredential, setPendingCredential] = useState('');
+  const [acceptedPolicies, setAcceptedPolicies] = useState(false);
+  const [consentError, setConsentError] = useState('');
+  const [submittingConsent, setSubmittingConsent] = useState(false);
 
   onSuccessRef.current = onSuccess;
+
+  const handleGoogleResponse = async (response) => {
+    const result = await onSuccessRef.current(response, false);
+    if (result?.requiresPolicyConsent) {
+      setPendingCredential(result.credential);
+      setConsentError('');
+    }
+  };
+
+  const createAccount = async () => {
+    if (!pendingCredential || !acceptedPolicies || submittingConsent) return;
+    setSubmittingConsent(true);
+    setConsentError('');
+    try {
+      const result = await onSuccessRef.current({ credential: pendingCredential }, true);
+      if (!result?.authenticated) setConsentError('Account creation could not be completed. Please try again.');
+    } finally {
+      setSubmittingConsent(false);
+    }
+  };
 
   useEffect(() => {
     if (!window.google || !GOOGLE_CLIENT_ID) {
       return;
     }
 
+    const activeCallback = (response) => handleGoogleResponse(response);
+    activeGoogleLoginCallback = activeCallback;
     if (!googleIdentityInitialized) {
       window.google.accounts.id.initialize({
         client_id: GOOGLE_CLIENT_ID,
-        callback: (response) => onSuccessRef.current(response),
+        callback: (response) => activeGoogleLoginCallback?.(response),
       });
       googleIdentityInitialized = true;
     }
@@ -6324,6 +9308,9 @@ function GoogleLoginModal({ onSuccess, onClose }) {
         shape: 'pill',
       });
     }
+    return () => {
+      if (activeGoogleLoginCallback === activeCallback) activeGoogleLoginCallback = null;
+    };
   }, []);
 
   return (
@@ -6337,9 +9324,183 @@ function GoogleLoginModal({ onSuccess, onClose }) {
       ) : (
         <div ref={googleRef} className="google-login-button" />
       )}
+      <p className="account-consent-note">By creating an account, you agree to our <Link to="/policies#terms" onClick={onClose}>Terms</Link> &amp; <Link to="/policies#policies" onClick={onClose}>Policies</Link>.</p>
+      {pendingCredential && <div className="account-consent-create">
+        <label><input type="checkbox" checked={acceptedPolicies} onChange={(event) => setAcceptedPolicies(event.target.checked)} /> I agree to the Terms &amp; Policies for this new account.</label>
+        {consentError && <p className="voice-error" role="alert">{consentError}</p>}
+        <button className="primary-btn full" type="button" disabled={!acceptedPolicies || submittingConsent} onClick={createAccount}>{submittingConsent ? 'Creating account...' : 'Create Account'}</button>
+      </div>}
       <button className="secondary-btn full" onClick={onClose}>Cancel</button>
     </div>
   );
+}
+
+function PurchaseAgeNotice({ dateOfBirth, onSave }) {
+  const [value, setValue] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (event) => {
+    event.preventDefault();
+    if (!value || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await onSave(value);
+      if (!result.purchaseAgeEligible) setError(result.message);
+    } catch (requestError) {
+      setError(requestError.message || 'Your date of birth could not be saved.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (dateOfBirth) return <aside className="purchase-age-notice is-ineligible" role="status">
+    <strong>Purchases are restricted to customers aged 18 or older.</strong>
+    <span>Your recorded date of birth does not meet the minimum age requirement. Contact support if it was recorded incorrectly.</span>
+  </aside>;
+  return <aside className="purchase-age-notice">
+    <div><strong>Purchase age requirement</strong><span>You must be at least 18 to place orders or make purchases. The date you provide is a customer declaration, not independent identity verification.</span></div>
+    <form onSubmit={submit}><label htmlFor="purchase-age-dob">Date of birth</label><input id="purchase-age-dob" type="date" max={new Date().toISOString().slice(0, 10)} value={value} onChange={(event) => setValue(event.target.value)} required /><button className="primary-btn small" type="submit" disabled={!value || busy}>{busy ? 'Saving...' : 'Save declaration'}</button></form>
+    {error && <p className="voice-error" role="alert">{error}</p>}
+  </aside>;
+}
+
+function AgeVerificationPage({ error, onVerify }) {
+  const [dateOfBirth, setDateOfBirth] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (!dateOfBirth || busy) return;
+    setBusy(true);
+    try {
+      await onVerify(dateOfBirth);
+    } catch {
+      // The verification form renders the request error supplied by its parent.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    const preventDismissal = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    };
+    document.addEventListener('keydown', preventDismissal, true);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', preventDismissal, true);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, []);
+
+  return <main className="age-gate-screen">
+    <section className="age-gate-card" role="dialog" aria-modal="true" aria-labelledby="age-gate-heading">
+      <span className="eyebrow">Account verification</span>
+      <h1 id="age-gate-heading">Verify Your Age</h1>
+      <p>To use Innovation Labs, you must be at least 18 years old. Please enter your date of birth to verify your eligibility.</p>
+      <form onSubmit={submit}>
+        <label htmlFor="age-verification-dob">Date of birth</label>
+        <input id="age-verification-dob" type="date" max={new Date().toISOString().slice(0, 10)} value={dateOfBirth} onChange={(event) => setDateOfBirth(event.target.value)} required autoFocus />
+        {error && <div className="voice-error" role="alert">{error}</div>}
+        <button className="primary-btn" type="submit" disabled={!dateOfBirth || busy}>{busy ? 'Verifying...' : 'Verify Age'}</button>
+      </form>
+    </section>
+  </main>;
+}
+
+function AgeVerificationSuccessPage({ onComplete }) {
+  const [countdown, setCountdown] = useState(4);
+  const onCompleteRef = useRef(onComplete);
+
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
+
+  useEffect(() => {
+    if (countdown <= 0) {
+      onCompleteRef.current();
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setCountdown((current) => {
+        if (current <= 1) return 1;
+        return current - 1;
+      });
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [countdown]);
+
+  useEffect(() => {
+    if (countdown === 1) {
+      const finalTimer = window.setTimeout(() => {
+        onCompleteRef.current();
+      }, 1000);
+      return () => window.clearTimeout(finalTimer);
+    }
+    return undefined;
+  }, [countdown]);
+
+  return <main className="age-gate-screen">
+    <section className="age-gate-card age-verification-success" role="status" aria-live="polite">
+      <span className="age-success-icon" aria-hidden="true">✓</span>
+      <h1>AGE VERIFICATION SUCCESSFUL!</h1>
+      <p>Congratulations! You have successfully verified that you are 18 years old or older.</p>
+      <p>You can now access Innovation Labs and use its available features.</p>
+      <p className="age-countdown-label">Redirecting you to the homepage in: <strong className="age-countdown">{countdown}</strong></p>
+    </section>
+  </main>;
+}
+
+function RestrictedAccountPage({ onSignOut }) {
+  const [countdown, setCountdown] = useState(4);
+  const onSignOutRef = useRef(onSignOut);
+
+  useEffect(() => {
+    onSignOutRef.current = onSignOut;
+  }, [onSignOut]);
+
+  useEffect(() => {
+    if (countdown <= 0) {
+      onSignOutRef.current();
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setCountdown((current) => {
+        if (current <= 1) return 1;
+        return current - 1;
+      });
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [countdown]);
+
+  useEffect(() => {
+    if (countdown === 1) {
+      const finalTimer = window.setTimeout(() => {
+        onSignOutRef.current();
+      }, 1000);
+      return () => window.clearTimeout(finalTimer);
+    }
+    return undefined;
+  }, [countdown]);
+
+  return <main className="age-gate-screen">
+    <section className="age-gate-card restricted-account-screen" role="alert" aria-live="polite">
+      <span className="eyebrow">Account status</span>
+      <h1>ACCESS RESTRICTED</h1>
+      <p>Unfortunately, you cannot access Innovation Labs because our Terms and Policies require all users to be at least 18 years old.</p>
+      <p>Your account has been restricted because you do not meet the minimum age requirement.</p>
+      <p>Contact Innovation Labs support if you believe this restriction was made in error.</p>
+      <p className="age-countdown-label restricted-signout-countdown">Signing out in: <strong className="age-countdown">{countdown}</strong></p>
+    </section>
+  </main>;
 }
 
 function RequireSignInModal({ onClose, onSignIn }) {
@@ -6648,73 +9809,122 @@ function ProjectPreferencesModal({ value, onClose, onSave }) {
   );
 }
 
-function PaymentErrorModal({ message, onClose }) {
+function PaymentErrorModal({ title, message, onClose, onViewResult, hasResult }) {
   return (
     <div className="modal-content">
-      <h3>Payment issue</h3>
+      <h3>{title || 'Payment issue'}</h3>
       <p>{message}</p>
-      <button className="primary-btn full" onClick={onClose}>OK</button>
+      {hasResult && <div className="modal-actions"><button className="secondary-btn" onClick={onClose}>Close</button><button className="primary-btn" onClick={onViewResult}>View Payment Result</button></div>}
+      {!hasResult && <button className="primary-btn full" onClick={onClose}>OK</button>}
     </div>
   );
 }
 
 function OrderCancellationModal({ order, onCancel, onConfirm }) {
-  const [stage, setStage] = useState('reason');
-  const [reasonChoice, setReasonChoice] = useState('I ordered by mistake');
-  const [customReason, setCustomReason] = useState('');
+  const [quantities, setQuantities] = useState(() => Object.fromEntries((order.items || []).map((item, itemIndex) => [
+    itemIndex,
+    item.cancellable === false ? 0 : Math.max(0, Number(item.quantity || 0) - Number(item.cancelledQuantity || 0)),
+  ])));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [refundQuote, setRefundQuote] = useState(null);
+  const [quoteLoading, setQuoteLoading] = useState(false);
+  const [quoteError, setQuoteError] = useState('');
+  const [quoteRefreshKey, setQuoteRefreshKey] = useState(0);
   const idempotencyKey = useRef(globalThis.crypto?.randomUUID?.() || `cancel-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
-  const reasons = [
-    'I ordered by mistake',
-    'I no longer need the product',
-    'I want to change my order',
-    'I selected the wrong product',
-    'I selected the wrong quantity',
-    'Delivery time is too long',
-    'I found another option',
-    'I entered incorrect order details',
-    'Payment issue',
-    'Other',
-  ];
-  const reason = reasonChoice === 'Other' ? customReason.trim() : reasonChoice;
-  const continueToConfirm = (event) => {
-    event.preventDefault();
-    if (!reason) {
-      setError('Enter a reason for cancelling this order.');
-      return;
+  const selectableItems = (order.items || []).map((item, itemIndex) => ({
+    item,
+    itemIndex,
+    remainingQuantity: Math.max(0, Number(item.quantity || 0) - Number(item.cancelledQuantity || 0)),
+  })).filter(({ item, remainingQuantity }) => item.cancellable !== false && remainingQuantity > 0);
+  const selectedItems = selectableItems.map(({ item, itemIndex, remainingQuantity }) => ({
+    item,
+    itemIndex,
+    quantity: Math.min(remainingQuantity, Math.max(0, Number(quantities[itemIndex] || 0))),
+  })).filter(({ quantity }) => quantity > 0);
+  const selectionKey = JSON.stringify(selectedItems.map(({ itemIndex, quantity }) => ({ itemIndex, quantity })));
+  const quoteIsCurrent = refundQuote?.selectionKey === selectionKey;
+
+  useEffect(() => {
+    if (!selectedItems.length) {
+      setRefundQuote(null);
+      setQuoteLoading(false);
+      setQuoteError('');
+      return undefined;
     }
-    setError('');
-    setStage('confirm');
-  };
+    let active = true;
+    const controller = new AbortController();
+    setRefundQuote(null);
+    setQuoteLoading(true);
+    setQuoteError('');
+    requestApi(`/api/orders/${encodeURIComponent(order.orderId || order.id)}/cancellation-quote`, {
+      method: 'POST',
+      body: JSON.stringify({ items: selectedItems.map(({ itemIndex, quantity }) => ({ itemIndex, quantity })) }),
+      signal: controller.signal,
+    }).then((quote) => {
+      if (active) setRefundQuote({ ...quote, selectionKey });
+    }).catch((requestError) => {
+      if (active && requestError.name !== 'AbortError') setQuoteError(requestError.message || 'The refund estimate could not be calculated.');
+    }).finally(() => {
+      if (active) setQuoteLoading(false);
+    });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [order.id, order.orderId, selectionKey, quoteRefreshKey]);
+
   const submit = async () => {
-    if (busy || !reason) return;
+    if (busy || !selectedItems.length || !quoteIsCurrent || quoteLoading || Boolean(quoteError)) return;
     setBusy(true);
     setError('');
     try {
-      await onConfirm(order, reason, idempotencyKey.current);
+      await onConfirm(order, 'Customer requested cancellation.', idempotencyKey.current, selectedItems.map(({ itemIndex, quantity }) => ({ itemIndex, quantity })));
     } catch (requestError) {
       setError(requestError.message || 'We could not cancel this order. Please try again.');
     } finally {
       setBusy(false);
     }
   };
-  const orderId = order.orderId || order.id;
+  const containsNonCancellable = (order.items || []).some((item) => item.cancellable === false
+    && Number(item.cancelledQuantity || 0) < Number(item.quantity || 0));
 
-  if (stage === 'reason') return <form className="modal-content order-cancel-form" onSubmit={continueToConfirm}>
+  return <div className="modal-content order-cancel-confirm">
     <h3>Cancel Order</h3>
-    <p>Why do you want to cancel this order?</p>
-    <label>Cancellation reason<select value={reasonChoice} onChange={(event) => { setReasonChoice(event.target.value); setError(''); }}><option disabled value="">Select a reason</option>{reasons.map((item) => <option key={item}>{item}</option>)}</select></label>
-    {reasonChoice === 'Other' && <label>Enter your reason<textarea value={customReason} onChange={(event) => { setCustomReason(event.target.value); setError(''); }} maxLength={1000} required /></label>}
+    <p>Are you sure you want to cancel this order?</p>
+    {selectableItems.length > 1 || selectableItems.some(({ remainingQuantity }) => remainingQuantity > 1)
+      ? <div className="order-cancellation-items">{selectableItems.map(({ item, itemIndex, remainingQuantity }) => <label key={`${item.id || item.name}-${itemIndex}`}><span>{item.name}<small>{remainingQuantity} unit(s) eligible</small></span><input aria-label={`Quantity of ${item.name} to cancel`} type="number" min="0" max={remainingQuantity} step="1" value={quantities[itemIndex] || 0} onChange={(event) => {
+      const value = event.target.value === '' ? 0 : Number(event.target.value);
+      setQuantities((current) => ({ ...current, [itemIndex]: Math.min(remainingQuantity, Math.max(0, Number.isSafeInteger(value) ? value : 0)) }));
+      setError('');
+    }} /></label>)}</div>
+      : <p>{selectedItems.map(({ item, quantity }) => `${item.name} × ${quantity}`).join(', ') || 'No eligible product selected.'}</p>}
+    {containsNonCancellable && <p className="non-cancellable-order-notice">Your order contains a non-cancellable product. Only eligible products can be cancelled. The amount for the non-cancellable product will not be refunded through customer-initiated cancellation.</p>}
+    <div className="order-cancellation-refund-quote" aria-live="polite">
+      {quoteLoading && <p>Calculating your refund estimate...</p>}
+      {quoteError && <p className="voice-error" role="alert">{quoteError} <button type="button" className="secondary-btn small" onClick={() => setQuoteRefreshKey((key) => key + 1)}>Retry</button></p>}
+      {quoteIsCurrent && !quoteLoading && <>
+        <h4>Cancellation refund estimate</h4>
+        <div className="order-cancellation-quote-row"><span>Selected products</span><strong>{refundQuote.items.map((item) => `${item.name} × ${item.quantity}`).join(', ')}</strong></div>
+        <div className="order-cancellation-quote-row"><span>Original order amount</span><strong>₹{Number(refundQuote.originalAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
+        {refundQuote.nonRefundableCharges.deductedNow > 0 && <>
+          {['delivery', 'coding', 'building'].filter((charge) => Number(refundQuote.nonRefundableCharges[charge]) > 0).map((charge) => <div className="order-cancellation-quote-row" key={charge}><span>Non-refundable {charge === 'delivery' ? 'delivery' : `${charge} service`} charge</span><strong>₹{Number(refundQuote.nonRefundableCharges[charge]).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>)}
+          <div className="order-cancellation-quote-row"><span>Total non-refundable charges deducted</span><strong>₹{Number(refundQuote.nonRefundableCharges.deductedNow).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
+        </>}
+        {refundQuote.nonRefundableCharges.previouslyDeducted > 0 && <div className="order-cancellation-quote-row"><span>Non-refundable charges already deducted</span><strong>₹{Number(refundQuote.nonRefundableCharges.previouslyDeducted).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}
+        {Number(refundQuote.discount) > 0 && <div className="order-cancellation-quote-row"><span>Allocated discount</span><strong>−₹{Number(refundQuote.discount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}
+        <div className="order-cancellation-quote-row total"><span>Estimated wallet refund</span><strong>₹{Number(refundQuote.estimatedRefund).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
+        <p>Applicable non-refundable charges will be deducted from your refund according to our Cancellation Policy.</p>
+      </>}
+    </div>
     {error && <div className="voice-error" role="alert">{error}</div>}
-    <div className="modal-actions"><button type="button" className="secondary-btn" onClick={onCancel}>Back</button><button className="primary-btn" disabled={reasonChoice === 'Other' && !customReason.trim()}>Continue</button></div>
-  </form>;
-
-  return <div className="modal-content order-cancel-confirm"><h3>Confirm Cancellation</h3><p>You are about to cancel this order.</p><dl><div><dt>Order ID</dt><dd>{orderId}</dd></div><div><dt>Cancellation reason</dt><dd>{reason}</dd></div></dl><p>Because this order was paid using your Wallet, ₹{Number(order.total || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })} will be returned to your Wallet after cancellation.</p><p>Do you want to cancel this order?</p>{error && <div className="voice-error" role="alert">{error}</div>}<div className="modal-actions"><button className="secondary-btn" disabled={busy} onClick={() => setStage('reason')}>Back</button><button className="primary-btn" disabled={busy} onClick={submit}>{busy ? 'Cancelling...' : 'Yes, Cancel Order'}</button></div></div>;
+    <div className="modal-actions"><button className="secondary-btn" disabled={busy} onClick={onCancel}>KEEP ORDER</button><button className="primary-btn" disabled={busy || !selectedItems.length || !quoteIsCurrent || quoteLoading || Boolean(quoteError)} onClick={submit}>{busy ? 'Cancelling...' : 'YES, CANCEL ORDER'}</button></div>
+  </div>;
 }
 
 function OrderCancellationSuccessModal({ order, cancellation, wallet, onViewWallet, onViewOrder }) {
-  return <div className="modal-content order-cancel-success"><div className="transfer-success-icon" aria-hidden="true">✓</div><h3>Order Cancelled</h3><p>Your order has been successfully cancelled.</p><p>₹{Number(cancellation.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })} has been returned to your Wallet.</p><div className="order-cancel-success-details"><span>Order #{order.orderId || order.id}</span><span>Wallet balance: ₹{Number(wallet.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span></div><div className="modal-actions"><button className="secondary-btn" onClick={onViewWallet}>View Wallet</button><button className="primary-btn" onClick={onViewOrder}>View Order</button></div></div>;
+  const refundAmount = Number(cancellation.amount);
+  return <div className="modal-content order-cancel-success"><div className="transfer-success-icon" aria-hidden="true">✓</div><h3>{cancellation.complete ? 'Order Cancelled' : 'Cancellation Processed'}</h3><p>{cancellation.complete ? 'Your order has been cancelled.' : 'The selected eligible products have been cancelled. The remaining items stay in your order.'}</p><p>{refundAmount > 0 ? `₹${refundAmount.toLocaleString('en-IN', { minimumFractionDigits: 2 })} has been returned to your Wallet.` : 'No wallet refund is due for this cancellation.'}</p><div className="order-cancel-success-details"><span>Order #{order.orderId || order.id}</span><span>Wallet balance: ₹{Number(wallet.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span></div><div className="modal-actions"><button className="secondary-btn" onClick={onViewWallet}>View Wallet</button><button className="primary-btn" onClick={onViewOrder}>View Order</button></div></div>;
 }
 
 function ConfirmCustomOrderModal({ itemName, onConfirm, onCancel }) {

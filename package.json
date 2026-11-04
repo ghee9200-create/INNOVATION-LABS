@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "server": "node server.js",
+    "start": "node server.js",
     "dev:full": "concurrently --kill-others-on-fail \"npm run server\" \"wait-on tcp:3001 && npm run dev\"",
     "build": "vite build",
     "preview": "vite preview"
@@ -17,10 +18,12 @@
     "dotenv": "^18.0.4",
     "express": "^5.2.1",
     "google-auth-library": "^11.1.0",
+    "html5-qrcode": "^2.3.8",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.10.2",
     "multer": "^2.4.0",
     "pdfkit": "^0.20.2",
+    "qrcode": "^1.5.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.28.0"
