@@ -1435,8 +1435,8 @@ function App() {
     navigate('/checkout');
   };
 
-  const beginCheckoutPayment = async () => {
-    const reference = checkoutAttemptRef.current || await createCheckoutAttempt();
+  const beginCheckoutPayment = async (referenceOverride = '') => {
+    const reference = referenceOverride || checkoutAttemptRef.current || await createCheckoutAttempt();
     if (!reference) throw new Error('Checkout has not been recorded. Please try again.');
     await requestApi(`/api/checkout-attempts/${encodeURIComponent(reference)}/stage`, {
       method: 'POST',
@@ -1483,7 +1483,9 @@ function App() {
     if (target.origin !== window.location.origin || target.pathname === '/checkout') return;
     event.preventDefault();
     event.stopPropagation();
-    setCheckoutExitIntent({ destination: `${target.pathname}${target.search}${target.hash}` });
+    if (anchor.classList.contains('brand')) {
+      setCheckoutExitIntent({ destination: `${target.pathname}${target.search}${target.hash}` });
+    }
   };
 
   const requestCheckoutExit = (destination) => {
@@ -1501,7 +1503,6 @@ function App() {
     const handleBack = (event) => {
       event.stopImmediatePropagation();
       window.history.pushState(marker, '', window.location.href);
-      setCheckoutExitIntent({ destination: '/' });
     };
     window.addEventListener('popstate', handleBack, true);
     return () => window.removeEventListener('popstate', handleBack, true);
@@ -1878,9 +1879,12 @@ function App() {
     navigate(`/order-placed/${encodeURIComponent(paidOrder.orderId || paidOrder.id)}`, { state: { order: paidOrder } });
   };
 
-  const requestWalletIdPayment = async (payerWalletId) => {
-    const checkoutReference = await beginCheckoutPayment();
+  const requestWalletIdPayment = async (payerWalletId, checkoutReference) => {
     if (!checkoutReference) throw new Error('Checkout has not been recorded. Please try again.');
+    const stagedReference = await beginCheckoutPayment(checkoutReference);
+    if (stagedReference !== checkoutReference) {
+      throw new Error('Checkout reference changed during Wallet ID verification. Please retry from the active checkout.');
+    }
     const idempotencyKey = globalThis.crypto?.randomUUID?.()
       || `wallet-id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     return requestApi('/api/checkout/wallet-id/request', {
@@ -2312,7 +2316,7 @@ function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart, on
         <Link className="brand" to="/">
           <span className="brand-mark">I</span> Innovation Labs
         </Link>
-        <button
+        {location.pathname !== '/checkout' && <button
           className="mobile-nav-toggle"
           type="button"
           aria-label={mobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
@@ -2321,9 +2325,9 @@ function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart, on
           onClick={() => setMobileMenuOpen((open) => !open)}
         >
           <span aria-hidden="true">{mobileMenuOpen ? '×' : '☰'}</span>
-        </button>
+        </button>}
 
-        <nav className="nav">
+        {location.pathname !== '/checkout' && <nav className="nav">
           <Link to="/">Home</Link>
           <Link to="/products">Products</Link>
           <Link to="/plans">Plans &amp; AI</Link>
@@ -2335,9 +2339,9 @@ function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart, on
           {auth?.isAdmin && <Link to="/admin/promo-codes">Promo Codes</Link>}
           {auth?.isAdmin && <Link to="/admin/refunds">Refunds</Link>}
           <Link to="/orders">My Orders</Link>
-        </nav>
+        </nav>}
 
-        <div className="nav-actions">
+        {location.pathname !== '/checkout' && <div className="nav-actions">
           <button className="cart-button" onClick={onOpenCart}>
             Cart <span>{cartCount}</span>
           </button>
@@ -2348,10 +2352,10 @@ function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart, on
           ) : (
             <button className="primary-btn small" onClick={onSignIn}>Sign In</button>
           )}
-        </div>
+        </div>}
       </div>
-      {mobileMenuOpen && <button className="mobile-nav-backdrop" type="button" aria-label="Close navigation menu" onClick={closeMobileMenu} />}
-      <nav className={`mobile-primary-navigation ${mobileMenuOpen ? 'is-open' : ''}`} id="mobile-primary-navigation" aria-label="Main navigation" aria-hidden={!mobileMenuOpen}>
+      {location.pathname !== '/checkout' && mobileMenuOpen && <button className="mobile-nav-backdrop" type="button" aria-label="Close navigation menu" onClick={closeMobileMenu} />}
+      {location.pathname !== '/checkout' && <nav className={`mobile-primary-navigation ${mobileMenuOpen ? 'is-open' : ''}`} id="mobile-primary-navigation" aria-label="Main navigation" aria-hidden={!mobileMenuOpen}>
           <Link to="/" onClick={closeMobileMenu}>Home</Link>
           <Link to="/products" onClick={closeMobileMenu}>Products</Link>
           <Link to="/plans" onClick={closeMobileMenu}>Plans &amp; AI</Link>
@@ -2367,7 +2371,7 @@ function Header({ auth, cartCount, onSignIn, onAccount, onWallet, onOpenCart, on
           {auth
             ? <button type="button" onClick={openAccount}><span aria-hidden="true">◉</span> Account</button>
             : <button type="button" onClick={signIn}>Sign In</button>}
-      </nav>
+      </nav>}
     </header>
   );
 }
@@ -5198,7 +5202,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       )
       || displayedCheckoutStep === 5 && paymentMethod === 'wallet' && walletPaymentMode === 'qr' && !checkoutQrVerified
       || displayedCheckoutStep === 5 && paymentMethod === 'wallet' && walletPaymentMode === 'wallet-id'
-        && (!/^@WL[A-Z]{4}\d{4}$/.test(payerWalletId.trim().toUpperCase()) || !checkoutReference)
+        && (!payerWalletId.trim() || !checkoutReference)
       || walletIdPaymentAwaiting
     )
     || displayedCheckoutStep === 5 && (
@@ -5514,7 +5518,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       if (!verified.walletId || verified.checkoutReference !== checkoutReference) {
         throw new Error('Wallet ID verification could not be completed. Please try again.');
       }
-      const paymentRequest = await onWalletIdRequest(verified.walletId);
+      const paymentRequest = await onWalletIdRequest(verified.walletId, verified.checkoutReference);
       if (!paymentRequest.requestId) {
         throw new Error('The payment request could not be created. Please retry.');
       }
@@ -5736,7 +5740,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
               <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'wallet-id'} disabled={walletIdRequestActive} onChange={() => setWalletPaymentMode('wallet-id')} /> Pay With Wallet ID</label>
             </div>}
             <div className="checkout-actions space-between">
-              <div><button className="secondary-btn" onClick={() => setCheckoutStep(3)}>Back</button><button className="secondary-btn" onClick={() => onRequestExit('/')}>Cancel Checkout</button></div>
+              <button className="secondary-btn" onClick={() => setCheckoutStep(3)}>Back</button>
               {renderCheckoutAction()}
             </div>
           </div>
@@ -5826,7 +5830,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
             </div>
 
             <div className="checkout-actions space-between">
-              <div><button className="secondary-btn" disabled={walletIdRequestActive} onClick={() => setCheckoutStep(4)}>Back</button><button className="secondary-btn" onClick={() => onRequestExit('/')}>Cancel Checkout</button></div>
+              <button className="secondary-btn" disabled={walletIdRequestActive} onClick={() => setCheckoutStep(4)}>Back</button>
               <div className="payment-actions">
                 {walletPaymentMode === 'wallet-id'
                   ? walletIdPaymentAwaiting
@@ -5847,7 +5851,9 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
             <h3 id="checkout-order-summary-title">{walletPaymentMode === 'wallet-id' ? 'Order Summary' : 'Place Your Order'}</h3>
             <div className="checkout-order-summary-action">
               {walletPaymentMode === 'wallet-id'
-                ? null
+                ? walletIdPaymentAwaiting
+                  ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />AWAITING FOR PAYMENT</div>
+                  : renderCheckoutAction('primary-btn full')
                 : qrPaymentAwaiting
                   ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />Awaiting QR Payment</div>
                   : renderCheckoutAction('primary-btn full')}

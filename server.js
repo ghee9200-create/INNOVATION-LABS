@@ -12529,7 +12529,7 @@ app.post('/api/checkout-attempts/:reference/exit', requireSession, requireDataba
       await WalletPaymentRequest.updateMany(
         { checkoutReference: attempt.reference, requesterUserId: req.session.sub, status: { $in: ['Pending', 'Processing'] } },
         {
-          $set: { status: 'Cancelled' },
+          $set: { status: 'Cancelled', paymentStatus: 'FAILED' },
           $unset: { activeCheckoutKey: 1 },
           $push: { statusHistory: { status: 'Payment Cancelled', at: now } },
         },
@@ -12550,7 +12550,7 @@ app.post('/api/checkout-attempts/:reference/exit', requireSession, requireDataba
     await WalletPaymentRequest.updateMany(
       { checkoutReference: attempt.reference, requesterUserId: req.session.sub, status: { $in: ['Pending', 'Processing'] } },
       {
-        $set: { status: 'Cancelled' },
+        $set: { status: 'Cancelled', paymentStatus: 'FAILED' },
         $unset: { activeCheckoutKey: 1 },
         $push: { statusHistory: { status: 'Payment Cancelled', at: now } },
       },
