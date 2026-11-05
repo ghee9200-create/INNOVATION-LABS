@@ -7023,6 +7023,47 @@ app.get('/api/wallet/payment-requests/pending', requireSession, requireDatabase,
   })) });
 });
 
+app.get('/api/wallet/payment-requests/:requestId', requireSession, requireDatabase, async (req, res) => {
+  const now = new Date();
+  let request = await WalletPaymentRequest.findOne({
+    requestId: req.params.requestId,
+    payerUserId: req.session.sub,
+  }).select('requestId checkoutReference requesterUserId payerUserId payerWalletId amountPaise status paymentStatus paymentReference orderId expiresAt approvedAt createdAt').lean();
+  if (!request) return res.status(404).json({ message: 'Payment request was not found.' });
+  if (['Pending', 'Processing'].includes(request.status) && request.expiresAt <= now) {
+    request = await WalletPaymentRequest.findOneAndUpdate(
+      { requestId: request.requestId, payerUserId: req.session.sub, status: { $in: ['Pending', 'Processing'] }, expiresAt: { $lte: now } },
+      {
+        $set: { status: 'Expired', paymentStatus: 'FAILED' },
+        $unset: { activeCheckoutKey: 1 },
+        $push: { statusHistory: { status: 'Payment Expired', at: now } },
+      },
+      { new: true },
+    ).select('requestId checkoutReference requesterUserId payerUserId payerWalletId amountPaise status paymentStatus paymentReference orderId expiresAt approvedAt createdAt').lean() || request;
+    if (request.status === 'Expired') broadcastWalletPaymentRequestUpdate(request, {
+      requestId: request.requestId,
+      checkoutReference: request.checkoutReference,
+      status: request.status,
+      serverTime: now.toISOString(),
+    });
+  }
+  const sender = await User.findOne({ googleId: request.requesterUserId }).select('name').lean();
+  return res.json({
+    requestId: request.requestId,
+    checkoutReference: request.checkoutReference,
+    requesterName: safeRecipientName(sender?.name),
+    payerWalletId: request.payerWalletId,
+    amount: money(request.amountPaise),
+    status: request.status,
+    paymentStatus: request.paymentStatus || (request.status === 'Approved' ? 'SUCCESS' : request.status === 'Processing' ? 'PROCESSING' : request.status === 'Pending' ? 'PENDING' : 'FAILED'),
+    transactionId: request.paymentReference || null,
+    orderId: request.orderId || null,
+    expiresAt: request.expiresAt,
+    createdAt: request.createdAt,
+    completedAt: request.approvedAt || null,
+  });
+});
+
 app.post('/api/wallet/payment-requests/:requestId/cancel', requireSession, requireDatabase, async (req, res) => {
   const now = new Date();
   const request = await WalletPaymentRequest.findOneAndUpdate(
@@ -7246,7 +7287,7 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
       await WalletPaymentRequest.updateOne(
         { requestId: current.requestId, status: 'Processing' },
         {
-          $set: { status, paymentStatus: expired || status === 'Cancelled' || Boolean(error.status) ? 'FAILED' : 'PENDING' },
+          $set: { status, paymentStatus: expired || status === 'Cancelled' ? 'FAILED' : 'PENDING' },
           ...(status === 'Pending' ? {} : { $unset: { activeCheckoutKey: 1 } }),
           $push: { statusHistory: { status: expired ? 'Payment Expired' : status === 'Cancelled' ? 'Payment Cancelled' : error.status ? 'Payment Failed' : 'Awaiting Payment', at: failedAt } },
         },

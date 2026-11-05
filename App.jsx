@@ -1025,7 +1025,7 @@ function App() {
   }, [auth, authLoading, location.pathname]);
 
   useEffect(() => {
-    if (!auth || authLoading || location.pathname === '/wallet/payment-requests') return undefined;
+    if (!auth || authLoading || location.pathname.startsWith('/wallet/payment-requests')) return undefined;
     let active = true;
     const checkPendingWalletRequests = async () => {
       try {
@@ -2076,6 +2076,7 @@ function App() {
         <Route path="/admin/promo-codes" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/promo-codes"><AdminPromoCodesPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/wallet" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletPage auth={auth} accessVersion={walletAccessVersion} onRequestUnlock={() => openWalletUnlock(true)} />} />
         <Route path="/wallet/payment-requests" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletPaymentRequestsPage />} />
+        <Route path="/wallet/payment-requests/:requestId/pin" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletPaymentPinPage />} />
         <Route path="/wallet/scan-pay" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletQrTransferPage auth={auth} accessVersion={walletAccessVersion} onRequestUnlock={() => openWalletUnlock(true, '/wallet/scan-pay')} />} />
         <Route path="/refund/:orderId" element={authLoading ? <AccountLoadingPage /> : auth ? <RefundRequestPage auth={auth} onSubmitted={handleRefundSubmitted} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/refunds/:id" element={authLoading ? <AccountLoadingPage /> : auth ? <RefundStatusPage auth={auth} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
@@ -6538,7 +6539,7 @@ function AccountEmpty({ text }) {
   return <div className="account-empty-state"><p>{text}</p></div>;
 }
 
-function PinBoxes({ value, onChange, autoFocus = true, disabled = false, focusVersion = 0 }) {
+function PinBoxes({ value, onChange, autoFocus = true, disabled = false, focusVersion = 0, inputMode = 'numeric', readOnly = false }) {
   const refs = useRef([]);
   const digits = `${value || ''}`.slice(0, 4).split('');
   while (digits.length < 4) digits.push('');
@@ -6556,10 +6557,11 @@ function PinBoxes({ value, onChange, autoFocus = true, disabled = false, focusVe
       ref={(element) => { refs.current[index] = element; }}
       value={digit}
       type="password"
-      inputMode="numeric"
+      inputMode={inputMode}
       pattern="[0-9]*"
       maxLength={1}
       disabled={disabled}
+      readOnly={readOnly}
       autoFocus={autoFocus && index === 0}
       autoComplete="off"
       aria-label={`PIN digit ${index + 1}`}
@@ -7166,9 +7168,6 @@ function WalletPaymentRequestsPage() {
   const navigate = useNavigate();
   const [requests, setRequests] = useState([]);
   const [recentRequests, setRecentRequests] = useState([]);
-  const [selectedRequest, setSelectedRequest] = useState(null);
-  const [pin, setPin] = useState('');
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   const loadRequests = useCallback(async () => {
@@ -7176,9 +7175,6 @@ function WalletPaymentRequestsPage() {
     const nextRequests = result.requests || [];
     setRecentRequests(result.recentRequests || []);
     setRequests(nextRequests);
-    setSelectedRequest((current) => current
-      ? nextRequests.find((request) => request.requestId === current.requestId) || null
-      : null);
   }, []);
 
   useRealtimeEvents(true, (eventName, data) => {
@@ -7197,27 +7193,6 @@ function WalletPaymentRequestsPage() {
     return () => window.clearInterval(intervalId);
   }, [loadRequests]);
 
-  const approveRequest = async () => {
-    if (!selectedRequest || pin.length !== 4 || busy) return;
-    setBusy(true);
-    setError('');
-    try {
-      const result = await requestApi(`/api/wallet/payment-requests/${encodeURIComponent(selectedRequest.requestId)}/approve`, {
-        method: 'POST',
-        body: JSON.stringify({ pin }),
-      });
-      navigate(`/order-placed/${encodeURIComponent(result.order.orderId)}`, { state: { order: result.order } });
-    } catch (requestError) {
-      setPin('');
-      setError(requestError.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const visibleRequests = selectedRequest
-    ? requests.filter((request) => request.requestId === selectedRequest.requestId)
-    : requests;
   const displayStatus = (request) => request.paymentStatus
     || (request.status === 'Approved' ? 'SUCCESS'
       : request.status === 'Processing' ? 'PROCESSING'
@@ -7233,12 +7208,12 @@ function WalletPaymentRequestsPage() {
       </header>
       <header className="wallet-payment-header wallet-request-heading">
         <span className="eyebrow">WALLET PAYMENT REQUEST</span>
-        <h1>{selectedRequest ? 'Review payment' : 'Payment requests'}</h1>
-        <p>Confirm the checkout amount, then authorize it with your existing Wallet PIN.</p>
+        <h1>Payment requests</h1>
+        <p>Review the amount and payment details before continuing to Wallet PIN verification.</p>
       </header>
       {error && <div className="wallet-payment-error" role="alert">{error}</div>}
       {!requests.length && <section className="wallet-payment-card wallet-request-empty"><span aria-hidden="true">✓</span><h2>No pending requests</h2><p>New Innovation Labs payment requests will appear here.</p></section>}
-      {visibleRequests.map((request) => <section className="wallet-payment-card wallet-request-card" key={request.requestId}>
+      {requests.map((request) => <section className="wallet-payment-card wallet-request-card" key={request.requestId}>
         <div className="wallet-request-card-brand"><span className="wallet-payment-avatar" aria-hidden="true">IL</span><div><strong>Innovation Labs</strong><small>Checkout payment request</small></div><span className={`wallet-request-status ${request.paymentStatus === 'PROCESSING' || request.status === 'Processing' ? 'is-processing' : ''}`}>{displayStatus(request)}</span></div>
         <div className="wallet-request-amount">
           <span>Amount requested</span>
@@ -7250,18 +7225,9 @@ function WalletPaymentRequestsPage() {
           <div><dt>Checkout reference</dt><dd>{request.checkoutReference}</dd></div>
           <div><dt>Paying Wallet ID</dt><dd>{request.payerWalletId}</dd></div>
         </dl>
-        {selectedRequest?.requestId === request.requestId && request.status === 'Processing'
-          ? <p className="wallet-request-processing" role="status"><span className="wallet-id-spinner" aria-hidden="true" /> Payment is processing securely. Keep this page open.</p>
-          : selectedRequest?.requestId === request.requestId ? <div className="wallet-request-verification">
-          <h2>Verify with your Wallet PIN</h2>
-          <p>Enter the four digits of your existing Wallet PIN. This is not an OTP.</p>
-          <PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy} />
-          <button type="button" className="wallet-payment-primary" disabled={busy || pin.length !== 4 || request.status !== 'Pending'} onClick={approveRequest}>
-            {busy ? <><span className="wallet-id-spinner" aria-hidden="true" /> Processing securely…</> : 'Pay'}
-          </button>
-        </div> : <button type="button" className="wallet-payment-primary" disabled={busy || request.status !== 'Pending'} onClick={() => { setSelectedRequest(request); setPin(''); setError(''); }}>Pay</button>}
+        <button type="button" className="wallet-payment-primary" disabled={request.status !== 'Pending'} onClick={() => navigate(`/wallet/payment-requests/${encodeURIComponent(request.requestId)}/pin`)}>Pay</button>
       </section>)}
-      {!selectedRequest && recentRequests.length > 0 && <section className="wallet-request-history">
+      {recentRequests.length > 0 && <section className="wallet-request-history">
         <h2>Recent payment requests</h2>
         {recentRequests.map((request) => <article className="wallet-request-history-item" key={request.requestId}>
           <div><strong>{request.requesterName}</strong><small>{request.checkoutReference}</small></div>
@@ -7269,6 +7235,144 @@ function WalletPaymentRequestsPage() {
           {request.transactionId && <small className="wallet-request-transaction">Transaction ID · {request.transactionId}</small>}
         </article>)}
       </section>}
+    </div>
+  </main>;
+}
+
+function WalletPaymentPinPage() {
+  const { requestId } = useParams();
+  const navigate = useNavigate();
+  const [request, setRequest] = useState(null);
+  const [pin, setPin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [order, setOrder] = useState(null);
+
+  const loadRequest = useCallback(async () => {
+    const result = await requestApi(`/api/wallet/payment-requests/${encodeURIComponent(requestId)}`);
+    setRequest(result);
+    return result;
+  }, [requestId]);
+
+  useRealtimeEvents(true, (eventName, data) => {
+    if (eventName === 'wallet_payment_request_updated' && data?.requestId === requestId) {
+      loadRequest().catch((requestError) => setError(requestError.message));
+    }
+  });
+
+  useEffect(() => {
+    let active = true;
+    loadRequest()
+      .catch((requestError) => { if (active) setError(requestError.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [loadRequest]);
+
+  useEffect(() => {
+    if (!['Pending', 'Processing'].includes(request?.status)) return undefined;
+    const intervalId = window.setInterval(() => {
+      loadRequest().catch((requestError) => setError(requestError.message));
+    }, 2500);
+    return () => window.clearInterval(intervalId);
+  }, [loadRequest, request?.status]);
+
+  const updatePin = (key) => {
+    setError('');
+    setPin((current) => key === 'delete'
+      ? current.slice(0, -1)
+      : key === 'clear' ? '' : current.length < 4 ? `${current}${key}` : current);
+  };
+
+  const pay = async () => {
+    if (!request || request.status !== 'Pending' || pin.length !== 4 || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await requestApi(`/api/wallet/payment-requests/${encodeURIComponent(requestId)}/approve`, {
+        method: 'POST',
+        body: JSON.stringify({ pin }),
+      });
+      setOrder(result.order || null);
+      setRequest((current) => ({
+        ...current,
+        status: 'Approved',
+        paymentStatus: 'SUCCESS',
+        orderId: result.order?.orderId || current.orderId,
+        transactionId: current.transactionId || `wallet-id-payment:${requestId}`,
+        completedAt: result.order?.paymentVerifiedAt || new Date().toISOString(),
+      }));
+      setPin('');
+    } catch (requestError) {
+      setPin('');
+      setError(requestError.message || 'Payment could not be completed. Please try again.');
+      try {
+        await loadRequest();
+      } catch (refreshError) {
+        setError(`${requestError.message || 'Payment could not be completed.'} Payment status could not be refreshed: ${refreshError.message}`);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const successful = request?.status === 'Approved' || request?.paymentStatus === 'SUCCESS';
+  const paymentStatus = request?.paymentStatus
+    || (request?.status === 'Pending' ? 'PENDING' : request?.status === 'Processing' ? 'PROCESSING' : 'FAILED');
+
+  return <main className="page-shell wallet-request-page">
+    <div className="container narrow-container wallet-request-shell">
+      <header className="wallet-request-brand">
+        <img src={innovationLabsLogo} alt="Innovation Labs" />
+        <span>INNOVATION LABS <small>SECURE WALLET PAYMENTS</small></span>
+      </header>
+      {loading ? <section className="wallet-payment-card wallet-request-empty" role="status"><span className="wallet-id-spinner" /><p>Loading payment request…</p></section>
+        : error && !request ? <section className="wallet-payment-card wallet-request-empty"><div className="wallet-payment-error" role="alert">{error}</div><button type="button" className="secondary-btn" onClick={() => navigate('/wallet/payment-requests')}>Back to requests</button></section>
+          : request && <section className={`wallet-payment-card wallet-request-card wallet-request-pin-card${successful ? ' is-success' : ''}`}>
+            {successful ? <>
+              <span className="wallet-payment-success-icon" aria-hidden="true">✓</span>
+              <h1>Payment Successful</h1>
+              <strong className="wallet-payment-success-amount">₹{Number(request.amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
+              <p className="wallet-request-success-message">Your payment has been processed successfully.</p>
+              <dl className="wallet-request-details">
+                <div><dt>Payment status</dt><dd>SUCCESS</dd></div>
+                <div><dt>Transaction ID</dt><dd>{request.transactionId || `wallet-id-payment:${requestId}`}</dd></div>
+                <div><dt>Payment date &amp; time</dt><dd>{request.completedAt ? new Date(request.completedAt).toLocaleString('en-IN') : 'Confirmed'}</dd></div>
+                <div><dt>Requested by</dt><dd>{request.requesterName}</dd></div>
+                <div><dt>Wallet ID</dt><dd>{request.payerWalletId}</dd></div>
+              </dl>
+              <button type="button" className="wallet-payment-primary" onClick={() => (order?.orderId || request.orderId)
+                ? navigate(`/order-placed/${encodeURIComponent(order?.orderId || request.orderId)}`, order ? { state: { order } } : {})
+                : navigate('/wallet/payment-requests')}>{order?.orderId || request.orderId ? 'Continue to Order' : 'Done'}</button>
+            </> : <>
+              <div className="wallet-request-card-brand"><span className="wallet-payment-avatar" aria-hidden="true">IL</span><div><strong>Innovation Labs</strong><small>Checkout payment request</small></div><span className={`wallet-request-status${paymentStatus === 'PROCESSING' ? ' is-processing' : ''}`}>{paymentStatus}</span></div>
+              <h1 className="wallet-request-pin-heading">Enter Your Wallet PIN</h1>
+              <div className="wallet-request-amount">
+                <span>Amount requested</span>
+                <strong>₹{Number(request.amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
+                <small>Exact requested amount · {request.requesterName}</small>
+              </div>
+              <dl className="wallet-request-details">
+                <div><dt>Payment request</dt><dd>{request.requestId}</dd></div>
+                <div><dt>Checkout reference</dt><dd>{request.checkoutReference}</dd></div>
+                <div><dt>Paying Wallet ID</dt><dd>{request.payerWalletId}</dd></div>
+                <div><dt>Payment status</dt><dd>{paymentStatus}</dd></div>
+              </dl>
+              {request.status === 'Processing' && <p className="wallet-request-processing" role="status"><span className="wallet-id-spinner" /> Payment is processing securely.</p>}
+              {request.status !== 'Pending' && request.status !== 'Processing' && <div className="wallet-payment-error" role="status">This payment request is {request.status.toLowerCase()} and can no longer be paid.</div>}
+              {error && <div className="wallet-payment-error" role="alert">{error}</div>}
+              <div className="wallet-request-verification">
+                <PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy || request.status !== 'Pending'} autoFocus={false} inputMode="none" readOnly />
+                <div className="wallet-payment-keypad wallet-payment-pin-keypad" aria-label="On-screen Wallet PIN keyboard">
+                  {['1', '2', '3', '4', '5', '6', '7', '8', '9', 'delete', '0', 'clear'].map((key) => <button type="button" key={key} aria-label={key === 'delete' ? 'Delete last digit' : key === 'clear' ? 'Clear PIN' : key} disabled={busy || request.status !== 'Pending'} onClick={() => updatePin(key)}>{key === 'delete' ? '⌫' : key === 'clear' ? '×' : key}</button>)}
+                </div>
+              </div>
+              <div className="wallet-payment-pin-actions">
+                <button type="button" className="secondary-btn" disabled={busy} onClick={() => navigate('/wallet/payment-requests')}>Back</button>
+                <button type="button" className="wallet-payment-primary" disabled={busy || pin.length !== 4 || request.status !== 'Pending'} onClick={pay}>{busy ? <><span className="wallet-id-spinner" /> Processing securely…</> : 'PAY'}</button>
+              </div>
+            </>}
+          </section>}
     </div>
   </main>;
 }

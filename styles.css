@@ -1993,6 +1993,8 @@ body.modal-open {
 .wallet-request-verification h2 { margin: 0; font-size: 1.2rem; }
 .wallet-request-verification > p { margin: 0; color: var(--muted); line-height: 1.5; }
 .wallet-request-processing { display: flex; align-items: center; justify-content: center; gap: 10px; margin: 0; color: var(--primary-strong); text-align: center; }
+.wallet-request-pin-heading { margin: 0; text-align: center; font-size: clamp(1.45rem, 5vw, 1.8rem); }
+.wallet-request-pin-card .wallet-request-verification { width: 100%; }
 .wallet-request-verification .pin-boxes { gap: clamp(10px, 3vw, 16px); margin: 15px 0; }
 .wallet-request-verification .pin-boxes input { width: clamp(48px, 14vw, 60px); height: clamp(54px, 15vw, 66px); border-color: rgba(0,209,255,0.24); border-radius: 14px; background: rgba(0,209,255,0.045); font-size: 1.55rem; }
 .wallet-request-verification .pin-boxes input:focus { border-color: var(--primary); box-shadow: 0 0 0 4px rgba(0,209,255,0.12); }
