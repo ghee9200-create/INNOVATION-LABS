@@ -9,6 +9,11 @@ import QRCode from 'qrcode';
 import innovationLabsLogo from './Innovation Labs logo.png';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
+const configuredApiBaseUrl = String(import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const apiUrl = (url) => {
+  if (!configuredApiBaseUrl || !/^\/api(?:\/|$)/.test(url)) return url;
+  return `${configuredApiBaseUrl}${url}`;
+};
 const AdminSessionContext = createContext({ auth: null, onSignOut: () => {} });
 const SESSION_STATE_EVENT = 'innovation:session-state';
 const PLAN_DISPLAY_NAMES = { Starter: 'Starter', Medium: 'Plus', Premium: 'Pro', Exclusive: 'Exclusive' };
@@ -133,7 +138,7 @@ const parseJsonSafely = async (response) => {
 
 const requestApi = async (url, options = {}) => {
   const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
-  const response = await fetch(url, {
+  const response = await fetch(apiUrl(url), {
     credentials: 'include',
     ...options,
     headers: {
@@ -162,8 +167,49 @@ const requestApi = async (url, options = {}) => {
   return result;
 };
 
+const useRealtimeEvents = (enabled, onEvent, onReconnect) => {
+  const eventHandlerRef = useRef(onEvent);
+  const reconnectRef = useRef(onReconnect);
+  useEffect(() => { eventHandlerRef.current = onEvent; }, [onEvent]);
+  useEffect(() => { reconnectRef.current = onReconnect; }, [onReconnect]);
+  useEffect(() => {
+    if (!enabled || typeof EventSource === 'undefined') return undefined;
+    let active = true;
+    let source;
+    let retryTimer;
+    let retryDelay = 1000;
+    const connect = () => {
+      if (!active) return;
+      source = new EventSource(apiUrl('/api/events'), { withCredentials: true });
+      source.onopen = () => { retryDelay = 1000; };
+      source.onerror = () => {
+        source.close();
+        if (!active) return;
+        reconnectRef.current?.();
+        retryTimer = window.setTimeout(connect, retryDelay);
+        retryDelay = Math.min(30_000, retryDelay * 2);
+      };
+      ['order_created', 'payment_success', 'order_accepted', 'order_declined', 'refund_processed', 'wallet_balance_updated'].forEach((eventName) => {
+        source.addEventListener(eventName, (event) => {
+          try {
+            eventHandlerRef.current?.(eventName, JSON.parse(event.data));
+          } catch (error) {
+            console.error(`Could not process realtime ${eventName} event.`, error);
+          }
+        });
+      });
+    };
+    connect();
+    return () => {
+      active = false;
+      window.clearTimeout(retryTimer);
+      source?.close();
+    };
+  }, [enabled]);
+};
+
 const downloadInvoicePdf = async (url, invoiceNumber) => {
-  const response = await fetch(url, { credentials: 'include' });
+  const response = await fetch(apiUrl(url), { credentials: 'include' });
   if (!response.ok) {
     const result = await parseJsonSafely(response);
     throw new Error(result?.message || `Invoice download failed with status ${response.status}.`);
@@ -482,7 +528,7 @@ function App() {
       try {
         let response;
         try {
-          response = await fetch('/api/auth/me', { credentials: 'include', signal: controller.signal });
+          response = await fetch(apiUrl('/api/auth/me'), { credentials: 'include', signal: controller.signal });
         } catch (error) {
           if (!active || error.name === 'AbortError') return;
           setAuth(null);
@@ -1226,7 +1272,7 @@ function App() {
     }
 
     try {
-      const response = await fetch('/api/auth/google', {
+      const response = await fetch(apiUrl('/api/auth/google'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -1765,14 +1811,14 @@ function App() {
     setAdminRefunds((current) => current.map((item) => item._id === refund._id ? refund : item));
   };
 
-  const payWithWallet = async (pin) => {
+  const payWithWallet = async (pin, paymentOptions = {}) => {
     const projectDescription = projectPreferences || '';
     await beginCheckoutPayment();
     const idempotencyKey = walletPaymentKeyRef.current || (globalThis.crypto?.randomUUID?.() || `checkout-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
     walletPaymentKeyRef.current = idempotencyKey;
     const result = await requestApi('/api/wallet/pay', {
       method: 'POST',
-      body: JSON.stringify({ items: cart, address: cart.some((item) => !item.discountOfferId) ? address : undefined, service: selectedService, projectDescription, pin, idempotencyKey, discountCode: appliedDiscount?.code, checkoutReference: checkoutAttemptRef.current || undefined }),
+      body: JSON.stringify({ items: cart, address: cart.some((item) => !item.discountOfferId) ? address : undefined, service: selectedService, projectDescription, pin, idempotencyKey, discountCode: appliedDiscount?.code, checkoutReference: checkoutAttemptRef.current || undefined, ...paymentOptions }),
     });
     const paidOrder = { ...normalizeOrderRecord(result.order), paymentMethod: 'Wallet', walletBalanceAfter: result.wallet.balance };
     setOrders((current) => [paidOrder, ...current.filter((order) => order.id !== paidOrder.id)]);
@@ -2030,7 +2076,7 @@ function App() {
           setCheckoutStep={setCheckoutStep}
           onOpenProjectModal={openProjectPreferencesModal}
           onPay={handleRazorpay}
-          onWalletPay={() => openModal('wallet-payment-pin')}
+          onWalletPay={(paymentOptions) => openModal('wallet-payment-pin', { paymentOptions })}
           onRequestExit={requestCheckoutExit}
           checkoutReference={checkoutAttemptReference}
           cartPriceNotice={cartPriceNotice}
@@ -2134,7 +2180,7 @@ function App() {
           )}
           {modal.kind === 'wallet-payment-pin' && <WalletPinModal
             onCancel={closeModal}
-            onSubmit={payWithWallet}
+            onSubmit={(pin) => payWithWallet(pin, modal.props.paymentOptions || {})}
             onViewResult={() => {
               const reference = checkoutAttemptReference || checkoutAttemptRef.current;
               closeModal();
@@ -4370,7 +4416,7 @@ function ProductDetailsPage({ auth, onSignIn, onAddToCart, onAddWishlistItem, on
       formData.append('rating', String(rating));
       formData.append('description', description);
       images.forEach((image) => formData.append('images', image));
-      const response = await fetch(`/api/products/${encodeURIComponent(productId)}/reviews`, { method: 'POST', credentials: 'include', body: formData });
+      const response = await fetch(apiUrl(`/api/products/${encodeURIComponent(productId)}/reviews`), { method: 'POST', credentials: 'include', body: formData });
       const result = await parseJsonSafely(response);
       if (!response.ok) throw new Error(result?.message || 'Review could not be submitted.');
       setReviewFormOpen(false);
@@ -4902,6 +4948,46 @@ function PromoPurchaseSuccess({ success, nextPromoReservationId, onCopy, onConti
   </div></main>;
 }
 
+function CheckoutQrPaymentPanel({ checkoutReference, amount, onReady }) {
+  const [qrImage, setQrImage] = useState('');
+  const [error, setError] = useState('');
+  const [verifiedAmount, setVerifiedAmount] = useState(null);
+  useEffect(() => {
+    let active = true;
+    setQrImage('');
+    setError('');
+    setVerifiedAmount(null);
+    requestApi('/api/checkout/payment-qr/start', {
+      method: 'POST',
+      body: JSON.stringify({ checkoutReference }),
+    })
+      .then(async (result) => {
+        const verification = await requestApi('/api/checkout/payment-qr/verify', {
+          method: 'POST',
+          body: JSON.stringify({ qrPayload: result.qrPayload, checkoutReference }),
+        });
+        const image = await QRCode.toDataURL(result.qrPayload, {
+          width: 480,
+          margin: 4,
+          errorCorrectionLevel: 'H',
+          color: { dark: '#07151c', light: '#ffffff' },
+        });
+        if (active) {
+          setQrImage(image);
+          setVerifiedAmount(verification.amount);
+          onReady({ qrPayload: result.qrPayload, checkoutReference, amount: verification.amount, paymentStatus: result.paymentStatus });
+        }
+      })
+      .catch((requestError) => { if (active) setError(requestError.message || 'The official Innovation Labs QR could not be loaded.'); });
+    return () => { active = false; };
+  }, [checkoutReference, onReady]);
+  const displayAmount = verifiedAmount ?? amount;
+  return <section className="wallet-checkout-summary" aria-live="polite">
+    <h4>Pay With QR Code</h4>
+    {qrImage ? <><div className="wallet-qr-image-wrap"><img src={qrImage} alt="Innovation Labs checkout payment QR code" /></div><div className="summary-row"><span>Company</span><strong>Innovation Labs</strong></div><div className="summary-row"><span>Order reference</span><strong>{checkoutReference}</strong></div><div className="summary-row total"><span>Payment amount</span><strong>₹{Number(displayAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div><p>Scan this checkout payment request, then confirm payment with your Innovation Labs Wallet PIN. The amount is fixed and cannot be edited.</p></> : error ? <p className="voice-error" role="alert">{error}</p> : <p role="status">Preparing the Innovation Labs checkout QR code...</p>}
+  </section>;
+}
+
 function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selectedService, setSelectedService, projectPreferences, address, setAddress, saveAddress, checkoutStep, setCheckoutStep, onOpenProjectModal, onPay, onWalletPay, onRequestExit, checkoutReference, appliedDiscount, onLogin, savedAddresses, authEmail }) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -4916,19 +5002,35 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
   const [walletQuoteError, setWalletQuoteError] = useState('');
   const [walletQuoteLoading, setWalletQuoteLoading] = useState(false);
   const [walletQuoteRefreshKey, setWalletQuoteRefreshKey] = useState(0);
+  const [walletPaymentMode, setWalletPaymentMode] = useState('pin');
+  const [checkoutQrVerified, setCheckoutQrVerified] = useState(null);
+  const [checkoutQrPaymentStatus, setCheckoutQrPaymentStatus] = useState('');
+  const [payerWalletId, setPayerWalletId] = useState('');
+  const [payerWalletOwner, setPayerWalletOwner] = useState('');
+  const [payerWalletIdVerified, setPayerWalletIdVerified] = useState(false);
+  const [walletIdVerificationLoading, setWalletIdVerificationLoading] = useState(false);
+  const [walletIdVerificationError, setWalletIdVerificationError] = useState('');
+  const handleMerchantQrReady = useCallback((value) => {
+    setCheckoutQrVerified(value);
+    setCheckoutQrPaymentStatus(value.paymentStatus || 'Pending');
+  }, []);
+  useRealtimeEvents(Boolean(auth && checkoutReference), (eventName, data) => {
+    if (eventName !== 'checkout_payment_completed' || data?.checkoutReference !== checkoutReference) return;
+    navigate(`/order-placed/${encodeURIComponent(data.orderId)}`);
+  });
 
   const hasCoding = selectedService === 'coding' || selectedService === 'full';
   const hasBuilding = selectedService === 'building' || selectedService === 'full';
   const digitalOnly = cart.length > 0 && cart.every((item) => Boolean(item.discountOfferId));
-  const displayedCheckoutStep = digitalOnly ? 3 : checkoutStep;
+  const displayedCheckoutStep = digitalOnly && checkoutStep < 3 ? 3 : checkoutStep;
   const serviceIndex = serviceOptions.findIndex((option) => option.id === selectedService);
   const currentAddress = auth && authEmail ? savedAddresses[authEmail] || address : address;
   const selectedServiceOption = serviceOptions.find((option) => option.id === selectedService);
   const cartSubtotal = cart.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0);
   const showFinalCharges = displayedCheckoutStep >= 2;
-  const checkoutActionLabel = displayedCheckoutStep === 3
-    ? paymentMethod === 'wallet' ? 'Pay Now' : 'Place Order'
-    : displayedCheckoutStep === 4 ? 'Order Confirmed' : 'Next';
+  const checkoutActionLabel = displayedCheckoutStep === 5
+    ? 'Pay Now'
+    : displayedCheckoutStep === 6 ? 'Order Confirmed' : 'Next';
   const formatCheckoutMoney = (value) => `₹${Number(value || 0).toLocaleString('en-IN', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
@@ -4956,19 +5058,26 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
     && isNonNegativeAmount(walletQuote.total));
   const walletQuoteMatchesEstimate = Boolean(hasValidWalletQuote && checkoutEstimate
     && Math.abs(Number(walletQuote.total) - Number(checkoutEstimate.total)) < 0.02);
+  const qrPaymentAwaiting = displayedCheckoutStep === 5
+    && paymentMethod === 'wallet'
+    && walletPaymentMode === 'qr'
+    && Boolean(checkoutQrVerified)
+    && checkoutQrPaymentStatus === 'Pending';
   const checkoutActionDisabled = actionInProgress
-    || displayedCheckoutStep === 4
-    || displayedCheckoutStep === 3 && (
+    || displayedCheckoutStep === 6
+    || displayedCheckoutStep === 5 && (
       !checkoutEstimate
       || Boolean(checkoutEstimateError)
-      || paymentMethod === 'wallet' && (
+      || paymentMethod === 'wallet' && walletPaymentMode !== 'qr' && (
         walletQuoteLoading
         || Boolean(walletQuoteError)
         || !walletQuoteMatchesEstimate
         || walletQuote.balance < walletQuote.total
       )
+      || displayedCheckoutStep === 5 && paymentMethod === 'wallet' && walletPaymentMode === 'qr' && !checkoutQrVerified
+      || displayedCheckoutStep === 5 && paymentMethod === 'wallet' && walletPaymentMode === 'wallet-id' && !payerWalletIdVerified
     )
-    || displayedCheckoutStep === 3 && (
+    || displayedCheckoutStep === 5 && (
       paymentMethod === 'online'
         ? !checkoutReference
         : false
@@ -4986,7 +5095,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
   }, [auth, savedAddresses, setAddress]);
 
   useEffect(() => {
-    if (digitalOnly && checkoutStep !== 3) setCheckoutStep(3);
+    if (digitalOnly && checkoutStep < 3) setCheckoutStep(3);
   }, [digitalOnly, checkoutStep, setCheckoutStep]);
 
   useEffect(() => {
@@ -5002,7 +5111,12 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
     setCheckoutEstimateError('');
     const quoteRequest = requestApi('/api/checkout/quote', {
       method: 'POST',
-      body: JSON.stringify({ items: cart, service: selectedService, discountCode: appliedDiscount?.code }),
+      body: JSON.stringify({
+        items: cart,
+        service: selectedService,
+        discountCode: appliedDiscount?.code,
+        payerWalletId: walletPaymentMode === 'wallet-id' ? payerWalletId : undefined,
+      }),
       signal: controller.signal,
     }).then((estimate) => {
       if (!estimate || !quoteContainsValidAmounts(estimate)) {
@@ -5032,6 +5146,12 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
 
   useEffect(() => {
     if (!auth?.id || paymentMethod !== 'wallet') {
+      setWalletQuote(null);
+      setWalletQuoteError('');
+      setWalletQuoteLoading(false);
+      return undefined;
+    }
+    if (walletPaymentMode === 'wallet-id' && !payerWalletId.trim()) {
       setWalletQuote(null);
       setWalletQuoteError('');
       setWalletQuoteLoading(false);
@@ -5068,7 +5188,40 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [auth?.id, cart, paymentMethod, selectedService, appliedDiscount?.code, walletQuoteRefreshKey]);
+  }, [auth?.id, cart, paymentMethod, walletPaymentMode, payerWalletId, selectedService, appliedDiscount?.code, walletQuoteRefreshKey]);
+
+  useEffect(() => {
+    setCheckoutQrVerified(null);
+    setCheckoutQrPaymentStatus('');
+    setPayerWalletIdVerified(false);
+    setPayerWalletOwner('');
+    setWalletIdVerificationError('');
+    if (paymentMethod !== 'wallet') setWalletPaymentMode('pin');
+  }, [paymentMethod, cart, selectedService, appliedDiscount?.code]);
+
+  useEffect(() => {
+    if (!auth || displayedCheckoutStep !== 5 || paymentMethod !== 'wallet'
+      || walletPaymentMode !== 'qr' || !checkoutQrVerified || checkoutQrPaymentStatus === 'Completed') return undefined;
+    let active = true;
+    const checkPaymentStatus = async () => {
+      try {
+        const result = await requestApi(`/api/checkout/payment-qr?reference=${encodeURIComponent(checkoutReference)}`);
+        if (!active) return;
+        setCheckoutQrPaymentStatus(result.paymentStatus || 'Pending');
+        if (result.paymentStatus === 'Paid' || result.checkoutStatus === 'Completed') {
+          navigate(`/order-placed/${encodeURIComponent(result.orderId || checkoutReference)}`);
+        }
+      } catch (requestError) {
+        if (active && requestError.status !== 409) setWalletQuoteError(requestError.message);
+      }
+    };
+    checkPaymentStatus();
+    const intervalId = window.setInterval(checkPaymentStatus, 2500);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [auth, checkoutReference, checkoutQrVerified, checkoutQrPaymentStatus, displayedCheckoutStep, navigate, paymentMethod, walletPaymentMode]);
 
   if (!auth) {
     return (
@@ -5115,14 +5268,20 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
   };
 
   const handleCheckoutAction = async () => {
-    if (actionInProgressRef.current || displayedCheckoutStep === 4) return;
+    if (actionInProgressRef.current) return;
     actionInProgressRef.current = true;
     setActionInProgress(true);
     try {
       if (displayedCheckoutStep < 3) {
         await nextStep();
+      } else if (displayedCheckoutStep === 3) {
+        setCheckoutStep(paymentMethod === 'wallet' ? 4 : 5);
+      } else if (displayedCheckoutStep === 4) {
+        setCheckoutStep(5);
       } else if (paymentMethod === 'wallet') {
-        await onWalletPay();
+        await onWalletPay(walletPaymentMode === 'qr'
+          ? { paymentChannel: 'checkout-qr', checkoutQrPayload: checkoutQrVerified.qrPayload }
+          : walletPaymentMode === 'wallet-id' ? { payerWalletId } : {});
       } else {
         await onPay();
       }
@@ -5139,7 +5298,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       disabled={checkoutActionDisabled}
       onClick={handleCheckoutAction}
     >
-      {actionInProgress && displayedCheckoutStep === 3 ? 'Processing...' : checkoutActionLabel}
+      {actionInProgress && displayedCheckoutStep === 5 ? 'Processing...' : checkoutActionLabel}
     </button>
   );
 
@@ -5155,8 +5314,10 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
         <div className="progress-steps" aria-label="Checkout progress">
           {['Project Preferences', 'Address', 'Payment', 'Confirmation'].map((label, index) => {
             const step = index + 1;
-            const completed = step < displayedCheckoutStep || (step === 4 && checkoutStep === 4);
-            const current = step === displayedCheckoutStep && !completed;
+            const paymentStage = step === 3 && displayedCheckoutStep >= 3 && displayedCheckoutStep <= 5;
+            const completed = (step < 3 && step < displayedCheckoutStep)
+              || (step === 3 && displayedCheckoutStep === 6);
+            const current = paymentStage || (step === 4 && displayedCheckoutStep === 6);
             return (
               <div
                 key={step}
@@ -5276,13 +5437,96 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
 
         {displayedCheckoutStep === 3 && (
           <div className="checkout-card checkout-step-card" key="checkout-step-3">
-            <h3>Step 3 — Payment</h3>
+            <h3>Step 3 — Payment Method</h3>
             <div className="payment-methods">
               <strong>Payment Method</strong>
               <label><input type="radio" name="payment-method" checked={paymentMethod === 'online'} onChange={() => setPaymentMethod('online')} /> Online Payment</label>
               <label><input type="radio" name="payment-method" checked={paymentMethod === 'wallet'} onChange={() => setPaymentMethod('wallet')} /> Wallet</label>
             </div>
-            {paymentMethod === 'wallet' && <section className="wallet-checkout-summary">
+            <div className="checkout-actions space-between">
+              <button className="secondary-btn" onClick={() => setCheckoutStep(2)}>Back</button>
+              {renderCheckoutAction()}
+            </div>
+          </div>
+        )}
+
+        {displayedCheckoutStep === 4 && (
+          <div className="checkout-card checkout-step-card" key="checkout-step-4">
+            <h3>Step 4 — Wallet Payment Method</h3>
+            {paymentMethod === 'wallet' && <div className="payment-methods" role="radiogroup" aria-label="Wallet payment method">
+              <strong>Wallet Payment Method</strong>
+              <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'pin'} onChange={() => setWalletPaymentMode('pin')} /> Pay With PIN</label>
+              <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'qr'} onChange={() => setWalletPaymentMode('qr')} /> Pay With QR Code</label>
+              <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'wallet-id'} onChange={() => setWalletPaymentMode('wallet-id')} /> Pay With Wallet ID</label>
+            </div>}
+            <div className="checkout-actions space-between">
+              <button className="secondary-btn" onClick={() => setCheckoutStep(3)}>Back</button>
+              {renderCheckoutAction()}
+            </div>
+          </div>
+        )}
+
+        {displayedCheckoutStep === 5 && (
+          <div className="checkout-card checkout-step-card" key="checkout-step-5">
+            <h3>Step 5 — {walletPaymentMode === 'pin' ? 'Pay With PIN' : walletPaymentMode === 'qr' ? 'Pay With QR Code' : 'Pay With Wallet ID'}</h3>
+            {paymentMethod === 'wallet' && walletPaymentMode === 'qr' &&             <CheckoutQrPaymentPanel
+              checkoutReference={checkoutReference}
+              amount={checkoutEstimate?.total}
+              onReady={handleMerchantQrReady}
+            />}
+            {paymentMethod === 'wallet' && walletPaymentMode === 'wallet-id' && <section className="wallet-checkout-summary wallet-id-checkout-panel">
+              <div className="wallet-id-checkout-heading">
+                <span className="wallet-id-checkout-icon" aria-hidden="true">◈</span>
+                <div>
+                  <h4>Pay With Wallet ID</h4>
+                  <p>Enter the Wallet ID of the person authorizing this payment.</p>
+                </div>
+              </div>
+              <label className="wallet-id-input-wrap">
+                <span className="wallet-id-input-icon" aria-hidden="true">◈</span>
+                <input
+                  value={payerWalletId}
+                  onChange={(event) => { setPayerWalletId(event.target.value.toUpperCase()); setPayerWalletIdVerified(false); setPayerWalletOwner(''); setWalletIdVerificationError(''); }}
+                  placeholder="Enter payer's Innovation Labs Wallet ID"
+                  aria-label="Innovation Labs Wallet ID"
+                  autoComplete="off"
+                  spellCheck="false"
+                />
+              </label>
+              <button
+                type="button"
+                className="wallet-id-verify-btn"
+                disabled={!payerWalletId.trim() || walletIdVerificationLoading}
+                onClick={async () => {
+                if (!payerWalletId.trim() || walletIdVerificationLoading) return;
+                setWalletIdVerificationLoading(true);
+                setWalletIdVerificationError('');
+                try {
+                  const result = await requestApi(`/api/wallet/identity?walletId=${encodeURIComponent(payerWalletId.trim())}`);
+                  if (result.walletId) {
+                    setPayerWalletId(result.walletId);
+                    setPayerWalletIdVerified(true);
+                    setPayerWalletOwner(result.ownerName || 'Innovation Labs wallet owner');
+                  } else {
+                    setPayerWalletIdVerified(false);
+                    setPayerWalletOwner('');
+                    setWalletIdVerificationError('This Wallet ID does not exist. Please check and try again.');
+                  }
+                } catch (requestError) {
+                  setPayerWalletIdVerified(false);
+                  setPayerWalletOwner('');
+                  setWalletIdVerificationError(requestError.message);
+                } finally {
+                  setWalletIdVerificationLoading(false);
+                }
+              }}
+              >
+                {walletIdVerificationLoading ? <><span className="wallet-id-spinner" aria-hidden="true" /> Verifying Wallet ID...</> : <><span aria-hidden="true">✓</span> Verify Wallet ID</>}
+              </button>
+              {payerWalletIdVerified && <p className="wallet-id-status wallet-id-status-success" role="status"><span aria-hidden="true">✓</span> Wallet Owner Verified · {payerWalletOwner}. Their Wallet PIN is required to authorize payment.</p>}
+              {walletIdVerificationError && <p className="wallet-id-status wallet-id-status-error" role="alert">{walletIdVerificationError}</p>}
+            </section>}
+            {paymentMethod === 'wallet' && walletPaymentMode !== 'qr' && <section className="wallet-checkout-summary">
               <h4>Wallet Payment</h4>
               {walletQuoteLoading ? <p>Checking wallet balance...</p> : walletQuoteError ? <><p role="alert">{walletQuoteError}</p><button className="secondary-btn small" type="button" onClick={() => setWalletQuoteRefreshKey((current) => current + 1)}>Retry</button></> : hasValidWalletQuote && !walletQuoteMatchesEstimate ? <><p role="alert">The Wallet amount does not match the latest order total. Refresh the Wallet check before paying.</p><button className="secondary-btn small" type="button" onClick={() => setWalletQuoteRefreshKey((current) => current + 1)}>Refresh Wallet check</button></> : hasValidWalletQuote && <>
                 <div className="summary-row"><span>Current Wallet Balance</span><strong>₹{Number(walletQuote.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
@@ -5316,9 +5560,13 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
             </div>
 
             <div className="checkout-actions space-between">
-              <button className="secondary-btn" onClick={() => digitalOnly ? onRequestExit('/cart') : setCheckoutStep(2)}>Back</button>
+              <button className="secondary-btn" onClick={() => setCheckoutStep(4)}>Back</button>
               <div className="payment-actions">
-                {renderCheckoutAction()}
+                {walletPaymentMode === 'qr'
+                  ? qrPaymentAwaiting
+                    ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />Awaiting QR Payment</div>
+                    : renderCheckoutAction()
+                  : renderCheckoutAction()}
               </div>
             </div>
           </div>
@@ -5327,7 +5575,11 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
 
           <aside className="checkout-order-summary" aria-labelledby="checkout-order-summary-title">
             <h3 id="checkout-order-summary-title">Place Your Order</h3>
-            <div className="checkout-order-summary-action">{renderCheckoutAction('primary-btn full')}</div>
+            <div className="checkout-order-summary-action">
+              {qrPaymentAwaiting
+                ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />Awaiting QR Payment</div>
+                : renderCheckoutAction('primary-btn full')}
+            </div>
             <div className="checkout-summary-service">
               <span>Project service</span>
               <strong>{selectedServiceOption?.title || 'Parts Only'}</strong>
@@ -6060,6 +6312,16 @@ function WalletPage({ auth, accessVersion, onRequestUnlock }) {
   const [activeSection, setActiveSection] = useState(() => location.state?.openTransferTab ? 'transfer' : 'overview');
   const [transferIntroOpen, setTransferIntroOpen] = useState(false);
   const [message, setMessage] = useState('');
+  useRealtimeEvents(Boolean(auth), (eventName) => {
+    if (eventName !== 'wallet_balance_updated') return;
+    requestApi('/api/wallet')
+      .then((result) => { if (!result.setupRequired) setWallet(result.wallet); })
+      .catch((error) => { if (error.status !== 423) setMessage(error.message || 'Wallet balance could not be synchronized.'); });
+  }, () => {
+    requestApi('/api/wallet')
+      .then((result) => { if (!result.setupRequired) setWallet(result.wallet); })
+      .catch(() => {});
+  });
 
   useEffect(() => {
     if (!auth) return;
@@ -6141,6 +6403,10 @@ function WalletPage({ auth, accessVersion, onRequestUnlock }) {
         {activeSection === 'overview' ? <>
           <div className="wallet-header"><span className="eyebrow">Secure payments</span><h1>My Wallet</h1><p>Use your Innovation Labs balance for faster checkout.</p></div>
           <div className="wallet-balance-card"><span>Available Balance</span><strong>₹{wallet.balance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong><div className="wallet-balance-breakdown"><span>Total Wallet Balance: ₹{Number(wallet.totalBalance ?? wallet.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span></div><button className="primary-btn small" onClick={() => setActiveTab('recharge')}>Recharge Wallet</button></div>
+          <section className="wallet-own-id-card" aria-label="Your Innovation Labs Wallet ID">
+            <div><span className="eyebrow">Your Innovation Labs Wallet ID</span><strong>{wallet.walletId || 'Wallet ID not created yet'}</strong></div>
+            {wallet.walletId && <button type="button" className="wallet-copy-id-btn" aria-label="Copy Wallet ID" onClick={() => navigator.clipboard?.writeText(wallet.walletId).then(() => setMessage('Wallet ID copied.')).catch(() => setMessage('Wallet ID could not be copied.'))}>⧉</button>}
+          </section>
           <section className="wallet-restricted-balance" aria-label="Restricted wallet balance"><div><span className="wallet-restricted-lock" aria-hidden="true">🔒</span><h2>Restricted Balance</h2></div><strong>₹{Number(wallet.restrictedBalance || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></section>
           <div className="wallet-tabs" role="tablist" aria-label="Wallet overview sections"><button role="tab" aria-selected={activeTab === 'wallet'} className={activeTab === 'wallet' ? 'active' : ''} onClick={() => setActiveTab('wallet')}>Wallet</button><button role="tab" aria-selected={activeTab === 'history'} className={activeTab === 'history' ? 'active' : ''} onClick={() => setActiveTab('history')}>History</button><button role="tab" aria-selected={activeTab === 'recharge'} className={activeTab === 'recharge' ? 'active' : ''} onClick={() => setActiveTab('recharge')}>Recharge</button><button role="tab" aria-selected={activeTab === 'promo'} className={activeTab === 'promo' ? 'active' : ''} onClick={() => setActiveTab('promo')}>Promo Code</button></div>
           {message && <div className="account-notice">{message}</div>}
@@ -6223,6 +6489,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
   const [qrImage, setQrImage] = useState('');
   const [qrLoading, setQrLoading] = useState(false);
   const [qrRenderError, setQrRenderError] = useState('');
+  const [qrGenerationError, setQrGenerationError] = useState('');
   const [qrRetry, setQrRetry] = useState(0);
   const [qrTransferAvailable, setQrTransferAvailable] = useState(false);
   const [qrAccessError, setQrAccessError] = useState('');
@@ -6230,6 +6497,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
   const [qrAccessChecking, setQrAccessChecking] = useState(true);
   const [recipientSuffix, setRecipientSuffix] = useState('');
   const [recipient, setRecipient] = useState(null);
+  const [checkoutQrPayment, setCheckoutQrPayment] = useState(null);
   const [recipientConfirmOpen, setRecipientConfirmOpen] = useState(false);
   const [recipientBusy, setRecipientBusy] = useState(false);
   const [creatingId, setCreatingId] = useState(false);
@@ -6310,7 +6578,10 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
     if (transferTab !== 'show') return undefined;
     let active = true;
     setQrLoading(true);
+    setQrData(null);
+    setQrImage('');
     setQrRenderError('');
+    setQrGenerationError('');
     requestApi('/api/wallet/transfers/qr', { method: 'POST', body: JSON.stringify({}) })
       .then((result) => {
         if (active) {
@@ -6320,7 +6591,12 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
           setQrImage('');
         }
       })
-      .catch((requestError) => { if (active) setError(requestError.message); })
+      .catch((requestError) => {
+        if (active) {
+          setQrGenerationError(requestError.message || 'Your QR code could not be generated. Please try again.');
+          setError('');
+        }
+      })
       .finally(() => { if (active) setQrLoading(false); });
     return () => { active = false; };
   }, [transferTab, ownWalletId, qrRetry]);
@@ -6370,16 +6646,19 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
         context.strokeStyle = '#00aeca';
         context.lineWidth = 3;
         context.stroke();
-        const logo = await loadImage(innovationLabsLogo);
-        context.save();
-        context.beginPath();
-        if (typeof context.roundRect === 'function') context.roundRect(panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16, 8);
-        else context.rect(panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16);
-        context.clip();
-        context.drawImage(logo, 105, 175, 1045, 825, panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16);
-        context.restore();
-
-        if (active) setQrImage(canvas.toDataURL('image/png'));
+        try {
+          const logo = await loadImage(innovationLabsLogo);
+          context.save();
+          context.beginPath();
+          if (typeof context.roundRect === 'function') context.roundRect(panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16, 8);
+          else context.rect(panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16);
+          context.clip();
+          context.drawImage(logo, 105, 175, 1045, 825, panelX + 8, panelY + 8, panelWidth - 16, panelHeight - 16);
+          context.restore();
+          if (active) setQrImage(canvas.toDataURL('image/png'));
+        } catch (logoError) {
+          console.warn('Innovation Labs logo could not be added to the QR code. Showing the scannable QR without the logo.', logoError);
+        }
       } catch (qrError) {
         if (active) {
           setQrRenderError(`The QR image could not be prepared: ${qrError.message}`);
@@ -6577,7 +6856,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
 
     {showTransferOptions && transferTab === 'enter' && view === 'recipient' && <section className="wallet-transfer-panel"><h2>Transfer Money</h2><div className="wallet-id-summary"><span>Your Wallet ID</span><strong>{ownWalletId || 'Loading Wallet ID...'}</strong></div><form className="wallet-transfer-form" onSubmit={checkRecipient}><label className="wallet-amount">Recipient Wallet ID<div className="wallet-id-input"><span aria-hidden="true">@WL</span><input value={recipientSuffix} onChange={(event) => { setRecipientSuffix(suffixFromInput(event.target.value)); setError(''); setRecipient(null); transferKeyRef.current = ''; }} maxLength={8} autoComplete="off" aria-label="Recipient letters and numbers" placeholder="ABCD1234" /></div></label>{error && <div className="voice-error" role="alert">{error}</div>}<button className="primary-btn" disabled={recipientBusy || !validRecipientSuffix}>{recipientBusy ? 'Checking recipient...' : 'Check Recipient'}</button></form></section>}
 
-    {showTransferOptions && transferTab === 'show' && <section className="wallet-transfer-panel wallet-qr-panel"><h2>My Wallet QR Code</h2>{qrLoading ? <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Preparing your wallet QR code...</p></div> : qrData && <><div className="wallet-qr-image-wrap">{qrImage ? <img src={qrImage} alt="Scannable Innovation Labs wallet QR code" /> : qrRenderError ? <div className="wallet-transfer-loading" role="alert"><p>{qrRenderError}</p><button type="button" className="secondary-btn small" onClick={() => setQrRetry((value) => value + 1)}>Retry</button></div> : <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Generating QR code...</p></div>}</div><strong>{qrData.fullName}</strong><code className="wallet-id-display">{qrData.walletId}</code><p>Let another Innovation Labs user scan this QR code to send you money.</p><div className="wallet-qr-actions">{qrImage && <a className="secondary-btn" href={qrImage} download={`innovation-labs-wallet-${qrData.walletId}.png`}>Download QR</a>}{typeof navigator.share === 'function' && <button className="primary-btn" onClick={shareQr}>Share QR</button>}</div>{qrTransferAvailable ? <button type="button" className="wallet-scan-bar" onClick={() => navigate('/wallet/scan-pay')}><span className="wallet-scan-icon" aria-hidden="true">▦</span><span><strong>Scan Another Wallet QR</strong><small>Scan another user's QR code to send money.</small></span><span className="wallet-scan-chevron" aria-hidden="true">›</span></button> : <section className="wallet-scan-locked" aria-label="Exclusive QR transfer feature"><div className="wallet-scan-locked-heading"><span className="wallet-scan-lock-icon" aria-hidden="true">🔒</span><div><strong>Scan Another Wallet QR</strong><small>{qrAccessChecking ? 'Checking subscription...' : 'Exclusive Feature'}</small></div></div><p>{qrAccessChecking ? 'Checking your plan eligibility...' : qrAccessError || 'Upgrade to the Exclusive plan to unlock QR Code Money Transfers.'}</p>{!qrAccessChecking && (qrAccessError ? <button type="button" className="secondary-btn small" onClick={() => setQrAccessRefresh((value) => value + 1)}>Retry eligibility check</button> : <Link className="primary-btn small" to="/plans">Upgrade to Exclusive</Link>)}</section>}</>}{error && <div className="voice-error" role="alert">{error}</div>}</section>}
+    {showTransferOptions && transferTab === 'show' && <section className="wallet-transfer-panel wallet-qr-panel"><h2>My Wallet QR Code</h2>{qrLoading ? <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Preparing your wallet QR code...</p></div> : qrGenerationError ? <div className="wallet-transfer-loading" role="alert"><p>{qrGenerationError}</p><button type="button" className="secondary-btn small" onClick={() => setQrRetry((value) => value + 1)}>Retry</button></div> : qrData && <><div className="wallet-qr-image-wrap">{qrImage ? <img src={qrImage} alt="Scannable Innovation Labs wallet QR code" /> : qrRenderError ? <div className="wallet-transfer-loading" role="alert"><p>{qrRenderError}</p><button type="button" className="secondary-btn small" onClick={() => setQrRetry((value) => value + 1)}>Retry</button></div> : <div className="wallet-transfer-loading" role="status"><div className="spinner" /><p>Generating QR code...</p></div>}</div><strong>{qrData.fullName}</strong><code className="wallet-id-display">{qrData.walletId}</code><p>Let another Innovation Labs user scan this QR code to send you money.</p><div className="wallet-qr-actions">{qrImage && <a className="secondary-btn" href={qrImage} download={`innovation-labs-wallet-${qrData.walletId}.png`}>Download QR</a>}{typeof navigator.share === 'function' && <button className="primary-btn" onClick={shareQr}>Share QR</button>}</div>{qrTransferAvailable ? <button type="button" className="wallet-scan-bar" onClick={() => navigate('/wallet/scan-pay')}><span className="wallet-scan-icon" aria-hidden="true">▦</span><span><strong>Scan Another Wallet QR</strong><small>Scan another user's QR code to send money.</small></span><span className="wallet-scan-chevron" aria-hidden="true">›</span></button> : <section className="wallet-scan-locked" aria-label="Exclusive QR transfer feature"><div className="wallet-scan-locked-heading"><span className="wallet-scan-lock-icon" aria-hidden="true">🔒</span><div><strong>Scan Another Wallet QR</strong><small>{qrAccessChecking ? 'Checking subscription...' : 'Exclusive Feature'}</small></div></div><p>{qrAccessChecking ? 'Checking your plan eligibility...' : qrAccessError || 'Upgrade to the Exclusive plan to unlock QR Code Money Transfers.'}</p>{!qrAccessChecking && (qrAccessError ? <button type="button" className="secondary-btn small" onClick={() => setQrAccessRefresh((value) => value + 1)}>Retry eligibility check</button> : <Link className="primary-btn small" to="/plans">Upgrade to Exclusive</Link>)}</section>}</>}{error && <div className="voice-error" role="alert">{error}</div>}</section>}
 
 
     {view === 'amount' && recipient && <section className="wallet-transfer-panel"><h2>Transfer Money</h2><div className="wallet-transfer-recipient"><span>Recipient</span><strong>{recipient.walletId}</strong><p>Recipient: {recipient.displayName}</p></div><form className="wallet-transfer-form" onSubmit={continueToConfirmation}><label className="wallet-amount">Amount (₹)<input type="number" inputMode="decimal" min="0.01" step="0.01" value={amount} disabled={checkingBalance} onChange={(event) => { setAmount(event.target.value); setError(''); transferKeyRef.current = ''; }} placeholder="0.00" /></label><div className="wallet-transfer-balance"><span>Available Balance</span><strong>₹{Number(wallet.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{error && <div className="voice-error" role="alert">{error}</div>}<button className="primary-btn" disabled={!amount || checkingBalance}>{checkingBalance ? 'Checking balance...' : 'Continue'}</button></form></section>}
@@ -6710,6 +6989,17 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
     setError('');
     try {
       await stopScanner();
+      if (qrPayload.trim().startsWith('ILPAY1.')) {
+        const result = await requestApi('/api/checkout/payment-qr/resolve', {
+          method: 'POST',
+          body: JSON.stringify({ qrPayload }),
+        });
+        setCheckoutQrPayment({ ...result, qrPayload: qrPayload.trim() });
+        setPin('');
+        setPinVisible(false);
+        setStage('checkout-qr');
+        return;
+      }
       const result = await requestApi('/api/wallet/transfers/qr/resolve', {
         method: 'POST',
         body: JSON.stringify({ qrPayload }),
@@ -6727,9 +7017,36 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
     }
   }, [stopScanner]);
 
+  const submitCheckoutQrPayment = async () => {
+    if (busy || pin.length !== 4 || !checkoutQrPayment) return;
+    setBusy(true);
+    setError('');
+    if (!transferKeyRef.current) transferKeyRef.current = globalThis.crypto?.randomUUID?.()
+      || `checkout-qr-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    try {
+      const result = await requestApi('/api/checkout/payment-qr/pay', {
+        method: 'POST',
+        body: JSON.stringify({
+          qrPayload: checkoutQrPayment.qrPayload,
+          pin,
+          idempotencyKey: transferKeyRef.current,
+        }),
+      });
+      setCheckoutQrPayment(null);
+      setPin('');
+      setStage('success');
+      setTransfer({ transferId: result.order.orderId, amount: checkoutQrPayment.amount, status: 'Completed', recipientName: 'Innovation Labs', completedAt: new Date().toISOString(), order: result.order });
+    } catch (requestError) {
+      setPin('');
+      setError(requestError.message || 'QR payment could not be completed.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const startScanner = useCallback(async () => {
     if (scannerStartingRef.current || scannerRef.current?.isScanning) return;
-    if (!window.isSecureContext && window.location.hostname !== 'localhost') {
+    if (!window.isSecureContext && !import.meta.env.DEV) {
       setError('Camera scanning requires a secure HTTPS connection.');
       return;
     }
@@ -6979,8 +7296,8 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
       <button type="button" className="wallet-payment-back" onClick={backToWallet}>← <span>Transfer Money</span></button>
       <header className="wallet-payment-header">
         <span className="eyebrow">INNOVATION LABS WALLET</span>
-        <h1>{stage === 'success' ? 'Payment complete' : stage === 'pin' ? 'Authorize payment' : stage === 'amount' ? 'Review payment' : 'Scan & Pay'}</h1>
-        <p>{stage === 'scan' ? 'Align the recipient’s Innovation Labs QR code inside the frame.' : stage === 'amount' ? 'Enter the amount you want to send.' : stage === 'pin' ? 'Confirm securely with your Innovation Labs Wallet PIN.' : 'Your transfer was completed securely.'}</p>
+        <h1>{stage === 'success' ? 'Payment complete' : stage === 'checkout-qr' ? 'Innovation Labs QR Payment' : stage === 'pin' ? 'Authorize payment' : stage === 'amount' ? 'Review payment' : 'Scan & Pay'}</h1>
+        <p>{stage === 'scan' ? 'Align the Innovation Labs checkout QR code inside the frame.' : stage === 'checkout-qr' ? 'Confirm the fixed checkout amount, then authorize with your Wallet PIN.' : stage === 'amount' ? 'Enter the amount you want to send.' : stage === 'pin' ? 'Confirm securely with your Innovation Labs Wallet PIN.' : 'Your transfer was completed securely.'}</p>
       </header>
 
       {error && <div className="wallet-payment-error" role="alert">{error}</div>}
@@ -7017,6 +7334,36 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
         </div>
         <label className="wallet-payment-remarks"><span>Remarks <small>(Optional)</small></span><input maxLength={120} value={remarks} onChange={(event) => { setRemarks(event.target.value); transferKeyRef.current = ''; }} placeholder="Add a note" /></label>
         <button type="button" className="wallet-payment-primary" disabled={busy || !amountValue || amountValue * 100 > Math.round(availableBalance * 100)} onClick={continueToPin}>{busy ? 'Checking balance…' : `PAY ₹${amountValue.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`}</button>
+      </section>}
+
+      {stage === 'checkout-qr' && checkoutQrPayment && <section className="wallet-payment-card wallet-payment-amount-stage checkout-qr-scanned-card">
+        <div className="wallet-payment-recipient">
+          <span className="wallet-payment-avatar" aria-hidden="true">IL</span>
+          <div><small>Payment recipient</small><strong>Innovation Labs</strong><span>Checkout payment request</span></div>
+          <span className="wallet-recipient-verified" aria-label="Company verified">✓</span>
+        </div>
+        <div className="wallet-payment-amount-entry">
+          <span>Fixed payment amount</span>
+          <strong className="wallet-payment-pin-amount">₹{Number(checkoutQrPayment.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+          <small>Order reference · {checkoutQrPayment.checkoutReference}</small>
+        </div>
+        <p>Payment will be deducted from this Wallet account. The amount cannot be changed.</p>
+        <button type="button" className="wallet-payment-primary" disabled={busy} onClick={() => { setPin(''); setStage('checkout-qr-pin'); }}>PAY ₹{Number(checkoutQrPayment.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</button>
+      </section>}
+
+      {stage === 'checkout-qr-pin' && checkoutQrPayment && <section className="wallet-payment-card wallet-payment-pin-stage">
+        <div className="wallet-payment-recipient compact"><span className="wallet-payment-avatar" aria-hidden="true">IL</span><div><small>Paying</small><strong>Innovation Labs</strong><span>{checkoutQrPayment.checkoutReference}</span></div></div>
+        <strong className="wallet-payment-pin-amount">₹{Number(checkoutQrPayment.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+        <h2>Enter Wallet PIN</h2>
+        <p>Use your Innovation Labs Wallet PIN to authorize this checkout payment.</p>
+        <div className={`wallet-payment-pin-dots${pinVisible ? ' visible' : ''}`} aria-label={`${pin.length} of 4 Wallet PIN digits entered`}>
+          {[0, 1, 2, 3].map((index) => <span key={index}>{pin[index] ? pinVisible ? pin[index] : '•' : ''}</span>)}
+          <button type="button" onClick={() => setPinVisible((visible) => !visible)}>{pinVisible ? 'Hide' : 'Show'}</button>
+        </div>
+        <div className="wallet-payment-keypad wallet-payment-pin-keypad" aria-label="Wallet PIN keypad">
+          {['1', '2', '3', '4', '5', '6', '7', '8', '9', 'delete', '0', 'clear'].map((key) => <button type="button" key={key} disabled={busy} onClick={() => { setError(''); setPin((current) => key === 'delete' ? current.slice(0, -1) : key === 'clear' ? '' : current.length < 4 ? `${current}${key}` : current); }}>{key === 'delete' ? '⌫' : key === 'clear' ? '×' : key}</button>)}
+        </div>
+        <div className="wallet-payment-pin-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => { setPin(''); setStage('checkout-qr'); }}>Back</button><button type="button" className="wallet-payment-primary" disabled={busy || pin.length !== 4} onClick={submitCheckoutQrPayment}>{busy ? 'Processing securely…' : 'Confirm Payment'}</button></div>
       </section>}
 
       {stage === 'pin' && recipient && <section className="wallet-payment-card wallet-payment-pin-stage">
@@ -7965,6 +8312,12 @@ function AdminOrdersPageV2({ auth }) {
   const [subscriptionOrders, setSubscriptionOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [realtimeVersion, setRealtimeVersion] = useState(0);
+  useRealtimeEvents(Boolean(auth?.isAdmin), (eventName) => {
+    if (['order_created', 'order_accepted', 'order_declined', 'refund_processed'].includes(eventName)) {
+      setRealtimeVersion((version) => version + 1);
+    }
+  }, () => setRealtimeVersion((version) => version + 1));
 
   useEffect(() => {
     if (!auth?.isAdmin) return;
@@ -7992,7 +8345,7 @@ function AdminOrdersPageV2({ auth }) {
       window.clearInterval(interval);
       window.removeEventListener('focus', refreshOrders);
     };
-  }, [auth]);
+  }, [auth, realtimeVersion]);
 
   if (!auth?.isAdmin) return <div className="empty-state"><h3>Admin access is required.</h3></div>;
   if (loading) return <div className="empty-state"><h3>Loading live orders...</h3></div>;
@@ -8966,6 +9319,17 @@ function OrderPlacedPage({ order: initialOrder }) {
   const [rewardPopupOpen, setRewardPopupOpen] = useState(false);
   const requestedOrderKey = routeOrderId || routedInitialOrder?.orderId || routedInitialOrder?.id;
   const orderKey = order?.orderId || order?.id;
+  const refreshRealtimeOrder = () => {
+    if (!requestedOrderKey) return;
+    requestApi(`/api/orders/${encodeURIComponent(requestedOrderKey)}`)
+      .then((result) => setOrder(result.order))
+      .catch((requestError) => setOrderLoadError(requestError.message || 'The latest order status could not be loaded.'));
+  };
+  useRealtimeEvents(Boolean(requestedOrderKey), (eventName, data) => {
+    if (data.orderId === requestedOrderKey && ['order_created', 'payment_success', 'order_accepted', 'order_declined', 'refund_processed'].includes(eventName)) {
+      refreshRealtimeOrder();
+    }
+  }, refreshRealtimeOrder);
   const rewardPointsEarned = Number(order?.rewardPointsEarned || 0);
   const rewardWasEarned = rewardPointsEarned > 0 && order?.paymentStatus === 'Paid' && !['Cancelled', 'Declined', 'Rejected', 'Failed'].includes(order?.orderStatus);
   const address = order?.address || {};

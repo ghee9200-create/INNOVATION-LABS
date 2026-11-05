@@ -1,14 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 
-const apiProxyTarget = process.env.API_PROXY_TARGET || 'http://127.0.0.1:3001';
 const rootDir = fileURLToPath(new URL('.', import.meta.url));
 const tempBuildDir = path.join(rootDir, '.vite-build');
 
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, rootDir, '');
+  const apiProxyTarget = String(env.API_PROXY_TARGET || '').trim();
+
+  return {
   plugins: [
     react(),
     {
@@ -29,7 +32,7 @@ export default defineConfig({
         fs.writeFileSync(path.join(rootDir, 'app.html'), builtHtml);
 
         for (const file of fs.readdirSync(tempBuildDir)) {
-          if (!file.endsWith('.js') && !file.endsWith('.css')) continue;
+          if (file === 'index.html') continue;
           fs.copyFileSync(path.join(tempBuildDir, file), path.join(rootDir, file));
         }
 
@@ -49,11 +52,7 @@ export default defineConfig({
     port: 3000,
     strictPort: true,
     host: '0.0.0.0',
-    headers: {
-      'Cross-Origin-Opener-Policy': 'same-origin-allow-popups',
-    },
-    proxy: {
-      '/api': apiProxyTarget,
-    },
+    ...(apiProxyTarget ? { proxy: { '/api': apiProxyTarget } } : {}),
   },
+  };
 });

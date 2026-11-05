@@ -85,6 +85,8 @@ const aiCreditPackages = [100, 500, 1000];
 let databaseDiagnostic = { state: 'connecting', errorType: null };
 const giftRecipientAttempts = new Map();
 const revokedSessionIds = new Set();
+const sseUserClients = new Map();
+const sseAdminClients = new Set();
 const googleClient = new OAuth2Client(googleClientId);
 const User = mongoose.model('User', new mongoose.Schema({
   googleId: { type: String, required: true, unique: true, index: true },
@@ -216,6 +218,7 @@ const Order = mongoose.model('Order', new mongoose.Schema({
   total: { type: Number, required: true, min: 0 },
   paymentStatus: { type: String, default: 'Paid' },
   paymentMethod: { type: String, enum: ['Razorpay', 'Wallet'], default: 'Razorpay' },
+  payerWalletId: String,
   walletBalanceAfterPaise: { type: Number, min: 0 },
   inventoryDeductedAt: Date,
   refundCaseId: { type: String, default: null },
@@ -376,6 +379,7 @@ const WalletTransaction = mongoose.model('WalletTransaction', new mongoose.Schem
   cancellationId: String,
   transferId: String,
   peerWalletId: String,
+  payerWalletId: String,
   description: { type: String, required: true },
   status: { type: String, enum: ['Pending', 'Successful', 'Failed', 'Completed'], default: 'Successful' },
 }, { timestamps: true }));
@@ -1146,6 +1150,36 @@ const validatePin = (pin) => typeof pin === 'string' && /^\d{4}$/.test(pin);
 const normalizeWalletId = (value) => String(value || '').trim().toUpperCase();
 const validateWalletId = (value) => /^@WL[A-Z]{4}\d{4}$/.test(value);
 const safeRecipientName = (value) => String(value || 'Innovation Labs user').trim().replace(/\s+/g, ' ') || 'Innovation Labs user';
+
+const writeSseEvent = (res, event, data = {}) => {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+};
+
+const broadcastSse = (event, data, userId = null) => {
+  const clients = userId
+    ? (sseUserClients.get(String(userId)) || [])
+    : [...sseAdminClients];
+  for (const client of clients) {
+    try {
+      writeSseEvent(client, event, data);
+    } catch (error) {
+      console.error('Could not broadcast SSE event:', error.message);
+    }
+  }
+};
+
+const broadcastOrderEvent = (order, event, extra = {}) => {
+  if (!order?.userId) return;
+  const data = {
+    orderId: order.orderId,
+    userId: order.userId,
+    orderStatus: order.orderStatus,
+    paymentStatus: order.paymentStatus,
+    ...extra,
+  };
+  broadcastSse(event, data, order.userId);
+  broadcastSse(event, data);
+};
 
 const findDeliveredAt = (order) => {
   const delivery = (order.statusHistory || [])
@@ -6578,6 +6612,264 @@ app.get('/api/wallet/access', requireSession, requireDatabase, async (req, res) 
   return res.json({ setupRequired: !wallet?.pinHash });
 });
 
+app.get('/api/wallet/identity', requireSession, requireDatabase, async (req, res) => {
+  const requestedWalletId = normalizeWalletId(req.query.walletId);
+  const wallet = await Wallet.findOne(requestedWalletId ? { walletId: requestedWalletId } : { userId: req.session.sub })
+    .select('walletId balancePaise restrictedBalancePaise pinHash userId').lean();
+  if (!wallet?.walletId) return res.status(404).json({ message: 'This Wallet ID does not exist. Please check and try again.' });
+  const owner = await User.findOne({ googleId: wallet.userId }).select('name').lean();
+  const limitState = await getWalletLimitStatus(wallet.userId, wallet.balancePaise);
+  return res.json({
+    walletId: wallet.walletId,
+    ownerName: owner?.name || 'Innovation Labs wallet owner',
+    availableBalance: money(limitState.availableBalancePaise),
+    hasPin: Boolean(wallet.pinHash),
+  });
+});
+
+app.get('/api/events', requireSession, requireDatabase, (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  const userId = String(req.session.sub);
+  const isAdmin = req.session.admin === true && isAdminEmail(req.session.email);
+  const client = res;
+  const userClients = sseUserClients.get(userId) || [];
+  userClients.push(client);
+  sseUserClients.set(userId, userClients);
+  if (isAdmin) sseAdminClients.add(client);
+  writeSseEvent(res, 'ready', { userId, isAdmin, serverTime: new Date().toISOString() });
+  const heartbeat = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch (error) { console.error('SSE heartbeat failed:', error.message); }
+  }, 25_000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    const remaining = (sseUserClients.get(userId) || []).filter((entry) => entry !== client);
+    if (remaining.length) sseUserClients.set(userId, remaining);
+    else sseUserClients.delete(userId);
+    sseAdminClients.delete(client);
+  });
+});
+
+const encodeCheckoutQrPayload = ({ reference, totalPaise }) => {
+  const body = {
+    version: 1,
+    company: 'Innovation Labs',
+    reference,
+    amountPaise: totalPaise,
+    currency: 'INR',
+  };
+  const encoded = Buffer.from(JSON.stringify(body)).toString('base64url');
+  const signature = crypto.createHmac('sha256', sessionSecret).update(encoded).digest('base64url');
+  return `ILPAY1.${encoded}.${signature}`;
+};
+
+const verifyCheckoutQrPayload = (payload) => {
+  const parts = String(payload || '').split('.');
+  if (parts.length !== 3 || parts[0] !== 'ILPAY1') return null;
+  const expected = crypto.createHmac('sha256', sessionSecret).update(parts[1]).digest('base64url');
+  if (parts[2].length !== expected.length || !crypto.timingSafeEqual(Buffer.from(parts[2]), Buffer.from(expected))) return null;
+  try {
+    const body = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (body.version !== 1 || body.company !== 'Innovation Labs' || body.currency !== 'INR'
+      || typeof body.reference !== 'string' || !Number.isSafeInteger(body.amountPaise) || body.amountPaise < 0) return null;
+    return body;
+  } catch {
+    return null;
+  }
+};
+
+app.get('/api/checkout/payment-qr', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
+  const reference = typeof req.query.reference === 'string' ? req.query.reference.trim() : '';
+  const attempt = await CheckoutAttempt.findOne({
+    reference,
+    userId: req.session.sub,
+    status: { $in: ['Open', 'Completing', 'Completed'] },
+  }).select('reference totalPaise paymentStatus status').lean();
+  if (!attempt) return res.status(409).json({ message: 'This checkout is no longer active. Return to checkout and try again.' });
+  const completedOrder = attempt.status === 'Completed'
+    ? await Order.findOne({ checkoutReference: attempt.reference }).select('orderId').lean()
+    : null;
+  return res.json({
+    qrPayload: encodeCheckoutQrPayload(attempt),
+    company: 'Innovation Labs',
+    checkoutReference: attempt.reference,
+    amount: money(attempt.totalPaise),
+    paymentStatus: attempt.paymentStatus,
+    checkoutStatus: attempt.status,
+    orderId: completedOrder?.orderId || null,
+  });
+});
+
+app.post('/api/checkout/payment-qr/start', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
+  const reference = typeof req.body?.checkoutReference === 'string' ? req.body.checkoutReference.trim() : '';
+  const attempt = await CheckoutAttempt.findOneAndUpdate(
+    { reference, userId: req.session.sub, status: { $in: ['Open', 'Payment Initiated'] } },
+    { $set: { status: 'Open', stage: 'Payment Initiated', paymentStatus: 'Pending' } },
+    { new: true },
+  ).select('reference totalPaise paymentStatus status').lean();
+  if (!attempt) return res.status(409).json({ message: 'This checkout is no longer active. Return to checkout and try again.' });
+  return res.json({
+    qrPayload: encodeCheckoutQrPayload(attempt),
+    company: 'Innovation Labs',
+    checkoutReference: attempt.reference,
+    amount: money(attempt.totalPaise),
+    paymentStatus: attempt.paymentStatus,
+    checkoutStatus: attempt.status,
+  });
+});
+
+app.post('/api/checkout/payment-qr/verify', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
+  const payload = verifyCheckoutQrPayload(req.body?.qrPayload);
+  if (!payload) return res.status(400).json({ message: 'This QR payment request is invalid or has been altered.' });
+  const attempt = await CheckoutAttempt.findOne({
+    reference: payload.reference,
+    userId: req.session.sub,
+    status: { $in: ['Open', 'Payment Initiated'] },
+  }).select('reference totalPaise paymentStatus').lean();
+  if (!attempt || attempt.totalPaise !== payload.amountPaise) {
+    return res.status(409).json({ message: 'This QR payment request does not match the current checkout.' });
+  }
+  return res.json({
+    verified: true,
+    company: 'Innovation Labs',
+    checkoutReference: attempt.reference,
+    amount: money(attempt.totalPaise),
+    paymentStatus: attempt.paymentStatus,
+  });
+});
+
+app.post('/api/checkout/payment-qr/resolve', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
+  const payload = verifyCheckoutQrPayload(req.body?.qrPayload);
+  if (!payload) return res.status(400).json({ message: 'This QR payment request is invalid or has been altered.' });
+  const attempt = await CheckoutAttempt.findOne({
+    reference: payload.reference,
+    status: { $in: ['Open', 'Payment Initiated'] },
+  }).select('reference totalPaise paymentStatus').lean();
+  if (!attempt || attempt.totalPaise !== payload.amountPaise) {
+    return res.status(409).json({ message: 'This QR payment request is expired or no longer available.' });
+  }
+  return res.json({
+    company: 'Innovation Labs',
+    checkoutReference: attempt.reference,
+    amount: money(attempt.totalPaise),
+    paymentStatus: attempt.paymentStatus,
+  });
+});
+
+app.post('/api/checkout/payment-qr/pay', requireSession, requireDatabase, requirePurchaseAge, async (req, res) => {
+  const payload = verifyCheckoutQrPayload(req.body?.qrPayload);
+  const pin = req.body?.pin;
+  const idempotencyKey = req.body?.idempotencyKey;
+  if (!payload || !validatePin(pin) || typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9:_-]{8,120}$/.test(idempotencyKey)) {
+    return res.status(400).json({ message: 'A valid QR payment request and Wallet PIN are required.' });
+  }
+  const subscription = await currentSubscription(req.session.sub);
+  if (subscription?.plan !== 'Exclusive') return res.status(403).json({ message: 'QR wallet payments are available to active Exclusive subscribers only.' });
+  try {
+    const result = await withMongoTransaction(async (session) => {
+      const attempt = await CheckoutAttempt.findOne({ reference: payload.reference, status: { $in: ['Open', 'Payment Initiated'] } }).session(session);
+      if (!attempt || attempt.totalPaise !== payload.amountPaise) throw Object.assign(new Error('This QR payment request is expired or no longer available.'), { status: 409 });
+      const referenceId = `checkout-qr:${attempt.reference}:${idempotencyKey}`;
+      const duplicate = await WalletTransaction.findOne({ userId: req.session.sub, referenceId }).session(session).lean();
+      if (duplicate) {
+        const existingOrder = await Order.findOne({ checkoutReference: attempt.reference }).session(session).lean();
+        if (!existingOrder) throw Object.assign(new Error('This QR payment was already processed but its order is unavailable.'), { status: 409 });
+        return { order: existingOrder, wallet: await Wallet.findOne({ userId: req.session.sub }).session(session).lean(), checkoutOwnerId: attempt.userId, checkoutReference: attempt.reference, duplicate: true };
+      }
+      const wallet = await Wallet.findOne({ userId: req.session.sub }).session(session);
+      if (!wallet?.pinHash) throw Object.assign(new Error('Create a Wallet PIN before paying from your Wallet.'), { status: 409 });
+      if (wallet.lockedUntil && wallet.lockedUntil > new Date()) throw Object.assign(new Error('Wallet security verification is temporarily locked.'), { status: 429 });
+      if (!verifyPin(pin, wallet.pinHash)) throw Object.assign(new Error('Incorrect Wallet PIN. Please try again.'), { status: 401 });
+      const limitState = await getWalletLimitStatus(req.session.sub, wallet.balancePaise, session);
+      const spendCheck = enforceAvailableWalletSpendLimit(wallet.balancePaise, attempt.totalPaise, limitState, 'Wallet balance');
+      if (!spendCheck.allowed || wallet.balancePaise < attempt.totalPaise) {
+        throw Object.assign(new Error(spendCheck.message || 'Insufficient wallet balance.'), { status: 402 });
+      }
+      const owner = await User.findOne({ googleId: attempt.userId }).session(session).lean();
+      if (!owner) throw Object.assign(new Error('The checkout account could not be found.'), { status: 409 });
+      const items = (attempt.items || []).map((item) => ({
+        ...item,
+        price: Number(item.unitPricePaise || 0) / 100,
+        quantity: Number(item.quantity || 0),
+      }));
+      const { safeItems } = await resolveOrderItems(items, attempt.userId);
+      const deliveryRequired = orderRequiresDelivery(safeItems);
+      const checkoutData = calculateOrder(safeItems, attempt.service);
+      const calculatedBase = checkoutData.totalPaise;
+      if (attempt.totalPaise > calculatedBase || attempt.totalPaise < 0) throw Object.assign(new Error('The checkout amount no longer matches the order.'), { status: 409 });
+      const inventoryDeductedAt = await applyInventoryReduction(session, safeItems, { validateProductSnapshot: true });
+      const orderId = `IL-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+      const before = wallet.balancePaise;
+      wallet.balancePaise -= attempt.totalPaise;
+      await wallet.save({ session });
+      const [order] = await Order.create([{
+        orderId,
+        orderType: safeItems.every((item) => item.discountOfferId) ? 'DISCOUNT_CODE' : 'PRODUCT',
+        userId: attempt.userId,
+        userName: owner.name || owner.email?.split('@')[0] || 'Innovation Labs customer',
+        userEmail: owner.email || attempt.customerEmail,
+        items: orderItemsSnapshot(safeItems),
+        address: null,
+        deliveryRequired,
+        service: attempt.service,
+        projectDescription: '',
+        subtotal: money(checkoutData.subtotalPaise),
+        discountAmountPaise: Math.max(0, calculatedBase - attempt.totalPaise),
+        codingCharge: money(checkoutData.codingChargePaise),
+        buildingCharge: money(checkoutData.buildingChargePaise),
+        deliveryCharge: money(checkoutData.deliveryChargePaise),
+        total: money(attempt.totalPaise),
+        paymentStatus: 'Paid',
+        paymentMethod: 'Wallet QR',
+        verifiedAmountPaidPaise: attempt.totalPaise,
+        paymentVerifiedAt: new Date(),
+        originalPaymentReference: referenceId,
+        walletBalanceAfterPaise: wallet.balancePaise,
+        inventoryDeductedAt,
+        orderStatus: 'Processing',
+        statusHistory: [{ status: 'Processing', note: 'Paid from an Innovation Labs Wallet QR request', createdAt: new Date() }],
+        checkoutReference: attempt.reference,
+      }], { session });
+      await WalletTransaction.create([{
+        userId: req.session.sub,
+        type: 'Purchase',
+        amountPaise: -attempt.totalPaise,
+        balanceBeforePaise: before,
+        balanceAfterPaise: wallet.balancePaise,
+        referenceId,
+        orderId,
+        description: `QR checkout payment for ${orderId}`,
+        status: 'Successful',
+      }], { session });
+      await createInvoiceForOrder(session, order);
+      await Notification.create([{ userId: attempt.userId, message: `Order ${orderId} was paid from an Innovation Labs Wallet QR.` }], { session });
+      attempt.status = 'Completed';
+      attempt.paymentStatus = 'Paid';
+      attempt.paymentReference = referenceId;
+      attempt.completedAt = new Date();
+      await attempt.save({ session });
+      return { order: order.toObject(), wallet: wallet.toObject(), checkoutOwnerId: attempt.userId, checkoutReference: attempt.reference, duplicate: false };
+    });
+    broadcastOrderEvent(result.order, 'payment_success', { amount: result.order.total, payerUserId: req.session.sub });
+    broadcastOrderEvent(result.order, 'order_created', { amount: result.order.total, payerUserId: req.session.sub });
+    broadcastSse('checkout_payment_completed', {
+      checkoutReference: result.checkoutReference,
+      orderId: result.order.orderId,
+      amount: result.order.total,
+      payerUserId: req.session.sub,
+    }, result.checkoutOwnerId);
+    broadcastSse('wallet_balance_updated', { userId: req.session.sub, balance: money(result.wallet.balancePaise) }, req.session.sub);
+    return res.status(result.duplicate ? 200 : 201).json({ order: result.order, wallet: walletView(result.wallet), duplicate: result.duplicate });
+  } catch (error) {
+    return res.status(error.status || 500).json({ message: error.message || 'QR wallet payment could not be completed.' });
+  }
+});
+
 app.get('/api/wallet', requireSession, requireDatabase, requireWalletUnlock, async (req, res) => {
   const walletRecord = await syncWalletRestrictionState(req.session.sub);
   const planState = await getWalletLimitStatus(req.session.sub, walletRecord?.balancePaise || 0);
@@ -6987,7 +7279,7 @@ app.post('/api/checkout/quote', requireSession, requireDatabase, async (req, res
 });
 
 app.post('/api/wallet/quote', requireSession, requireDatabase, async (req, res) => {
-  const { items, service = 'parts', discountCode } = req.body || {};
+  const { items, service = 'parts', discountCode, payerWalletId } = req.body || {};
   if (!['parts', 'coding', 'building', 'full'].includes(service)) return res.status(400).json({ message: 'Choose a valid project service.' });
   try {
     const { safeItems } = await resolveOrderItems(items, req.session.sub);
@@ -6999,10 +7291,17 @@ app.post('/api/wallet/quote', requireSession, requireDatabase, async (req, res) 
       Math.max(0, calculated.totalPaise - discountAmountPaise),
     );
     const totalPaise = Math.max(0, calculated.totalPaise - discountAmountPaise - subscriptionDiscount.amountPaise);
-    const wallet = await syncWalletRestrictionState(req.session.sub);
+    const payerId = normalizeWalletId(payerWalletId);
+    const payerWallet = payerId
+      ? await Wallet.findOne({ walletId: payerId }).lean()
+      : await syncWalletRestrictionState(req.session.sub);
+    if (payerId && !payerWallet) return res.status(404).json({ message: 'This Wallet ID does not exist. Please check and try again.' });
+    const wallet = payerId ? payerWallet : payerWallet;
     if (!wallet) return res.status(409).json({ message: 'Create your wallet PIN before paying with Wallet.' });
-    const walletState = await getWalletBalanceState(req.session.sub);
-    const limitState = await getWalletLimitStatus(req.session.sub, walletState.balancePaise);
+    const walletState = payerId
+      ? { balancePaise: wallet.balancePaise }
+      : await getWalletBalanceState(req.session.sub);
+    const limitState = await getWalletLimitStatus(wallet.userId, walletState.balancePaise);
     return res.json({
       balance: limitState.availableBalance,
       availableBalance: limitState.availableBalance,
@@ -7630,6 +7929,7 @@ app.patch('/api/admin/orders/:id/accept', requireSession, requireAdmin, requireD
       await Notification.create([{ userId: current.userId, message: `Order ${current.orderId} has been accepted and is now being processed.` }], { session });
       return current.toObject();
     });
+    broadcastOrderEvent(accepted, 'order_accepted', { acceptedAt: accepted.acceptedAt, estimatedDelivery: accepted.estimatedDelivery });
     return res.json({ order: accepted });
   } catch (error) {
     if (error.status) return res.status(error.status).json({ message: error.message });
@@ -8141,6 +8441,17 @@ app.patch('/api/admin/orders/:id/decline', requireSession, requireAdmin, require
       refundCreatedAt: result.refund.refundCreatedAt,
       refundCompletedAt: result.refund.refundCompletedAt,
     };
+    broadcastOrderEvent(result.order, 'order_declined', {
+      refundStatus: result.refund?.status || result.order.refundStatus || null,
+      refundAmountPaise: result.refund?.refundAmountPaise || result.order.refundAmountPaise || null,
+    });
+    if (result.walletBalance != null) {
+      broadcastSse('wallet_balance_updated', {
+        userId: result.order.userId,
+        balance: money(result.walletBalance),
+        availableBalance: money(result.walletBalance),
+      }, result.order.userId);
+    }
     return res.json({
       order: { ...result.order, refundCase },
       refund: result.refund,
@@ -8956,7 +9267,7 @@ app.post('/api/wallet/recharge/verify', requireSession, requireDatabase, require
     if (existing) return { duplicate: true, wallet: await Wallet.findOne({ userId: req.session.sub }).session(session).lean() };
     const wallet = await Wallet.findOne({ userId: req.session.sub }).session(session);
     if (!wallet) throw Object.assign(new Error('Create and unlock your wallet before recharging.'), { status: 409 });
-    const limitState = await getWalletLimitStatus(req.session.sub, wallet.balancePaise);
+    const limitState = await getWalletLimitStatus(req.session.sub, wallet.balancePaise, session);
     if (wallet.balancePaise + requestedPaise > limitState.maximumBalancePaise) {
       throw Object.assign(new Error(`This recharge would exceed your ${displayPlanName(limitState.plan)} wallet limit of ${money(limitState.maximumBalancePaise)}. You can add up to ${money(limitState.availableDepositCapacityPaise)} more.`, { status: 409, maximumBalance: money(limitState.maximumBalancePaise) }));
     }
@@ -8971,9 +9282,17 @@ app.post('/api/wallet/recharge/verify', requireSession, requireDatabase, require
 });
 
 app.post('/api/wallet/pay', requireSession, requireDatabase, requirePurchaseAge, async (req, res) => {
-  const { items, address, service = 'parts', projectDescription = '', pin, idempotencyKey, discountCode, checkoutReference } = req.body || {};
+  const { items, address, service = 'parts', projectDescription = '', pin, idempotencyKey, discountCode, checkoutReference, paymentChannel, checkoutQrPayload, payerWalletId } = req.body || {};
   if (!validatePin(pin) || typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9:_-]{8,120}$/.test(idempotencyKey)) return res.status(400).json({ message: 'Wallet PIN and a valid payment reference are required.' });
   if (!['parts', 'coding', 'building', 'full'].includes(service)) return res.status(400).json({ message: 'Choose a valid project service.' });
+  if (paymentChannel === 'checkout-qr') {
+    const subscription = await currentSubscription(req.session.sub);
+    if (subscription?.plan !== 'Exclusive') return res.status(403).json({ message: 'Checkout QR payments are available to active Exclusive subscribers only.' });
+    const qrRequest = verifyCheckoutQrPayload(checkoutQrPayload);
+    if (!checkoutReference || !qrRequest || qrRequest.reference !== checkoutReference) {
+      return res.status(400).json({ message: 'The checkout QR payment request must be verified before payment.' });
+    }
+  }
   const { safeItems, customOrders } = await resolveOrderItems(items, req.session.sub);
   const deliveryRequired = orderRequiresDelivery(safeItems);
   if (deliveryRequired && !validateAddress(address)) return res.status(400).json({ message: 'Complete the required delivery address fields.' });
@@ -8981,15 +9300,20 @@ app.post('/api/wallet/pay', requireSession, requireDatabase, requirePurchaseAge,
   const orderId = `IL-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
   try {
     const result = await withMongoTransaction(async (session) => {
-      const duplicate = await WalletTransaction.findOne({ userId: req.session.sub, referenceId: `wallet-payment:${idempotencyKey}` }).session(session).lean();
-      const wallet = await Wallet.findOne({ userId: req.session.sub }).session(session);
+      const normalizedPayerWalletId = normalizeWalletId(payerWalletId);
+      const walletQuery = normalizedPayerWalletId ? { walletId: normalizedPayerWalletId } : { userId: req.session.sub };
+      const payerWallet = await Wallet.findOne(walletQuery).session(session);
+      if (!payerWallet) throw Object.assign(new Error('This Wallet ID does not exist. Please check and try again.'), { status: 404 });
+      const payerUserId = payerWallet.userId;
+      const duplicate = await WalletTransaction.findOne({ userId: payerUserId, referenceId: `wallet-payment:${idempotencyKey}` }).session(session).lean();
+      const wallet = payerWallet;
       await enforceOrderLimit(session);
       if (!wallet?.pinHash) throw Object.assign(new Error('Create a Wallet PIN before paying from your Wallet.'), { status: 409 });
       if (!verifyPin(pin, wallet.pinHash)) throw Object.assign(new Error('Incorrect Wallet PIN. Please try again.'), { status: 401 });
       if (duplicate) {
         const existingOrder = await Order.findOne({ orderId: duplicate.orderId, userId: req.session.sub }).session(session).lean();
         if (!existingOrder) throw Object.assign(new Error('This wallet payment has already been processed.'), { status: 409 });
-        return { order: existingOrder, wallet: wallet.toObject(), duplicate: true };
+        return { order: existingOrder, wallet: wallet.toObject(), payerUserId, duplicate: true };
       }
       const checkoutAttempt = checkoutReference
         ? await CheckoutAttempt.findOne({ reference: checkoutReference, userId: req.session.sub, status: 'Open' }).session(session)
@@ -9009,7 +9333,7 @@ app.post('/api/wallet/pay', requireSession, requireDatabase, requirePurchaseAge,
           : 'The checkout contents or total changed. Return to checkout and try again.';
         throw Object.assign(new Error(message), { status: 409 });
       }
-      const limitState = await getWalletLimitStatus(req.session.sub, wallet.balancePaise);
+      const limitState = await getWalletLimitStatus(payerUserId, wallet.balancePaise, session);
       const spendCheck = enforceAvailableWalletSpendLimit(wallet.balancePaise, totalPaise, limitState, 'Wallet balance');
       if (!spendCheck.allowed) throw Object.assign(new Error(spendCheck.message), { status: 409, balance: money(spendCheck.availableBalancePaise), required: money(totalPaise), availableBalance: money(spendCheck.availableBalancePaise), restrictedBalance: money(spendCheck.restrictedBalancePaise) });
       if (wallet.balancePaise < totalPaise) throw Object.assign(new Error('Insufficient wallet balance.'), { status: 402, balance: money(spendCheck.availableBalancePaise), required: money(totalPaise) });
@@ -9040,6 +9364,7 @@ app.post('/api/wallet/pay', requireSession, requireDatabase, requirePurchaseAge,
         total: money(totalPaise),
         paymentStatus: 'Paid',
         paymentMethod: 'Wallet',
+        payerWalletId: wallet.walletId,
         verifiedAmountPaidPaise: totalPaise,
         paymentVerifiedAt: new Date(),
         originalPaymentReference: `wallet-payment:${idempotencyKey}`,
@@ -9052,11 +9377,11 @@ app.post('/api/wallet/pay', requireSession, requireDatabase, requirePurchaseAge,
       const discountCodes = await fulfillDiscountOfferItems(session, safeItems, { userId: req.session.sub, orderId });
       if (discount) await redeemDiscountCode(session, { userId: req.session.sub, code: discount.code, items: safeItems, orderId });
       await awardRewardPointsForOrder(session, order);
-      await WalletTransaction.create([{ userId: req.session.sub, type: 'Purchase', amountPaise: -totalPaise, balanceBeforePaise: before, balanceAfterPaise: wallet.balancePaise, referenceId: `wallet-payment:${idempotencyKey}`, orderId, description: `Purchase ${orderId}`, status: 'Successful' }], { session });
+      await WalletTransaction.create([{ userId: payerUserId, type: 'Purchase', amountPaise: -totalPaise, balanceBeforePaise: before, balanceAfterPaise: wallet.balancePaise, payerWalletId: wallet.walletId, referenceId: `wallet-payment:${idempotencyKey}`, orderId, description: `Purchase ${orderId} for ${req.session.email}`, status: 'Successful' }], { session });
       await createInvoiceForOrder(session, order);
       await createScratchCardForOrder(session, order);
       if (customOrders.length) await CustomOrder.updateMany({ _id: { $in: customOrders.map((item) => item._id) }, userId: req.session.sub, status: 'Accepted' }, { $set: { status: 'Ordered', orderedAt: new Date() } }, { session });
-      await Notification.create([{ userId: req.session.sub, message: `Order ${orderId} was paid from your wallet.` }], { session });
+      await Notification.create([{ userId: req.session.sub, message: `Order ${orderId} was paid from an Innovation Labs Wallet.` }], { session });
       if (checkoutAttempt) {
         checkoutAttempt.status = 'Completed';
         checkoutAttempt.paymentStatus = 'Paid';
@@ -9064,7 +9389,7 @@ app.post('/api/wallet/pay', requireSession, requireDatabase, requirePurchaseAge,
         checkoutAttempt.completedAt = new Date();
         await checkoutAttempt.save({ session });
       }
-      return { order, discountCodes, wallet: wallet.toObject() };
+      return { order, discountCodes, wallet: wallet.toObject(), payerUserId };
     });
     const savedOrder = result.order.toObject ? result.order.toObject() : result.order;
     const discountCodes = result.discountCodes || await discountCodesForOrder(savedOrder.orderId);
@@ -9079,6 +9404,14 @@ app.post('/api/wallet/pay', requireSession, requireDatabase, requirePurchaseAge,
       refundEligibility: { eligible: refund.eligible, reason: refund.reason, deliveredAt: refund.deliveredAt, eligibleAt: refund.eligibleAt },
       refundCase: null,
     };
+    const transactionId = `wallet-payment:${idempotencyKey}`;
+    broadcastOrderEvent(savedOrder, 'payment_success', { transactionId, amount: savedOrder.total });
+    broadcastOrderEvent(savedOrder, 'order_created', { transactionId, amount: savedOrder.total });
+    broadcastSse('wallet_balance_updated', {
+      userId: result.payerUserId,
+      balance: money(result.wallet.balancePaise),
+      availableBalance: money(walletAvailableBalancePaise(result.wallet)),
+    }, result.payerUserId);
     return res.status(result.duplicate ? 200 : 201).json({ order, wallet: walletView(result.wallet), duplicate: result.duplicate });
   } catch (error) {
     if (error.status) {
@@ -10677,6 +11010,9 @@ const checkoutItemsSnapshot = (items) => items.map((item) => ({
   category: String(item.category || 'Product'),
   quantity: Number(item.quantity),
   unitPricePaise: toPaise(item.price),
+  ...(item.discountOfferId ? { discountOfferId: String(item.discountOfferId) } : {}),
+  ...(item.customOrderId ? { customOrderId: String(item.customOrderId) } : {}),
+  ...(item.promoReservationId ? { promoReservationId: String(item.promoReservationId) } : {}),
 }));
 const checkoutAttemptMatches = (attempt, { items, service, totalPaise }) => (
   attempt.service === service
