@@ -189,7 +189,7 @@ const useRealtimeEvents = (enabled, onEvent, onReconnect) => {
         retryTimer = window.setTimeout(connect, retryDelay);
         retryDelay = Math.min(30_000, retryDelay * 2);
       };
-      ['order_created', 'payment_success', 'order_accepted', 'order_declined', 'refund_processed', 'wallet_balance_updated'].forEach((eventName) => {
+      ['order_created', 'payment_success', 'checkout_payment_completed', 'cart_updated', 'order_accepted', 'order_declined', 'refund_processed', 'wallet_balance_updated', 'wallet_payment_request', 'wallet_payment_request_updated'].forEach((eventName) => {
         source.addEventListener(eventName, (event) => {
           try {
             eventHandlerRef.current?.(eventName, JSON.parse(event.data));
@@ -290,6 +290,7 @@ function OrderItemStatusList({
             <small className="order-item-status-meta">
               <span className="order-item-status-badge is-active">Active</span>
               <span>Fulfillment: {fulfillmentStatus}</span>
+              {item.cancellable === false && <><span className="non-cancellable-item-name">Non-cancellable</span><span className="non-cancellable-item-warning">This item is non-cancellable.</span></>}
             </small>
           </span>
           <strong>₹{(price * activeQuantity).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
@@ -404,6 +405,7 @@ function App() {
   const trackedProductViewsRef = useRef(new Map());
   const aiCartActionKeysRef = useRef(new Set());
   const cartSyncQueueRef = useRef(Promise.resolve());
+  const cartSyncTimerRef = useRef(null);
   const walletPaymentKeyRef = useRef('');
   const checkoutAttemptRef = useRef('');
   const checkoutCreationRef = useRef(null);
@@ -909,17 +911,39 @@ function App() {
     return () => { active = false; };
   }, [auth?.id]);
 
+  useRealtimeEvents(Boolean(auth?.id), (eventName) => {
+    if (eventName !== 'cart_updated') return;
+    window.clearTimeout(cartSyncTimerRef.current);
+    cartSyncTimerRef.current = null;
+    cartSyncQueueRef.current = cartSyncQueueRef.current
+      .catch(() => {})
+      .then(() => requestApi('/api/cart'))
+      .then(({ items = [] }) => {
+        setCart(items);
+        setCartError('');
+      })
+      .catch((error) => {
+        setCartError(`Your saved cart could not be refreshed: ${error.message}`);
+      });
+  });
+
   useEffect(() => {
     if (!auth?.id || cartOwnerId !== auth.id) return undefined;
     const items = cart;
+    window.clearTimeout(cartSyncTimerRef.current);
     const timer = window.setTimeout(() => {
+      cartSyncTimerRef.current = null;
       cartSyncQueueRef.current = cartSyncQueueRef.current
         .catch(() => {})
         .then(() => requestApi('/api/cart', { method: 'PUT', body: JSON.stringify({ items }) }))
         .then(() => setCartError(''))
         .catch((error) => setCartError(`Your cart changes could not be saved: ${error.message}`));
     }, 250);
-    return () => window.clearTimeout(timer);
+    cartSyncTimerRef.current = timer;
+    return () => {
+      window.clearTimeout(timer);
+      if (cartSyncTimerRef.current === timer) cartSyncTimerRef.current = null;
+    };
   }, [auth?.id, cartOwnerId, cart]);
 
   useEffect(() => {
@@ -999,6 +1023,22 @@ function App() {
     if (authLoading || auth || !protectedRoute) return;
     setModal({ open: true, kind: 'require-signin', props: {} });
   }, [auth, authLoading, location.pathname]);
+
+  useEffect(() => {
+    if (!auth || authLoading || location.pathname === '/wallet/payment-requests') return undefined;
+    let active = true;
+    const checkPendingWalletRequests = async () => {
+      try {
+        const result = await requestApi('/api/wallet/payment-requests/pending');
+        if (active && result.requests?.length) navigate('/wallet/payment-requests');
+      } catch {
+        // The dedicated page will surface any actionable API error.
+      }
+    };
+    checkPendingWalletRequests();
+    const intervalId = window.setInterval(checkPendingWalletRequests, 5000);
+    return () => { active = false; window.clearInterval(intervalId); };
+  }, [auth, authLoading, location.pathname, navigate]);
 
   const cartCount = cart.reduce((sum, item) => sum + item.quantity, 0);
 
@@ -1411,20 +1451,22 @@ function App() {
     if (!checkoutExitIntent) return;
     setCheckoutExitLoading(true);
     try {
-      if (!checkoutAttemptRef.current) {
-        const reference = await createCheckoutAttempt();
-        if (!reference) throw new Error('Checkout could not be recorded. Stay on this page and try again.');
-      }
-      await requestApi(`/api/checkout-attempts/${encodeURIComponent(checkoutAttemptRef.current)}/exit`, {
+      const reference = checkoutAttemptRef.current || checkoutAttemptReference;
+      const result = reference ? await requestApi(`/api/checkout-attempts/${encodeURIComponent(reference)}/exit`, {
         method: 'POST',
         body: JSON.stringify({ destination: checkoutExitIntent.destination }),
-      });
+      }) : null;
       const destination = checkoutExitIntent.destination;
       checkoutAttemptRef.current = '';
       setCheckoutAttemptReference('');
       checkoutIdempotencyRef.current = '';
+      walletPaymentKeyRef.current = '';
       setCheckoutExitIntent(null);
-      navigate(destination);
+      if (result?.status === 'Completed' && result.orderId) {
+        navigate(`/order-placed/${encodeURIComponent(result.orderId)}`);
+      } else {
+        navigate(destination);
+      }
     } catch (error) {
       openModal('payment-error', { title: 'Checkout was not closed', message: error.message });
     } finally {
@@ -1532,7 +1574,6 @@ function App() {
       setAccountError(`This order could not sync to your account yet: ${error.message}`);
       return;
     }
-    setCart([]);
     setCheckoutStep(4);
     checkoutAttemptRef.current = '';
     setCheckoutAttemptReference('');
@@ -1832,10 +1873,24 @@ function App() {
     checkoutAttemptRef.current = '';
     setCheckoutAttemptReference('');
     checkoutIdempotencyRef.current = '';
-    setCart([]);
     setAppliedDiscount(null);
     closeModal();
     navigate(`/order-placed/${encodeURIComponent(paidOrder.orderId || paidOrder.id)}`, { state: { order: paidOrder } });
+  };
+
+  const requestWalletIdPayment = async (payerWalletId) => {
+    const checkoutReference = checkoutAttemptRef.current || await createCheckoutAttempt();
+    if (!checkoutReference) throw new Error('Checkout has not been recorded. Please try again.');
+    const idempotencyKey = globalThis.crypto?.randomUUID?.()
+      || `wallet-id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    return requestApi('/api/checkout/wallet-id/request', {
+      method: 'POST',
+      body: JSON.stringify({
+        walletId: payerWalletId,
+        checkoutReference,
+        idempotencyKey,
+      }),
+    });
   };
 
   const handleRazorpay = async () => {
@@ -1874,7 +1929,6 @@ function App() {
           });
           return;
         }
-        setCart([]);
         setAppliedDiscount(null);
         checkoutAttemptRef.current = '';
         setCheckoutAttemptReference('');
@@ -2002,8 +2056,10 @@ function App() {
         <Route path="/admin/account-restrictions" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/account-restrictions"><AdminAccountRestrictionsPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/subscription-finished" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/subscription-finished"><AdminSubscriptionFinishedPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin"><AdminDashboardPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
-        <Route path="/admin/orders" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/orders"><AdminOrdersPageV2 auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
-        <Route path="/admin/orders/:orderId" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/orders"><AdminOrderDetailPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/orders" element={<Navigate to="/admin/part-orders" replace />} />
+        <Route path="/admin/part-orders" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/part-orders"><AdminOrdersPageV2 auth={auth} category="PART_ORDER" /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/subscription-orders" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/subscription-orders"><AdminOrdersPageV2 auth={auth} category="SUBSCRIPTION_ORDER" /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
+        <Route path="/admin/orders/:orderId" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/part-orders"><AdminOrderDetailPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/rewards" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/rewards"><AdminRewardsPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/product-reviews" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/product-reviews"><AdminProductReviewsPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/discount-codes" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/discount-codes"><AdminDiscountCodesPage /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
@@ -2015,6 +2071,7 @@ function App() {
         <Route path="/admin/ai-bill-credits" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/ai-bill-credits"><AdminAIBillCreditsPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/promo-codes" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/promo-codes"><AdminPromoCodesPage auth={auth} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/wallet" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletPage auth={auth} accessVersion={walletAccessVersion} onRequestUnlock={() => openWalletUnlock(true)} />} />
+        <Route path="/wallet/payment-requests" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletPaymentRequestsPage />} />
         <Route path="/wallet/scan-pay" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletQrTransferPage auth={auth} accessVersion={walletAccessVersion} onRequestUnlock={() => openWalletUnlock(true, '/wallet/scan-pay')} />} />
         <Route path="/refund/:orderId" element={authLoading ? <AccountLoadingPage /> : auth ? <RefundRequestPage auth={auth} onSubmitted={handleRefundSubmitted} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/refunds/:id" element={authLoading ? <AccountLoadingPage /> : auth ? <RefundStatusPage auth={auth} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
@@ -2079,6 +2136,7 @@ function App() {
           onOpenProjectModal={openProjectPreferencesModal}
           onPay={handleRazorpay}
           onWalletPay={(paymentOptions) => openModal('wallet-payment-pin', { paymentOptions })}
+          onWalletIdRequest={requestWalletIdPayment}
           onRequestExit={requestCheckoutExit}
           checkoutReference={checkoutAttemptReference}
           cartPriceNotice={cartPriceNotice}
@@ -2205,7 +2263,7 @@ function App() {
       {adminSignOutConfirm && <div className="wallet-lock-overlay"><section className="wallet-pin-modal admin-signout-confirm" role="dialog" aria-modal="true" aria-labelledby="admin-signout-title"><h2 id="admin-signout-title">Do you want to sign out?</h2><div className="modal-actions"><button type="button" className="secondary-btn" onClick={() => setAdminSignOutConfirm(false)}>No, Continue</button><button type="button" className="primary-btn" onClick={confirmAdminSignOut}>Yes, Sign Out</button></div></section></div>}
       {checkoutExitIntent && <div className="wallet-lock-overlay"><section className="wallet-pin-modal checkout-exit-modal" role="dialog" aria-modal="true" aria-labelledby="checkout-exit-title">
         <h2 id="checkout-exit-title">Do you want to exit the payment page?</h2>
-        <p>Your cart will be kept. If you exit, this checkout attempt will be recorded separately from completed orders.</p>
+        <p>Your cart will be kept. Any pending payment request will be cancelled and cannot be approved after you exit.</p>
         <div className="modal-actions"><button type="button" className="secondary-btn" disabled={checkoutExitLoading} onClick={() => setCheckoutExitIntent(null)}>No, Stay on Page</button><button type="button" className="primary-btn" disabled={checkoutExitLoading} onClick={confirmCheckoutExit}>{checkoutExitLoading ? 'Saving…' : 'Yes, Exit'}</button></div>
       </section></div>}
     </div>
@@ -5013,7 +5071,7 @@ function CheckoutQrPaymentPanel({ checkoutReference, amount, address, onReady, o
   </section>;
 }
 
-function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selectedService, setSelectedService, projectPreferences, address, setAddress, saveAddress, checkoutStep, setCheckoutStep, onOpenProjectModal, onPay, onWalletPay, onRequestExit, checkoutReference, appliedDiscount, onLogin, savedAddresses, authEmail }) {
+function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selectedService, setSelectedService, projectPreferences, address, setAddress, saveAddress, checkoutStep, setCheckoutStep, onOpenProjectModal, onPay, onWalletPay, onWalletIdRequest, onRequestExit, checkoutReference, appliedDiscount, onLogin, savedAddresses, authEmail }) {
   const navigate = useNavigate();
   const location = useLocation();
   const actionInProgressRef = useRef(false);
@@ -5031,11 +5089,25 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
   const [checkoutQrVerified, setCheckoutQrVerified] = useState(null);
   const [checkoutQrPaymentStatus, setCheckoutQrPaymentStatus] = useState('');
   const [checkoutQrExpired, setCheckoutQrExpired] = useState(false);
+  const [walletIdPaymentStatus, setWalletIdPaymentStatus] = useState('');
+  const [walletIdRequestError, setWalletIdRequestError] = useState('');
+  const [walletIdRequestId, setWalletIdRequestId] = useState('');
+  const [walletIdPaymentAmount, setWalletIdPaymentAmount] = useState(null);
+  const [walletIdExpiresAt, setWalletIdExpiresAt] = useState('');
+  const [walletIdServerOffset, setWalletIdServerOffset] = useState(0);
+  const [walletIdRemainingSeconds, setWalletIdRemainingSeconds] = useState(null);
   const [payerWalletId, setPayerWalletId] = useState('');
   const [payerWalletOwner, setPayerWalletOwner] = useState('');
   const [payerWalletIdVerified, setPayerWalletIdVerified] = useState(false);
   const [walletIdVerificationLoading, setWalletIdVerificationLoading] = useState(false);
   const [walletIdVerificationError, setWalletIdVerificationError] = useState('');
+  const checkoutFingerprint = JSON.stringify({
+    items: cart.map((item) => [item.id, item.quantity, item.price]),
+    selectedService,
+    discountCode: appliedDiscount?.code || '',
+  });
+  const checkoutFingerprintRef = useRef(checkoutFingerprint);
+  const previousPaymentMethodRef = useRef(paymentMethod);
   const handleMerchantQrReady = useCallback((value) => {
     setCheckoutQrVerified(value);
     setCheckoutQrPaymentStatus(value.paymentStatus || 'Pending');
@@ -5045,8 +5117,23 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
     window.setTimeout(() => navigate('/'), 2000);
   }, [navigate]);
   useRealtimeEvents(Boolean(auth && checkoutReference), (eventName, data) => {
-    if (eventName !== 'checkout_payment_completed' || data?.checkoutReference !== checkoutReference) return;
-    navigate(`/order-placed/${encodeURIComponent(data.orderId)}`);
+    if (eventName === 'checkout_payment_completed' && data?.checkoutReference === checkoutReference) {
+      navigate(`/order-placed/${encodeURIComponent(data.orderId)}`);
+      return;
+    }
+    if (eventName !== 'wallet_payment_request_updated' || data?.checkoutReference !== checkoutReference) return;
+    setWalletIdPaymentStatus(data.status || '');
+    if (data.requestId) setWalletIdRequestId(data.requestId);
+    if (data.expiresAt) setWalletIdExpiresAt(data.expiresAt);
+    if (data.serverTime) setWalletIdServerOffset(new Date(data.serverTime).getTime() - Date.now());
+    if (['Cancelled', 'Rejected', 'Expired'].includes(data.status)) {
+      setWalletIdRequestError(data.status === 'Expired'
+        ? 'Payment Request Expired. You can start a fresh payment request.'
+        : `Payment request ${data.status.toLowerCase()}. You can start a fresh payment request.`);
+    }
+    if (data.status === 'Approved' && data.orderId) {
+      navigate(`/order-placed/${encodeURIComponent(data.orderId)}`);
+    }
   });
 
   const hasCoding = selectedService === 'coding' || selectedService === 'full';
@@ -5059,7 +5146,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
   const cartSubtotal = cart.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0);
   const showFinalCharges = displayedCheckoutStep >= 2;
   const checkoutActionLabel = displayedCheckoutStep === 5
-    ? 'Pay Now'
+    ? walletPaymentMode === 'wallet-id' && walletIdPaymentStatus === 'Pending' ? 'Awaiting Approval' : 'Pay Now'
     : displayedCheckoutStep === 6 ? 'Order Confirmed' : 'Next';
   const formatCheckoutMoney = (value) => `₹${Number(value || 0).toLocaleString('en-IN', {
     minimumFractionDigits: 2,
@@ -5093,12 +5180,17 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
     && walletPaymentMode === 'qr'
     && Boolean(checkoutQrVerified)
     && checkoutQrPaymentStatus === 'Pending';
+  const walletIdRequestActive = ['Pending', 'Processing'].includes(walletIdPaymentStatus);
+  const walletIdPaymentAwaiting = displayedCheckoutStep === 5
+    && paymentMethod === 'wallet'
+    && walletPaymentMode === 'wallet-id'
+    && walletIdRequestActive;
   const checkoutActionDisabled = actionInProgress
     || displayedCheckoutStep === 6
     || displayedCheckoutStep === 5 && (
       !checkoutEstimate
       || Boolean(checkoutEstimateError)
-      || paymentMethod === 'wallet' && walletPaymentMode !== 'qr' && (
+      || paymentMethod === 'wallet' && walletPaymentMode === 'pin' && (
         walletQuoteLoading
         || Boolean(walletQuoteError)
         || !walletQuoteMatchesEstimate
@@ -5106,6 +5198,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       )
       || displayedCheckoutStep === 5 && paymentMethod === 'wallet' && walletPaymentMode === 'qr' && !checkoutQrVerified
       || displayedCheckoutStep === 5 && paymentMethod === 'wallet' && walletPaymentMode === 'wallet-id' && !payerWalletIdVerified
+      || walletIdPaymentAwaiting
     )
     || displayedCheckoutStep === 5 && (
       paymentMethod === 'online'
@@ -5145,7 +5238,6 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
         items: cart,
         service: selectedService,
         discountCode: appliedDiscount?.code,
-        payerWalletId: walletPaymentMode === 'wallet-id' ? payerWalletId : undefined,
       }),
       signal: controller.signal,
     }).then((estimate) => {
@@ -5175,13 +5267,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
   }, [auth?.id, cart, selectedService, appliedDiscount?.code, displayedCheckoutStep, checkoutEstimateRetry]);
 
   useEffect(() => {
-    if (!auth?.id || paymentMethod !== 'wallet') {
-      setWalletQuote(null);
-      setWalletQuoteError('');
-      setWalletQuoteLoading(false);
-      return undefined;
-    }
-    if (walletPaymentMode === 'wallet-id' && !payerWalletId.trim()) {
+    if (!auth?.id || paymentMethod !== 'wallet' || walletPaymentMode !== 'pin') {
       setWalletQuote(null);
       setWalletQuoteError('');
       setWalletQuoteLoading(false);
@@ -5218,17 +5304,60 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [auth?.id, cart, paymentMethod, walletPaymentMode, payerWalletId, selectedService, appliedDiscount?.code, walletQuoteRefreshKey]);
+  }, [auth?.id, cart, paymentMethod, walletPaymentMode, selectedService, appliedDiscount?.code, walletQuoteRefreshKey]);
 
   useEffect(() => {
+    const checkoutChanged = checkoutFingerprintRef.current !== checkoutFingerprint;
+    const exitedWalletPayment = previousPaymentMethodRef.current === 'wallet' && paymentMethod !== 'wallet';
+    checkoutFingerprintRef.current = checkoutFingerprint;
+    previousPaymentMethodRef.current = paymentMethod;
+    if (!checkoutChanged && !exitedWalletPayment) {
+      if (paymentMethod !== 'wallet') setWalletPaymentMode('pin');
+      return;
+    }
     setCheckoutQrVerified(null);
     setCheckoutQrExpired(false);
     setCheckoutQrPaymentStatus('');
+    setWalletIdPaymentStatus('');
+    setWalletIdRequestError('');
+    setWalletIdRequestId('');
+    setWalletIdPaymentAmount(null);
+    setWalletIdExpiresAt('');
+    setWalletIdRemainingSeconds(null);
+    setWalletIdServerOffset(0);
     setPayerWalletIdVerified(false);
     setPayerWalletOwner('');
     setWalletIdVerificationError('');
     if (paymentMethod !== 'wallet') setWalletPaymentMode('pin');
-  }, [paymentMethod, cart, selectedService, appliedDiscount?.code]);
+  }, [paymentMethod, checkoutFingerprint, cart, selectedService, appliedDiscount?.code]);
+
+  useEffect(() => {
+    if (!auth || !checkoutReference) return undefined;
+    let active = true;
+    requestApi(`/api/checkout/wallet-id/status?reference=${encodeURIComponent(checkoutReference)}`)
+      .then((result) => {
+        if (!active || result.status === 'Not Started') return;
+        setPaymentMethod('wallet');
+        setWalletPaymentMode('wallet-id');
+        setCheckoutStep(5);
+        setWalletIdPaymentStatus(result.status || '');
+        setWalletIdRequestId(result.requestId || '');
+        setWalletIdPaymentAmount(result.amount ?? null);
+        setWalletIdExpiresAt(result.expiresAt || '');
+        setWalletIdServerOffset(new Date(result.serverTime).getTime() - Date.now());
+        if (result.payerWalletId) {
+          setPayerWalletId(result.payerWalletId);
+          setPayerWalletIdVerified(true);
+        }
+        if (result.status === 'Approved' && result.orderId) {
+          navigate(`/order-placed/${encodeURIComponent(result.orderId)}`);
+        }
+      })
+      .catch((requestError) => {
+        if (active && requestError.status !== 404) setWalletIdRequestError(requestError.message);
+      });
+    return () => { active = false; };
+  }, [auth, checkoutReference, navigate, setCheckoutStep]);
 
   useEffect(() => {
     if (!auth || displayedCheckoutStep !== 5 || paymentMethod !== 'wallet'
@@ -5253,6 +5382,71 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       window.clearInterval(intervalId);
     };
   }, [auth, checkoutReference, checkoutQrVerified, checkoutQrPaymentStatus, displayedCheckoutStep, navigate, paymentMethod, walletPaymentMode]);
+
+  useEffect(() => {
+    if (!auth || !checkoutReference || displayedCheckoutStep !== 5 || paymentMethod !== 'wallet' || walletPaymentMode !== 'wallet-id'
+      || ['Approved', 'Rejected', 'Cancelled', 'Expired'].includes(walletIdPaymentStatus)) return undefined;
+    let active = true;
+    const checkRequest = async () => {
+      try {
+        const result = await requestApi(`/api/checkout/wallet-id/status?reference=${encodeURIComponent(checkoutReference)}`);
+        if (!active) return;
+        if (result.status && result.status !== 'Not Started') {
+          setWalletIdPaymentStatus(result.status);
+          setWalletIdRequestId(result.requestId || '');
+          setWalletIdPaymentAmount(result.amount ?? null);
+          setWalletIdExpiresAt(result.expiresAt || '');
+          setWalletIdServerOffset((current) => current || new Date(result.serverTime).getTime() - Date.now());
+          if (result.payerWalletId) {
+            setPayerWalletId(result.payerWalletId);
+            setPayerWalletIdVerified(true);
+          }
+        }
+        if (result.status === 'Approved' && result.orderId) {
+          navigate(`/order-placed/${encodeURIComponent(result.orderId)}`);
+        }
+        if (['Cancelled', 'Rejected', 'Expired'].includes(result.status)) {
+          setWalletIdRequestError(result.status === 'Expired'
+            ? 'Payment Request Expired. You can start a fresh payment request.'
+            : `Payment request ${result.status.toLowerCase()}. You can start a fresh payment request.`);
+        }
+      } catch (requestError) {
+        if (active) setWalletIdRequestError(requestError.message);
+      }
+    };
+    checkRequest();
+    const intervalId = window.setInterval(checkRequest, 2500);
+    return () => { active = false; window.clearInterval(intervalId); };
+  }, [auth, checkoutReference, displayedCheckoutStep, navigate, paymentMethod, walletIdPaymentStatus, walletPaymentMode]);
+
+  useEffect(() => {
+    if (!walletIdExpiresAt || !['Pending', 'Processing'].includes(walletIdPaymentStatus)) {
+      setWalletIdRemainingSeconds(null);
+      return undefined;
+    }
+    const updateRemaining = () => {
+      const expiresAt = new Date(walletIdExpiresAt).getTime();
+      const remaining = Math.max(0, Math.ceil((expiresAt - (Date.now() + walletIdServerOffset)) / 1000));
+      setWalletIdRemainingSeconds(remaining);
+    };
+    updateRemaining();
+    const intervalId = window.setInterval(updateRemaining, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [walletIdExpiresAt, walletIdPaymentStatus, walletIdServerOffset]);
+
+  const cancelWalletIdPayment = async () => {
+    if (!walletIdRequestId) return;
+    try {
+      const result = await requestApi(`/api/wallet/payment-requests/${encodeURIComponent(walletIdRequestId)}/cancel`, {
+        method: 'POST',
+        body: '{}',
+      });
+      setWalletIdPaymentStatus(result.status || 'Cancelled');
+      setWalletIdRequestError('Payment request cancelled. You can start a fresh payment request.');
+    } catch (requestError) {
+      setWalletIdRequestError(requestError.message);
+    }
+  };
 
   if (!auth) {
     return (
@@ -5310,6 +5504,12 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       } else if (displayedCheckoutStep === 4) {
         setCheckoutStep(5);
       } else if (paymentMethod === 'wallet') {
+        if (walletPaymentMode === 'wallet-id') {
+          setWalletIdRequestError('');
+          const result = await onWalletIdRequest(payerWalletId);
+          setWalletIdPaymentStatus(result.status || 'Pending');
+          return;
+        }
         await onWalletPay(walletPaymentMode === 'qr'
           ? { paymentChannel: 'checkout-qr', checkoutQrPayload: checkoutQrVerified.qrPayload }
           : walletPaymentMode === 'wallet-id' ? { payerWalletId } : {});
@@ -5486,13 +5686,13 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
             <h3>Step 4 — Wallet Payment Method</h3>
             {paymentMethod === 'wallet' && <div className="payment-methods" role="radiogroup" aria-label="Wallet payment method">
               <strong>Wallet Payment Method</strong>
-              <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'pin'} onChange={() => setWalletPaymentMode('pin')} /> Pay With PIN</label>
-              <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'qr'} onChange={() => setWalletPaymentMode('qr')} /> Pay With QR Code</label>
-              <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'wallet-id'} onChange={() => setWalletPaymentMode('wallet-id')} /> Pay With Wallet ID</label>
+              <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'pin'} disabled={walletIdRequestActive} onChange={() => setWalletPaymentMode('pin')} /> Pay With PIN</label>
+              <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'qr'} disabled={walletIdRequestActive} onChange={() => setWalletPaymentMode('qr')} /> Pay With QR Code</label>
+              <label><input type="radio" name="wallet-payment-mode" checked={walletPaymentMode === 'wallet-id'} disabled={walletIdRequestActive} onChange={() => setWalletPaymentMode('wallet-id')} /> Pay With Wallet ID</label>
             </div>}
             <div className="checkout-actions space-between">
-              <button className="secondary-btn" onClick={() => setCheckoutStep(3)}>Back</button>
-              {renderCheckoutAction()}
+              <div><button className="secondary-btn" onClick={() => setCheckoutStep(3)}>Back</button><button className="secondary-btn" onClick={() => onRequestExit('/')}>Cancel Checkout</button></div>
+              {walletPaymentMode === 'wallet-id' ? null : renderCheckoutAction()}
             </div>
           </div>
         )}
@@ -5512,55 +5712,81 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
               <div className="wallet-id-checkout-heading">
                 <span className="wallet-id-checkout-icon" aria-hidden="true">◈</span>
                 <div>
-                  <h4>Pay With Wallet ID</h4>
-                  <p>Enter the Wallet ID of the person authorizing this payment.</p>
+                  <h4>{walletIdPaymentAwaiting ? 'AWAITING FOR PAYMENT' : 'Pay With Wallet ID'}</h4>
+                  <p>{walletIdPaymentAwaiting ? 'Your request has been sent to the wallet owner.' : 'Enter the Wallet ID of the person authorizing this payment.'}</p>
                 </div>
               </div>
-              <label className="wallet-id-input-wrap">
-                <span className="wallet-id-input-icon" aria-hidden="true">◈</span>
-                <input
-                  value={payerWalletId}
-                  onChange={(event) => { setPayerWalletId(event.target.value.toUpperCase()); setPayerWalletIdVerified(false); setPayerWalletOwner(''); setWalletIdVerificationError(''); }}
-                  placeholder="Enter payer's Innovation Labs Wallet ID"
-                  aria-label="Innovation Labs Wallet ID"
-                  autoComplete="off"
-                  spellCheck="false"
-                />
-              </label>
-              <button
-                type="button"
-                className="wallet-id-verify-btn"
-                disabled={!payerWalletId.trim() || walletIdVerificationLoading}
-                onClick={async () => {
-                if (!payerWalletId.trim() || walletIdVerificationLoading) return;
-                setWalletIdVerificationLoading(true);
-                setWalletIdVerificationError('');
-                try {
-                  const result = await requestApi(`/api/wallet/identity?walletId=${encodeURIComponent(payerWalletId.trim())}`);
-                  if (result.walletId) {
-                    setPayerWalletId(result.walletId);
-                    setPayerWalletIdVerified(true);
-                    setPayerWalletOwner(result.ownerName || 'Innovation Labs wallet owner');
-                  } else {
-                    setPayerWalletIdVerified(false);
-                    setPayerWalletOwner('');
-                    setWalletIdVerificationError('This Wallet ID does not exist. Please check and try again.');
-                  }
-                } catch (requestError) {
-                  setPayerWalletIdVerified(false);
-                  setPayerWalletOwner('');
-                  setWalletIdVerificationError(requestError.message);
-                } finally {
-                  setWalletIdVerificationLoading(false);
-                }
-              }}
-              >
-                {walletIdVerificationLoading ? <><span className="wallet-id-spinner" aria-hidden="true" /> Verifying Wallet ID...</> : <><span aria-hidden="true">✓</span> Verify Wallet ID</>}
-              </button>
-              {payerWalletIdVerified && <p className="wallet-id-status wallet-id-status-success" role="status"><span aria-hidden="true">✓</span> Wallet Owner Verified · {payerWalletOwner}. Their Wallet PIN is required to authorize payment.</p>}
-              {walletIdVerificationError && <p className="wallet-id-status wallet-id-status-error" role="alert">{walletIdVerificationError}</p>}
+              {walletIdPaymentAwaiting ? <>
+                <dl className="wallet-id-request-summary">
+                  <div><dt>Payment amount</dt><dd>₹{Number(walletIdPaymentAmount ?? checkoutEstimate?.total ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>
+                  <div><dt>Wallet ID</dt><dd>{payerWalletId.replace(/^(@WL)[A-Z]{4}(\d{4})$/, '$1••••$2') || 'Verified Wallet owner'}</dd></div>
+                  <div><dt>Payment request status</dt><dd>{walletIdPaymentStatus === 'Processing' ? 'Payment Processing' : 'Awaiting Payment'}</dd></div>
+                </dl>
+                {walletIdRemainingSeconds != null && <p className="wallet-id-countdown" role="timer">
+                  Payment Request Expires In: {String(Math.floor(walletIdRemainingSeconds / 60)).padStart(2, '0')}:{String(walletIdRemainingSeconds % 60).padStart(2, '0')}
+                </p>}
+                <p>The wallet owner must approve this request and enter their Wallet PIN.</p>
+                <button type="button" className="secondary-btn" disabled={walletIdPaymentStatus === 'Processing'} onClick={cancelWalletIdPayment}>Cancel Payment</button>
+              </> : <>
+                {walletIdPaymentStatus === 'Expired' && <div className="alert-box" role="alert"><strong>Payment Request Expired</strong><p>Start a fresh request to continue checkout.</p></div>}
+                {walletIdPaymentStatus === 'Rejected' && <div className="alert-box" role="alert"><strong>Payment Request Rejected</strong><p>You can enter a Wallet ID and start a fresh request.</p></div>}
+                {walletIdPaymentStatus === 'Cancelled' && <div className="alert-box" role="status"><strong>Payment Request Cancelled</strong><p>You can enter a Wallet ID and start a fresh request.</p></div>}
+                <label className="wallet-id-input-wrap">
+                  <span className="wallet-id-input-icon" aria-hidden="true">◈</span>
+                  <input
+                    value={payerWalletId}
+                    onChange={(event) => { setPayerWalletId(event.target.value.toUpperCase()); setPayerWalletIdVerified(false); setPayerWalletOwner(''); setWalletIdVerificationError(''); }}
+                    placeholder="Enter another user's Innovation Labs Wallet ID"
+                    aria-label="Innovation Labs Wallet ID"
+                    autoComplete="off"
+                    spellCheck="false"
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="wallet-id-verify-btn"
+                  disabled={!payerWalletId.trim() || !checkoutReference || walletIdVerificationLoading}
+                  onClick={async () => {
+                    if (!payerWalletId.trim() || walletIdVerificationLoading) return;
+                    setWalletIdVerificationLoading(true);
+                    setWalletIdVerificationError('');
+                    setWalletIdRequestError('');
+                    try {
+                      const result = await requestApi('/api/checkout/wallet-id/verify', {
+                        method: 'POST',
+                        body: JSON.stringify({ walletId: payerWalletId.trim(), checkoutReference }),
+                      });
+                      if (!result.walletId) throw new Error('This Wallet ID does not exist. Please check and try again.');
+                      const paymentRequest = await onWalletIdRequest(result.walletId);
+                      if (!paymentRequest.requestId) throw new Error('The payment request could not be created. Please retry.');
+                      const confirmedWalletId = paymentRequest.payerWalletId || result.walletId;
+                      setPayerWalletId(confirmedWalletId);
+                      setPayerWalletIdVerified(true);
+                      setPayerWalletOwner(result.ownerName || 'Innovation Labs wallet owner');
+                      setWalletIdRequestId(paymentRequest.requestId);
+                      setWalletIdPaymentStatus(paymentRequest.status || 'Pending');
+                      setWalletIdPaymentAmount(paymentRequest.amount ?? checkoutEstimate?.total ?? null);
+                      setWalletIdExpiresAt(paymentRequest.expiresAt || '');
+                      if (paymentRequest.serverTime) {
+                        setWalletIdServerOffset(new Date(paymentRequest.serverTime).getTime() - Date.now());
+                      }
+                    } catch (requestError) {
+                      setPayerWalletIdVerified(false);
+                      setPayerWalletOwner('');
+                      setWalletIdVerificationError(requestError.message);
+                    } finally {
+                      setWalletIdVerificationLoading(false);
+                    }
+                  }}
+                >
+                  {walletIdVerificationLoading ? <><span className="wallet-id-spinner" aria-hidden="true" /> Verifying Wallet ID...</> : <><span aria-hidden="true">✓</span> Verify ID</>}
+                </button>
+                {payerWalletIdVerified && <p className="wallet-id-status wallet-id-status-success" role="status"><span aria-hidden="true">✓</span> Wallet owner verified · {payerWalletOwner}.</p>}
+                {walletIdVerificationError && <p className="wallet-id-status wallet-id-status-error" role="alert">{walletIdVerificationError}</p>}
+                {walletIdRequestError && <p className="wallet-id-status wallet-id-status-error" role="alert">{walletIdRequestError}</p>}
+              </>}
             </section>}
-            {paymentMethod === 'wallet' && walletPaymentMode !== 'qr' && <section className="wallet-checkout-summary">
+            {paymentMethod === 'wallet' && walletPaymentMode === 'pin' && <section className="wallet-checkout-summary">
               <h4>Wallet Payment</h4>
               {walletQuoteLoading ? <p>Checking wallet balance...</p> : walletQuoteError ? <><p role="alert">{walletQuoteError}</p><button className="secondary-btn small" type="button" onClick={() => setWalletQuoteRefreshKey((current) => current + 1)}>Retry</button></> : hasValidWalletQuote && !walletQuoteMatchesEstimate ? <><p role="alert">The Wallet amount does not match the latest order total. Refresh the Wallet check before paying.</p><button className="secondary-btn small" type="button" onClick={() => setWalletQuoteRefreshKey((current) => current + 1)}>Refresh Wallet check</button></> : hasValidWalletQuote && <>
                 <div className="summary-row"><span>Current Wallet Balance</span><strong>₹{Number(walletQuote.balance).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
@@ -5594,13 +5820,15 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
             </div>
 
             <div className="checkout-actions space-between">
-              <button className="secondary-btn" onClick={() => setCheckoutStep(4)}>Back</button>
+              <div><button className="secondary-btn" disabled={walletIdRequestActive} onClick={() => setCheckoutStep(4)}>Back</button><button className="secondary-btn" onClick={() => onRequestExit('/')}>Cancel Checkout</button></div>
               <div className="payment-actions">
-                {walletPaymentMode === 'qr'
-                  ? qrPaymentAwaiting
-                    ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />Awaiting QR Payment</div>
-                    : renderCheckoutAction()
-                  : renderCheckoutAction()}
+                {walletPaymentMode === 'wallet-id'
+                  ? walletIdPaymentAwaiting && <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />AWAITING FOR PAYMENT</div>
+                  : walletPaymentMode === 'qr'
+                    ? qrPaymentAwaiting
+                      ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />Awaiting QR Payment</div>
+                      : renderCheckoutAction()
+                    : renderCheckoutAction()}
               </div>
             </div>
           </div>
@@ -5610,9 +5838,11 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
           <aside className="checkout-order-summary" aria-labelledby="checkout-order-summary-title">
             <h3 id="checkout-order-summary-title">Place Your Order</h3>
             <div className="checkout-order-summary-action">
-              {qrPaymentAwaiting
-                ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />Awaiting QR Payment</div>
-                : renderCheckoutAction('primary-btn full')}
+              {walletPaymentMode === 'wallet-id'
+                ? walletIdPaymentAwaiting && <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />AWAITING FOR PAYMENT</div>
+                : qrPaymentAwaiting
+                  ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />Awaiting QR Payment</div>
+                  : renderCheckoutAction('primary-btn full')}
             </div>
             <div className="checkout-summary-service">
               <span>Project service</span>
@@ -6918,6 +7148,89 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
   </section>;
 }
 
+function WalletPaymentRequestsPage() {
+  const navigate = useNavigate();
+  const [requests, setRequests] = useState([]);
+  const [selectedRequest, setSelectedRequest] = useState(null);
+  const [pin, setPin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const loadRequests = useCallback(async () => {
+    const result = await requestApi('/api/wallet/payment-requests/pending');
+    const nextRequests = result.requests || [];
+    setRequests(nextRequests);
+    setSelectedRequest((current) => current && nextRequests.some((request) => request.requestId === current.requestId)
+      ? current
+      : null);
+  }, []);
+
+  useRealtimeEvents(true, (eventName, data) => {
+    if (eventName === 'wallet_payment_request'
+      || eventName === 'wallet_payment_request_updated'
+      && requests.some((request) => request.requestId === data?.requestId)) {
+      loadRequests().catch((requestError) => setError(requestError.message));
+    }
+  });
+
+  useEffect(() => {
+    loadRequests().catch((requestError) => setError(requestError.message));
+    const intervalId = window.setInterval(() => {
+      loadRequests().catch((requestError) => setError(requestError.message));
+    }, 2500);
+    return () => window.clearInterval(intervalId);
+  }, [loadRequests]);
+
+  const rejectRequest = async (requestId) => {
+    setBusy(true);
+    setError('');
+    try {
+      await requestApi(`/api/wallet/payment-requests/${encodeURIComponent(requestId)}/reject`, { method: 'POST', body: '{}' });
+      setSelectedRequest(null);
+      setPin('');
+      await loadRequests();
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const approveRequest = async () => {
+    if (!selectedRequest || pin.length !== 4 || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await requestApi(`/api/wallet/payment-requests/${encodeURIComponent(selectedRequest.requestId)}/approve`, {
+        method: 'POST',
+        body: JSON.stringify({ pin }),
+      });
+      navigate(`/order-placed/${encodeURIComponent(result.order.orderId)}`, { state: { order: result.order } });
+    } catch (requestError) {
+      setPin('');
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <main className="page-shell"><div className="container narrow-container">
+    <button type="button" className="wallet-payment-back" onClick={() => navigate('/wallet')}>← <span>Wallet</span></button>
+    <header className="wallet-payment-header"><span className="eyebrow">WALLET PAYMENT REQUEST</span><h1>Approve Payment</h1><p>Review the fixed checkout amount before authorizing it with your Wallet PIN.</p></header>
+    {error && <div className="alert-box" role="alert">{error}</div>}
+    {!requests.length && <section className="wallet-payment-card"><p>No pending payment requests.</p></section>}
+    {requests.map((request) => <section className="wallet-payment-card" key={request.requestId}>
+      <p>Payment request from Innovation Labs</p>
+      <div className="summary-row"><span>Requested by</span><strong>{request.requesterName}</strong></div>
+      <div className="summary-row"><span>Checkout reference</span><strong>{request.checkoutReference}</strong></div>
+      <div className="summary-row total"><span>Fixed amount</span><strong>₹{Number(request.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
+      {selectedRequest?.requestId === request.requestId
+        ? <div className="wallet-pin-approval"><label>Wallet PIN<input type="password" inputMode="numeric" maxLength={4} value={pin} onChange={(event) => setPin(event.target.value.replace(/\D/g, ''))} /></label><div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => rejectRequest(request.requestId)}>Reject Payment</button><button type="button" className="primary-btn" disabled={busy || pin.length !== 4} onClick={approveRequest}>{busy ? 'Processing...' : 'Approve Payment'}</button></div></div>
+        : <div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => rejectRequest(request.requestId)}>Reject Payment</button><button type="button" className="primary-btn" disabled={busy} onClick={() => { setSelectedRequest(request); setPin(''); setError(''); }}>Review Payment</button></div>}
+    </section>)}
+  </div></main>;
+}
+
 function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
   const navigate = useNavigate();
   const [wallet, setWallet] = useState(null);
@@ -7877,7 +8190,8 @@ function AdminDashboardPage() {
   const adminSections = [
     ['/admin/subscription-finished', 'Subscription Finished', 'Search paid subscriptions that have expired and review their purchase details.'],
     ['/admin/account-restrictions', 'Account Restrictions', 'Review age-restricted accounts and require re-verification before access is restored.'],
-    ['/admin/orders', 'Orders', 'Review the live order queue, approvals, and delivery estimates.'],
+    ['/admin/part-orders', 'Part Orders', 'Review physical product and Promo Code purchases, approvals, and delivery estimates.'],
+    ['/admin/subscription-orders', 'Subscription Orders', 'Review plan purchases, renewals, upgrades, payments, and allocated credits.'],
     ['/admin/rewards', 'Reward Points', 'Review reward balances, earning history, conversions, and earning rules.'],
     ['/admin/product-reviews', 'Product Reviews', 'Moderate verified customer product reviews and uploaded images.'],
     ['/admin/promo-codes', 'Wallet Promo Codes', 'Create and track codes that add value to customer wallets.'],
@@ -8306,7 +8620,8 @@ function AdminWorkspaceLayout({ currentPath, children }) {
     { path: '/admin', label: 'Dashboard' },
     { path: '/admin/subscription-finished', label: 'Subscription Finished' },
     { path: '/admin/account-restrictions', label: 'Account Restrictions' },
-    { path: '/admin/orders', label: 'Orders' },
+    { path: '/admin/part-orders', label: 'Part Orders' },
+    { path: '/admin/subscription-orders', label: 'Subscription Orders' },
     { path: '/admin/rewards', label: 'Reward Points' },
     { path: '/admin/product-reviews', label: 'Product Reviews' },
     { path: '/admin/promo-codes', label: 'Wallet Promo Codes' },
@@ -8383,9 +8698,8 @@ function AdminOrdersPage({ auth }) {
   return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Admin</span><h2>Orders</h2></div>{error && <div className="alert-box">{error}</div>}{orders.length ? <div className="orders-list">{orders.map((order) => <div className="order-card" key={order._id}><div className="order-row"><span>Order ID</span><strong>#{order.orderId || order._id}</strong></div><div className="order-row"><span>Order Type</span><strong>{order.orderType === 'PROMO_CODE' ? 'Promo Code (Digital)' : 'Product'}</strong></div>{order.orderType !== 'PROMO_CODE' && <div className="order-row"><span>Products</span><strong>{summarizeOrderProducts(order)}</strong></div>}<div className="order-row"><span>Customer</span><strong>{order.userName}</strong></div><div className="order-row"><span>Items</span><strong>{(order.items || []).reduce((sum, item) => sum + (item.quantity || 0), 0)}</strong></div>{order.orderType === 'PROMO_CODE' && <><div className="order-row"><span>Promo Code</span><strong>{order.promoCode}</strong></div><div className="order-row"><span>Value</span><strong>₹{(Number(order.promoCodeAmountPaise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div><div className="order-row"><span>Redemption</span><strong>{order.promoCodeStatus === 'REDEEMED' ? 'Redeemed' : 'Purchased'}</strong></div></>}<div className="order-row"><span>Total</span><strong>₹{Number(order.total || 0).toLocaleString('en-IN')}</strong></div><div className="order-row"><span>Payment</span><strong>{order.paymentMethod}</strong></div><div className="order-row"><span>Status</span><strong>{order.orderStatus}</strong></div>{order.estimatedDelivery && order.deliveryRequired !== false && <div className="order-row"><span>ETA</span><strong>{new Date(order.estimatedDelivery).toLocaleDateString()}</strong></div>}{order.orderStatus === 'Cancelled' && <span className="order-cancelled-stamp">CANCELLED</span>}{order.orderType !== 'PROMO_CODE' && order.orderStatus !== 'Cancelled' && order.orderStatus !== 'Completed' && <div className="custom-order-actions">{order.orderStatus !== 'Accepted' && <button className="primary-btn small" disabled={busyId === order._id} onClick={() => updateOrder(order._id, 'accept')}>{busyId === order._id ? 'Working...' : 'Accept'}</button>}{order.orderStatus !== 'Declined' && <button className="secondary-btn small" disabled={busyId === order._id} onClick={() => updateOrder(order._id, 'decline')}>Decline</button>}</div>}</div>)} </div> : <div className="empty-state"><h3>No active orders yet.</h3></div>}</div>;
 }
 
-function AdminOrdersPageV2({ auth }) {
+function AdminOrdersPageV2({ auth, category }) {
   const [orders, setOrders] = useState([]);
-  const [subscriptionOrders, setSubscriptionOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [realtimeVersion, setRealtimeVersion] = useState(0);
@@ -8399,11 +8713,15 @@ function AdminOrdersPageV2({ auth }) {
     if (!auth?.isAdmin) return;
     let active = true;
     const refreshOrders = () => {
-      requestApi('/api/admin/orders')
+      const endpoint = category === 'SUBSCRIPTION_ORDER'
+        ? '/api/admin/subscription-orders'
+        : '/api/admin/part-orders';
+      requestApi(endpoint)
         .then((result) => {
           if (!active) return;
-          setOrders(result.orders || []);
-          setSubscriptionOrders(result.subscriptionOrders || []);
+          setOrders(category === 'SUBSCRIPTION_ORDER'
+            ? result.subscriptionOrders || []
+            : result.orders || []);
           setError('');
         })
         .catch((requestError) => {
@@ -8421,7 +8739,7 @@ function AdminOrdersPageV2({ auth }) {
       window.clearInterval(interval);
       window.removeEventListener('focus', refreshOrders);
     };
-  }, [auth, realtimeVersion]);
+  }, [auth, category, realtimeVersion]);
 
   if (!auth?.isAdmin) return <div className="empty-state"><h3>Admin access is required.</h3></div>;
   if (loading) return <div className="empty-state"><h3>Loading live orders...</h3></div>;
@@ -8430,26 +8748,30 @@ function AdminOrdersPageV2({ auth }) {
     ? new Date(value).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })
     : '—';
   const formatAmount = (value) => `₹${(Number(value || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
-  const hasOrders = subscriptionOrders.length > 0 || orders.length > 0;
-
-  return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Admin</span><h2>Orders</h2></div>{error && <div className="alert-box">{error}</div>}{hasOrders ? <div className="orders-list">
-    {subscriptionOrders.map((order) => <article className="order-card admin-subscription-order" key={order.id}>
+  const isSubscriptionPage = category === 'SUBSCRIPTION_ORDER';
+  const title = isSubscriptionPage ? 'Subscription Orders' : 'Part Orders';
+  return <div className="admin-panel-wrap"><div className="section-title left"><span className="eyebrow">Admin</span><h2>{title}</h2></div>{error && <div className="alert-box">{error}</div>}{orders.length ? <div className="orders-list">
+    {isSubscriptionPage ? orders.map((order) => <article className="order-card admin-subscription-order" key={order.id}>
       <span className="admin-subscription-label">SUBSCRIPTION ORDER</span>
-      <div className="admin-subscription-name">{displayPlanName(order.plan)}</div>
+      <div className="admin-subscription-name">{order.subscriptionName || displayPlanName(order.plan)}</div>
       <div className="order-row"><span>Customer</span><strong>{order.customerName}</strong></div>
       <div className="order-row"><span>Email</span><strong>{order.customerEmail || '—'}</strong></div>
       <div className="order-row"><span>Order / Transaction ID</span><strong>#{order.orderId}</strong></div>
-      <div className="order-row"><span>Subscription</span><strong>{displayPlanName(order.plan)}</strong></div>
-      <div className="order-row"><span>Duration</span><strong>{order.durationMonths} Month{order.durationMonths === 1 ? '' : 's'}</strong></div>
+      <div className="order-row"><span>Transaction type</span><strong>{order.transactionType === 'renewal' ? 'Renewal' : order.transactionType === 'upgrade' ? 'Upgrade' : order.transactionType === 'bill_purchase' ? 'AI bill purchase' : order.transactionType === 'credit_purchase' ? 'AI credit purchase' : 'Plan purchase'}</strong></div>
+      {order.durationMonths && <div className="order-row"><span>Duration</span><strong>{order.durationMonths} Month{order.durationMonths === 1 ? '' : 's'}</strong></div>}
+      {order.quantity && <div className="order-row"><span>Bills purchased</span><strong>{order.quantity}</strong></div>}
       <div className="order-row"><span>Purchase date</span><strong>{formatDate(order.purchaseDate)}</strong></div>
       <div className="order-row"><span>Starting date</span><strong>{formatDate(order.startDate)}</strong></div>
       <div className="order-row"><span>Expiration date</span><strong>{formatDate(order.expiryDate)}</strong></div>
       <div className="order-row"><span>Total amount</span><strong>{formatAmount(order.amountPaise)}</strong></div>
       <div className="order-row"><span>Payment method</span><strong>{order.paymentMethod === 'Wallet' ? 'Innovation Labs Wallet' : order.paymentMethod}</strong></div>
+      <div className="order-row"><span>Payment reference</span><strong>{order.paymentReference}</strong></div>
       <div className="order-row"><span>Payment status</span><strong>{order.paymentStatus}</strong></div>
+      <div className="order-row"><span>AI credits allocated</span><strong>{Number(order.creditsAllocated || 0).toLocaleString('en-IN')}</strong></div>
+      {order.billsAllocated != null && <div className="order-row"><span>AI bills allocated</span><strong>{Number(order.billsAllocated).toLocaleString('en-IN')}</strong></div>}
+      {order.creditsDeducted > 0 && <div className="order-row"><span>Credits used</span><strong>{Number(order.creditsDeducted).toLocaleString('en-IN')}</strong></div>}
       <div className="order-row"><span>Subscription status</span><strong>{order.subscriptionStatus}</strong></div>
-    </article>)}
-    {orders.map((order) => {
+    </article>) : orders.map((order) => {
     const orderId = order.orderId || order._id;
     const orderStatus = order.orderStatus || 'Processing';
     const productSummary = summarizeOrderProducts(order);
@@ -8457,8 +8779,8 @@ function AdminOrdersPageV2({ auth }) {
     const canManageRemainingItems = order.orderType !== 'PROMO_CODE'
       && activeOrderItemCount(order) > 0
       && ['Processing', 'Pending Review', 'Pending', 'Accepted'].includes(orderStatus);
-    return <div className="order-card" key={order._id || orderId}><div className="order-row"><span>Order ID</span><strong>#{orderId}</strong></div><div className="order-row"><span>Order Type</span><strong>{order.orderType === 'PROMO_CODE' ? 'Promo Code (Digital)' : 'Product'}</strong></div>{order.orderType !== 'PROMO_CODE' && <div className="order-row"><span>Products</span><strong>{productSummary}</strong></div>}<div className="order-row"><span>Customer</span><strong>{order.userName}</strong></div><div className="order-row admin-current-subscription"><span>Current Subscription</span><strong>{subscription?.displayName || 'No Active Subscription'}{subscription?.expiryDate && <small>{subscription.status === 'Active' ? 'Expires' : 'Expired'} {new Date(subscription.expiryDate).toLocaleDateString()}</small>}</strong></div><div className="order-row"><span>Items</span><strong>{activeOrderItemCount(order)} active</strong></div>{order.orderType === 'PROMO_CODE' && <><div className="order-row"><span>Promo Code</span><strong>{order.promoCode || '—'}</strong></div><div className="order-row"><span>Value</span><strong>₹{(Number(order.promoCodeAmountPaise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></>}{order.orderType !== 'PROMO_CODE' && <div className="order-row"><span>Total</span><strong>₹{Number(order.total || 0).toLocaleString('en-IN')}</strong></div>}<div className="order-row"><span>Payment</span><strong>{order.paymentMethod || 'Not set'}</strong></div><div className="order-row"><span>Status</span><strong>{orderStatus}</strong></div>{order.estimatedDelivery && order.deliveryRequired !== false && <div className="order-row"><span>ETA</span><strong>{new Date(order.estimatedDelivery).toLocaleDateString()}</strong></div>}{order.orderStatus === 'Cancelled' && <span className="order-cancelled-stamp">CANCELLED</span>}<div className="custom-order-actions"><Link className="primary-btn small" to={`/admin/orders/${encodeURIComponent(orderId)}`}>View Details</Link>{canManageRemainingItems && <Link className="secondary-btn small" to={`/admin/orders/${encodeURIComponent(orderId)}`}>Manage</Link>}</div></div>;
-  })}</div> : <div className="empty-state"><h3>No orders yet.</h3></div>}</div>;
+    return <div className="order-card" key={order._id || orderId}><div className="order-row"><span>Order ID</span><strong>#{orderId}</strong></div><div className="order-row"><span>Order Type</span><strong>{order.orderType === 'PROMO_CODE' ? 'Wallet Promo Code' : order.orderType === 'DISCOUNT_CODE' ? 'Discount Promo Code' : 'Physical Product'}</strong></div>{order.orderType !== 'PROMO_CODE' && <div className="order-row"><span>Products</span><strong>{productSummary}</strong></div>}<div className="order-row"><span>Customer</span><strong>{order.userName}</strong></div><div className="order-row admin-current-subscription"><span>Current Subscription</span><strong>{subscription?.displayName || 'No Active Subscription'}{subscription?.expiryDate && <small>{subscription.status === 'Active' ? 'Expires' : 'Expired'} {new Date(subscription.expiryDate).toLocaleDateString()}</small>}</strong></div><div className="order-row"><span>Items</span><strong>{activeOrderItemCount(order)} active</strong></div>{order.orderType === 'PROMO_CODE' && <><div className="order-row"><span>Promo Code</span><strong>{order.promoCode || '—'}</strong></div><div className="order-row"><span>Value</span><strong>₹{(Number(order.promoCodeAmountPaise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div></>}{order.orderType !== 'PROMO_CODE' && <div className="order-row"><span>Total</span><strong>₹{Number(order.total || 0).toLocaleString('en-IN')}</strong></div>}<div className="order-row"><span>Payment</span><strong>{order.paymentMethod || 'Not set'}</strong></div><div className="order-row"><span>Status</span><strong>{orderStatus}</strong></div>{order.estimatedDelivery && order.deliveryRequired !== false && <div className="order-row"><span>ETA</span><strong>{new Date(order.estimatedDelivery).toLocaleDateString()}</strong></div>}{order.orderStatus === 'Cancelled' && <span className="order-cancelled-stamp">CANCELLED</span>}<div className="custom-order-actions"><Link className="primary-btn small" to={`/admin/orders/${encodeURIComponent(orderId)}`}>View Details</Link>{canManageRemainingItems && <Link className="secondary-btn small" to={`/admin/orders/${encodeURIComponent(orderId)}`}>Manage</Link>}</div></div>;
+  })}</div> : <div className="empty-state"><h3>No {isSubscriptionPage ? 'subscription' : 'part'} orders yet.</h3></div>}</div>;
 }
 
 function AdminOrderDetailPage({ auth }) {
@@ -9118,7 +9440,21 @@ function OrdersPage({ orders, auth, loading, error, serverNow, onRefreshOrders, 
                       ? formatEstimatedDelivery(order.estimatedDelivery, new Date(deliveryNow))
                       : order.orderStatus === 'Accepted' ? 'DELIVERY DATE NOT SET' : 'DELIVERY ESTIMATE PENDING'}
                 </p>
-                {activeOrderItemCount(order) > 0 ? <ul className="order-card-products" aria-label="Active products in this order">
+                {order.orderType === 'SUBSCRIPTION' ? <section className="account-subscription-order-details" aria-label="Subscription purchase details">
+                  <h3>{order.subscriptionName || `${displayPlanName(order.plan)} Subscription`}</h3>
+                  <div className="order-row"><span>Transaction</span><strong>{order.transactionType === 'renewal' ? 'Renewal' : order.transactionType === 'upgrade' ? 'Upgrade' : order.transactionType === 'bill_purchase' ? 'AI bill purchase' : order.transactionType === 'credit_purchase' ? 'AI credit purchase' : 'Plan purchase'}</strong></div>
+                  <div className="order-row"><span>Amount paid</span><strong>₹{Number(order.total || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
+                  <div className="order-row"><span>Payment method</span><strong>{order.paymentMethod === 'Wallet' ? 'Innovation Labs Wallet' : order.paymentMethod}</strong></div>
+                  {order.plan && <div className="order-row"><span>Subscription plan</span><strong>{displayPlanName(order.plan)}</strong></div>}
+                  {order.durationMonths && <div className="order-row"><span>Duration</span><strong>{order.durationMonths} Month{order.durationMonths === 1 ? '' : 's'}</strong></div>}
+                  {order.quantity && <div className="order-row"><span>Bills purchased</span><strong>{order.quantity}</strong></div>}
+                  {order.creditsAllocated > 0 && <div className="order-row"><span>AI credits allocated</span><strong>{Number(order.creditsAllocated).toLocaleString('en-IN')}</strong></div>}
+                  {order.billsAllocated != null && <div className="order-row"><span>AI bills allocated</span><strong>{Number(order.billsAllocated).toLocaleString('en-IN')}</strong></div>}
+                  {order.creditsDeducted > 0 && <div className="order-row"><span>Credits used</span><strong>{Number(order.creditsDeducted).toLocaleString('en-IN')}</strong></div>}
+                  {order.startDate && <div className="order-row"><span>Start date</span><strong>{new Date(order.startDate).toLocaleDateString('en-IN')}</strong></div>}
+                  {order.expiryDate && <div className="order-row"><span>Expiry date</span><strong>{new Date(order.expiryDate).toLocaleDateString('en-IN')}</strong></div>}
+                  <div className="order-row"><span>Subscription status</span><strong>{order.subscriptionStatus}</strong></div>
+                </section> : activeOrderItemCount(order) > 0 ? <ul className="order-card-products" aria-label="Active products in this order">
                   {(order.items || []).flatMap((item, index) => {
                     const { activeQuantity } = getOrderItemQuantities(item);
                     return activeQuantity > 0 ? [
@@ -9130,12 +9466,12 @@ function OrdersPage({ orders, auth, loading, error, serverNow, onRefreshOrders, 
                     ] : [];
                   })}
                 </ul> : <p className="account-order-delivery">No active products remain in this order.</p>}
-                <div className="order-actions">
+                {order.orderType !== 'SUBSCRIPTION' && <div className="order-actions">
                   <Link to={`/order-placed/${encodeURIComponent(order.orderId || order.id)}`} state={{ order }} className="primary-btn small">VIEW DETAILS</Link>
                   {order.cancelEligible && !order.arrived && !order.cancelledAt && !['Cancelled', 'Declined', 'Delivered', 'Completed'].includes(order.orderStatus)
                     && <button className="secondary-btn small" onClick={() => onCancelOrder(order)}>CANCEL ORDER</button>}
                   {order.refundEligible && !order.cancelEligible && <Link className="secondary-btn small" to={`/refund/${encodeURIComponent(order.id)}`}>Refund</Link>}
-                </div>
+                </div>}
               </article>
             ))}
           </div>
@@ -10359,6 +10695,7 @@ function OrderCancellationModal({ order, onCancel, onConfirm }) {
     }} /></label>)}</div>
       : <p>{selectedItems.map(({ item, quantity }) => `${item.name} × ${quantity}`).join(', ') || 'No eligible product selected.'}</p>}
     {containsNonCancellable && <p className="non-cancellable-order-notice">Your order contains a non-cancellable product. Only eligible products can be cancelled. The amount for the non-cancellable product will not be refunded through customer-initiated cancellation.</p>}
+    {containsNonCancellable && <section className="order-cancellation-non-cancellable"><h4>Non-cancellable items</h4>{(order.items || []).filter((item) => item.cancellable === false && Number(item.cancelledQuantity || 0) < Number(item.quantity || 0)).map((item) => <p className="non-cancellable-item-warning" key={item.id || item.name}><strong className="non-cancellable-item-name">{item.name}</strong> — This item is non-cancellable. If you cancel this order, you will not receive a refund for this item.</p>)}</section>}
     <div className="order-cancellation-refund-quote" aria-live="polite">
       {quoteLoading && <p>Calculating your refund estimate...</p>}
       {quoteError && <p className="voice-error" role="alert">{quoteError} <button type="button" className="secondary-btn small" onClick={() => setQuoteRefreshKey((key) => key + 1)}>Retry</button></p>}
