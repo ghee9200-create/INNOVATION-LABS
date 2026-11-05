@@ -6851,7 +6851,7 @@ app.post('/api/checkout/payment-qr/pay', requireSession, requireDatabase, requir
       const deliveryRequired = orderRequiresDelivery(safeItems);
       const checkoutData = calculateOrder(safeItems, attempt.service);
       const calculatedBase = checkoutData.totalPaise;
-      if (attempt.totalPaise !== calculatedBase || attempt.totalPaise < 0) throw Object.assign(new Error('The checkout amount no longer matches the order.'), { status: 409 });
+      if (attempt.totalPaise > calculatedBase || attempt.totalPaise < 0) throw Object.assign(new Error('The checkout amount no longer matches the order.'), { status: 409 });
       const inventoryDeductedAt = await applyInventoryReduction(session, safeItems, { validateProductSnapshot: true });
       const orderId = `IL-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
       const before = wallet.balancePaise;
@@ -10486,10 +10486,11 @@ app.post('/api/orders', requireSession, requireDatabase, requirePurchaseAge, asy
       headers: { Authorization: `Basic ${Buffer.from(`${razorpayKeyId}:${razorpayKeySecret}`).toString('base64')}` },
     });
     const payment = await paymentResponse.json();
-    if (!paymentResponse.ok || payment.currency !== 'INR' || payment.status !== 'captured' || !Number.isSafeInteger(payment.amount)) {
+    const confirmedAmountPaise = Number(payment.amount);
+    if (!paymentResponse.ok || payment.currency !== 'INR' || payment.status !== 'captured' || !Number.isSafeInteger(confirmedAmountPaise) || confirmedAmountPaise < 0) {
       return res.status(409).json({ message: 'Payment amount or capture status could not be verified; no order or reward points were created.' });
     }
-    paymentAmountPaise = payment.amount;
+    paymentAmountPaise = confirmedAmountPaise;
     paymentOrderId = payment.order_id || '';
     paymentVerified = true;
   } catch {
@@ -10509,13 +10510,14 @@ app.post('/api/orders', requireSession, requireDatabase, requirePurchaseAge, asy
     req.session.sub,
     Math.max(0, calculated.totalPaise - discountAmountPaise),
   );
-  const payableTotalPaise = Math.max(0, calculated.totalPaise - discountAmountPaise - subscriptionDiscount.amountPaise);
+  let expectedCheckoutAmountPaise = null;
   if (checkoutReference) {
     const checkout = await CheckoutAttempt.findOne({
       reference: checkoutReference, userId: req.session.sub, status: 'Open',
     }).select('razorpayOrderId items service totalPaise').lean();
     if (!checkout || !checkout.razorpayOrderId || checkout.razorpayOrderId !== paymentOrderId
-      || !checkoutAttemptMatches(checkout, { items: safeItems, service, totalPaise: payableTotalPaise })) {
+      || !Number.isSafeInteger(checkout.totalPaise)
+      || !checkoutAttemptMatches(checkout, { items: safeItems, service, totalPaise: checkout.totalPaise })) {
       try {
         await refundRazorpayPayment(paymentId, paymentAmountPaise);
         await CheckoutAttempt.updateOne(
@@ -10535,8 +10537,10 @@ app.post('/api/orders', requireSession, requireDatabase, requirePurchaseAge, asy
         return res.status(409).json({ message: `Payment could not be matched or refunded: ${refundError.message}` });
       }
     }
+    expectedCheckoutAmountPaise = checkout.totalPaise;
   }
-  if (paymentAmountPaise !== payableTotalPaise) {
+  const expectedPaymentAmountPaise = expectedCheckoutAmountPaise ?? Math.max(0, calculated.totalPaise - discountAmountPaise - subscriptionDiscount.amountPaise);
+  if (paymentAmountPaise !== expectedPaymentAmountPaise) {
     try { await refundRazorpayPayment(paymentId, paymentAmountPaise); } catch (refundError) {
       if (checkoutReference) await CheckoutAttempt.updateOne(
         { reference: checkoutReference, userId: req.session.sub, status: 'Open' },
@@ -10548,7 +10552,7 @@ app.post('/api/orders', requireSession, requireDatabase, requirePurchaseAge, asy
       { reference: checkoutReference, userId: req.session.sub, status: 'Open' },
       { $set: { status: 'Interrupted', paymentStatus: 'Failed', paymentReference: paymentId, reason: 'Captured payment was refunded because its amount did not match the checkout.' } },
     );
-    return res.status(409).json({ message: 'Payment amount did not match the server-calculated order total; the captured payment was refunded.' });
+    return res.status(409).json({ message: 'Payment amount did not match the recorded checkout amount; the captured payment was refunded.' });
   }
   if (checkoutReference) {
     const checkoutAttempt = await CheckoutAttempt.findOneAndUpdate(
@@ -10589,9 +10593,8 @@ app.post('/api/orders', requireSession, requireDatabase, requirePurchaseAge, asy
         Math.max(0, calculated.totalPaise - discountAmountPaise),
         session,
       );
-      const currentPayableTotalPaise = Math.max(0, calculated.totalPaise - discountAmountPaise - currentSubscriptionDiscount.amountPaise);
-      if (currentPayableTotalPaise !== paymentAmountPaise) {
-        throw Object.assign(new Error('Your subscription benefit or order total changed during payment. The payment will be refunded.'), { status: 409 });
+      if (paymentAmountPaise !== expectedPaymentAmountPaise) {
+        throw Object.assign(new Error('The captured payment no longer matches the recorded checkout amount. The payment will be refunded.'), { status: 409 });
       }
       const inventoryDeductedAt = await applyInventoryReduction(session, safeItems, { validateProductSnapshot: true });
       const [order] = await Order.create([{
@@ -10614,7 +10617,7 @@ app.post('/api/orders', requireSession, requireDatabase, requirePurchaseAge, asy
         codingCharge: money(calculated.codingChargePaise),
         buildingCharge: money(calculated.buildingChargePaise),
         deliveryCharge: money(calculated.deliveryChargePaise),
-        total: money(payableTotalPaise),
+        total: money(expectedPaymentAmountPaise),
         paymentStatus: 'Paid',
         paymentMethod: 'Razorpay',
         verifiedAmountPaidPaise: paymentAmountPaise,
@@ -12416,13 +12419,14 @@ app.post('/api/webhooks/razorpay/inquiry-payments', requireDatabase, async (req,
   const payment = req.body?.payload?.payment?.entity;
   if (event === 'payment.captured' && payment?.order_id && payment?.id) {
     try {
+      const paymentAmountPaise = Number(payment.amount);
       const inquiryAttempt = await InquiryPaymentAttempt.exists({ razorpayOrderId: payment.order_id });
       if (inquiryAttempt) {
         await confirmInquiryRazorpayPayment({ orderId: payment.order_id, paymentId: payment.id });
       } else {
         const checkoutAttempt = await CheckoutAttempt.findOne({
           razorpayOrderId: payment.order_id,
-          totalPaise: payment.amount,
+          totalPaise: Number.isSafeInteger(paymentAmountPaise) ? paymentAmountPaise : -1,
           currency: payment.currency,
         });
         if (checkoutAttempt && checkoutAttempt.status !== 'Completed') {
