@@ -5146,7 +5146,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
   const cartSubtotal = cart.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0);
   const showFinalCharges = displayedCheckoutStep >= 2;
   const checkoutActionLabel = displayedCheckoutStep === 5
-    ? walletPaymentMode === 'wallet-id' && walletIdPaymentStatus === 'Pending' ? 'Awaiting Approval' : 'Pay Now'
+    ? walletPaymentMode === 'wallet-id' ? 'Next' : 'Pay Now'
     : displayedCheckoutStep === 6 ? 'Order Confirmed' : 'Next';
   const formatCheckoutMoney = (value) => `₹${Number(value || 0).toLocaleString('en-IN', {
     minimumFractionDigits: 2,
@@ -5197,7 +5197,8 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
         || walletQuote.balance < walletQuote.total
       )
       || displayedCheckoutStep === 5 && paymentMethod === 'wallet' && walletPaymentMode === 'qr' && !checkoutQrVerified
-      || displayedCheckoutStep === 5 && paymentMethod === 'wallet' && walletPaymentMode === 'wallet-id' && !payerWalletIdVerified
+      || displayedCheckoutStep === 5 && paymentMethod === 'wallet' && walletPaymentMode === 'wallet-id'
+        && (!/^@WL[A-Z]{4}\d{4}$/.test(payerWalletId.trim().toUpperCase()) || !checkoutReference)
       || walletIdPaymentAwaiting
     )
     || displayedCheckoutStep === 5 && (
@@ -5492,6 +5493,50 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
     }
   };
 
+  const verifyAndRequestWalletIdPayment = async () => {
+    const walletId = payerWalletId.trim().toUpperCase();
+    if (!/^@WL[A-Z]{4}\d{4}$/.test(walletId)) {
+      setWalletIdVerificationError('Enter a valid Innovation Labs Wallet ID.');
+      return;
+    }
+    if (!checkoutReference) {
+      setWalletIdVerificationError('Checkout is not ready. Please retry.');
+      return;
+    }
+    setWalletIdVerificationLoading(true);
+    setWalletIdVerificationError('');
+    setWalletIdRequestError('');
+    try {
+      const verified = await requestApi('/api/checkout/wallet-id/verify', {
+        method: 'POST',
+        body: JSON.stringify({ walletId, checkoutReference }),
+      });
+      if (!verified.walletId || verified.checkoutReference !== checkoutReference) {
+        throw new Error('Wallet ID verification could not be completed. Please try again.');
+      }
+      const paymentRequest = await onWalletIdRequest(verified.walletId);
+      if (!paymentRequest.requestId) {
+        throw new Error('The payment request could not be created. Please retry.');
+      }
+      setPayerWalletId(paymentRequest.payerWalletId || verified.walletId);
+      setPayerWalletIdVerified(true);
+      setPayerWalletOwner(verified.ownerName || 'Innovation Labs wallet owner');
+      setWalletIdRequestId(paymentRequest.requestId);
+      setWalletIdPaymentStatus(paymentRequest.status || 'Pending');
+      setWalletIdPaymentAmount(paymentRequest.amount ?? verified.amount ?? checkoutEstimate?.total ?? null);
+      setWalletIdExpiresAt(paymentRequest.expiresAt || '');
+      if (paymentRequest.serverTime) {
+        setWalletIdServerOffset(new Date(paymentRequest.serverTime).getTime() - Date.now());
+      }
+    } catch (requestError) {
+      setPayerWalletIdVerified(false);
+      setPayerWalletOwner('');
+      setWalletIdVerificationError(requestError.message);
+    } finally {
+      setWalletIdVerificationLoading(false);
+    }
+  };
+
   const handleCheckoutAction = async () => {
     if (actionInProgressRef.current) return;
     actionInProgressRef.current = true;
@@ -5505,9 +5550,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
         setCheckoutStep(5);
       } else if (paymentMethod === 'wallet') {
         if (walletPaymentMode === 'wallet-id') {
-          setWalletIdRequestError('');
-          const result = await onWalletIdRequest(payerWalletId);
-          setWalletIdPaymentStatus(result.status || 'Pending');
+          await verifyAndRequestWalletIdPayment();
           return;
         }
         await onWalletPay(walletPaymentMode === 'qr'
@@ -5529,7 +5572,9 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       disabled={checkoutActionDisabled}
       onClick={handleCheckoutAction}
     >
-      {actionInProgress && displayedCheckoutStep === 5 ? 'Processing...' : checkoutActionLabel}
+      {walletPaymentMode === 'wallet-id' && displayedCheckoutStep === 5
+        && (actionInProgress || walletIdVerificationLoading) ? <><span className="wallet-id-spinner" aria-hidden="true" /> AWAITING PAYMENT</>
+        : actionInProgress && displayedCheckoutStep === 5 ? 'Processing...' : checkoutActionLabel}
     </button>
   );
 
@@ -5692,7 +5737,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
             </div>}
             <div className="checkout-actions space-between">
               <div><button className="secondary-btn" onClick={() => setCheckoutStep(3)}>Back</button><button className="secondary-btn" onClick={() => onRequestExit('/')}>Cancel Checkout</button></div>
-              {walletPaymentMode === 'wallet-id' ? null : renderCheckoutAction()}
+              {renderCheckoutAction()}
             </div>
           </div>
         )}
@@ -5735,6 +5780,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
                   <span className="wallet-id-input-icon" aria-hidden="true">◈</span>
                   <input
                     value={payerWalletId}
+                    disabled={walletIdRequestActive || walletIdVerificationLoading}
                     onChange={(event) => { setPayerWalletId(event.target.value.toUpperCase()); setPayerWalletIdVerified(false); setPayerWalletOwner(''); setWalletIdVerificationError(''); }}
                     placeholder="Enter another user's Innovation Labs Wallet ID"
                     aria-label="Innovation Labs Wallet ID"
@@ -5742,46 +5788,6 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
                     spellCheck="false"
                   />
                 </label>
-                <button
-                  type="button"
-                  className="wallet-id-verify-btn"
-                  disabled={!payerWalletId.trim() || !checkoutReference || walletIdVerificationLoading}
-                  onClick={async () => {
-                    if (!payerWalletId.trim() || walletIdVerificationLoading) return;
-                    setWalletIdVerificationLoading(true);
-                    setWalletIdVerificationError('');
-                    setWalletIdRequestError('');
-                    try {
-                      const result = await requestApi('/api/checkout/wallet-id/verify', {
-                        method: 'POST',
-                        body: JSON.stringify({ walletId: payerWalletId.trim(), checkoutReference }),
-                      });
-                      if (!result.walletId) throw new Error('This Wallet ID does not exist. Please check and try again.');
-                      const paymentRequest = await onWalletIdRequest(result.walletId);
-                      if (!paymentRequest.requestId) throw new Error('The payment request could not be created. Please retry.');
-                      const confirmedWalletId = paymentRequest.payerWalletId || result.walletId;
-                      setPayerWalletId(confirmedWalletId);
-                      setPayerWalletIdVerified(true);
-                      setPayerWalletOwner(result.ownerName || 'Innovation Labs wallet owner');
-                      setWalletIdRequestId(paymentRequest.requestId);
-                      setWalletIdPaymentStatus(paymentRequest.status || 'Pending');
-                      setWalletIdPaymentAmount(paymentRequest.amount ?? checkoutEstimate?.total ?? null);
-                      setWalletIdExpiresAt(paymentRequest.expiresAt || '');
-                      if (paymentRequest.serverTime) {
-                        setWalletIdServerOffset(new Date(paymentRequest.serverTime).getTime() - Date.now());
-                      }
-                    } catch (requestError) {
-                      setPayerWalletIdVerified(false);
-                      setPayerWalletOwner('');
-                      setWalletIdVerificationError(requestError.message);
-                    } finally {
-                      setWalletIdVerificationLoading(false);
-                    }
-                  }}
-                >
-                  {walletIdVerificationLoading ? <><span className="wallet-id-spinner" aria-hidden="true" /> Verifying Wallet ID...</> : <><span aria-hidden="true">✓</span> Verify ID</>}
-                </button>
-                {payerWalletIdVerified && <p className="wallet-id-status wallet-id-status-success" role="status"><span aria-hidden="true">✓</span> Wallet owner verified · {payerWalletOwner}.</p>}
                 {walletIdVerificationError && <p className="wallet-id-status wallet-id-status-error" role="alert">{walletIdVerificationError}</p>}
                 {walletIdRequestError && <p className="wallet-id-status wallet-id-status-error" role="alert">{walletIdRequestError}</p>}
               </>}
@@ -5823,7 +5829,9 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
               <div><button className="secondary-btn" disabled={walletIdRequestActive} onClick={() => setCheckoutStep(4)}>Back</button><button className="secondary-btn" onClick={() => onRequestExit('/')}>Cancel Checkout</button></div>
               <div className="payment-actions">
                 {walletPaymentMode === 'wallet-id'
-                  ? walletIdPaymentAwaiting && <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />AWAITING FOR PAYMENT</div>
+                  ? walletIdPaymentAwaiting
+                    ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />AWAITING FOR PAYMENT</div>
+                    : renderCheckoutAction()
                   : walletPaymentMode === 'qr'
                     ? qrPaymentAwaiting
                       ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />Awaiting QR Payment</div>
@@ -5836,10 +5844,10 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
           </div>
 
           <aside className="checkout-order-summary" aria-labelledby="checkout-order-summary-title">
-            <h3 id="checkout-order-summary-title">Place Your Order</h3>
+            <h3 id="checkout-order-summary-title">{walletPaymentMode === 'wallet-id' ? 'Order Summary' : 'Place Your Order'}</h3>
             <div className="checkout-order-summary-action">
               {walletPaymentMode === 'wallet-id'
-                ? walletIdPaymentAwaiting && <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />AWAITING FOR PAYMENT</div>
+                ? null
                 : qrPaymentAwaiting
                   ? <div className="checkout-qr-awaiting-status" role="status"><span className="checkout-qr-status-dot" aria-hidden="true" />Awaiting QR Payment</div>
                   : renderCheckoutAction('primary-btn full')}

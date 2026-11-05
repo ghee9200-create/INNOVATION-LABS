@@ -6761,15 +6761,22 @@ app.post('/api/checkout/wallet-id/verify', requireSession, requireDatabase, asyn
   const walletId = normalizeWalletId(req.body?.walletId);
   const checkoutReference = typeof req.body?.checkoutReference === 'string' ? req.body.checkoutReference.trim() : '';
   if (!walletId || !checkoutReference) return res.status(400).json({ message: 'A Wallet ID and checkout reference are required.' });
-  const [wallet, attempt] = await Promise.all([
+  if (!validateWalletId(walletId)) return res.status(400).json({ message: 'Enter a valid Innovation Labs Wallet ID.' });
+  const [wallet, attempt, requester] = await Promise.all([
     Wallet.findOne({ walletId }).select('walletId userId').lean(),
     CheckoutAttempt.findOne({ reference: checkoutReference, userId: req.session.sub, status: { $in: ['Open', 'Payment Initiated'] } }).select('reference totalPaise expiresAt').lean(),
+    User.findOne({ googleId: req.session.sub }).select('email').lean(),
   ]);
   if (!attempt) return res.status(409).json({ message: 'This checkout is no longer active.' });
   if (attempt.expiresAt && attempt.expiresAt <= new Date()) return res.status(409).json({ message: 'This checkout payment session has expired.' });
   if (!wallet?.walletId) return res.status(404).json({ message: 'This Wallet ID does not exist. Please check and try again.' });
   if (wallet.userId === req.session.sub) return res.status(400).json({ message: 'You cannot use your own Wallet ID to pay for this checkout.' });
-  const owner = await User.findOne({ googleId: wallet.userId }).select('name').lean();
+  const owner = await User.findOne({ googleId: wallet.userId }).select('name email').lean();
+  const sessionEmail = typeof req.session.email === 'string' ? req.session.email.trim().toLowerCase() : '';
+  if (!requester?.email || requester.email.trim().toLowerCase() !== sessionEmail) {
+    return res.status(403).json({ message: 'Your registered email could not be verified. Please sign in again.' });
+  }
+  if (!owner?.email) return res.status(404).json({ message: 'This Wallet ID is not linked to a verified Innovation Labs account.' });
   return res.json({
     walletId: wallet.walletId,
     ownerName: safeRecipientName(owner?.name),
