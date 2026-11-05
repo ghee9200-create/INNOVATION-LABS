@@ -7010,12 +7010,12 @@ app.post('/api/wallet/transfers/quote', requireSession, requireDatabase, require
   if (!validateWalletId(recipientWalletId)) return res.status(400).json({ message: 'Enter a valid recipient Wallet ID.' });
   if (qrPayload && !qrMatch) return res.status(400).json({ message: 'This is not a valid Innovation Labs wallet QR code.' });
   if (!Number.isSafeInteger(amountPaise) || amountPaise <= 0) return res.status(400).json({ message: 'Enter a valid transfer amount greater than ₹0.' });
-  const [sender, receiver, planLimit] = await Promise.all([
+  const [sender, receiver] = await Promise.all([
     Wallet.findOne({ userId: req.session.sub }).select('balancePaise').lean(),
     Wallet.findOne({ walletId: recipientWalletId }).select('userId balancePaise +qrReference').lean(),
-    getWalletLimitStatus(req.session.sub),
   ]);
   if (!sender) return res.status(409).json({ message: 'Your wallet is not available.' });
+  const planLimit = await getWalletLimitStatus(req.session.sub, sender.balancePaise);
   if (!receiver) return res.status(404).json({ message: 'Wallet ID not found. Please check the Wallet ID and try again.' });
   if (qrMatch && receiver.qrReference !== qrMatch[1]) return res.status(409).json({ message: 'The scanned QR code does not match this recipient wallet.' });
   if (receiver.userId === req.session.sub) return res.status(400).json({ message: 'You cannot transfer money to your own Wallet ID.' });

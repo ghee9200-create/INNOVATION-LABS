@@ -6575,6 +6575,20 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
   const availablePaise = Math.round(Number(wallet.balance || 0) * 100);
 
   useEffect(() => {
+    let active = true;
+    requestApi('/api/wallet')
+      .then((result) => {
+        if (active && !result.setupRequired && result.wallet) onWalletUpdate(result.wallet);
+      })
+      .catch((requestError) => {
+        if (active && requestError.status !== 423) {
+          setError(requestError.message || 'Your latest wallet balance could not be loaded.');
+        }
+      });
+    return () => { active = false; };
+  }, [accessVersion, onWalletUpdate]);
+
+  useEffect(() => {
     if (transferTab !== 'show') return undefined;
     let active = true;
     setQrLoading(true);
