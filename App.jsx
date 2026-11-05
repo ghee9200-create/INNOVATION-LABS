@@ -6497,7 +6497,6 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
   const [qrAccessChecking, setQrAccessChecking] = useState(true);
   const [recipientSuffix, setRecipientSuffix] = useState('');
   const [recipient, setRecipient] = useState(null);
-  const [checkoutQrPayment, setCheckoutQrPayment] = useState(null);
   const [recipientConfirmOpen, setRecipientConfirmOpen] = useState(false);
   const [recipientBusy, setRecipientBusy] = useState(false);
   const [creatingId, setCreatingId] = useState(false);
@@ -6890,6 +6889,7 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
   const [wallet, setWallet] = useState(null);
   const [recipient, setRecipient] = useState(null);
   const [transfer, setTransfer] = useState(null);
+  const [checkoutQrPayment, setCheckoutQrPayment] = useState(null);
   const [stage, setStage] = useState('scan');
   const [amount, setAmount] = useState('');
   const [amountPaise, setAmountPaise] = useState(0);
@@ -7274,26 +7274,27 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
     }
   };
 
-  const downloadReceipt = () => {
+  const downloadReceipt = async () => {
     if (!transfer) return;
-    const completedAt = transfer.completedAt ? new Date(transfer.completedAt) : new Date();
-    const receipt = [
-      'INNOVATION LABS — WALLET TRANSFER RECEIPT',
-      '',
-      `Status: ${transfer.status || 'COMPLETED'}`,
-      `Amount: ₹${Number(transfer.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`,
-      `Paid to: ${recipient?.displayName || transfer.recipientName || 'Recipient'}`,
-      `Wallet ID: ${recipient?.username || recipient?.walletId || transfer.recipientWalletId}`,
-      `Transaction ID: ${transfer.transferId}`,
-      `Date & time: ${completedAt.toLocaleString('en-IN')}`,
-      ...(remarks ? [`Remarks: ${remarks}`] : []),
-    ].join('\n');
-    const url = URL.createObjectURL(new Blob([receipt], { type: 'text/plain;charset=utf-8' }));
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `innovation-labs-transfer-${transfer.transferId}.txt`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    setReceiptError('');
+    try {
+      const response = await fetch(apiUrl(`/api/wallet/transfers/${encodeURIComponent(transfer.transferId)}/receipt`), {
+        credentials: 'include',
+      });
+      if (!response.ok) {
+        const result = await parseJsonSafely(response);
+        throw new Error(result?.message || 'The receipt could not be downloaded.');
+      }
+      const pdf = await response.blob();
+      const url = URL.createObjectURL(pdf);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `innovation-labs-transfer-${transfer.transferId}.pdf`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (downloadError) {
+      setReceiptError(downloadError.message || 'The receipt could not be downloaded.');
+    }
   };
 
   const backToWallet = () => navigate('/wallet', { state: { openTransferTab: true } });

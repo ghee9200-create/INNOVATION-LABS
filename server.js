@@ -1746,6 +1746,56 @@ const reverseRewardPointsForOrder = async (session, order, { referenceId, refund
 
 const invoiceCurrency = (paise) => `INR ${money(paise).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
+const renderTransferReceiptPdf = async ({ transfer, sender, receiver, senderWalletId, receiverWalletId }) => {
+  let logo;
+  try {
+    logo = await fs.readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), 'Innovation Labs logo.png'));
+  } catch (error) {
+    throw new Error(`Innovation Labs logo could not be loaded: ${error.message}`);
+  }
+  return new Promise((resolve, reject) => {
+  const document = new PDFDocument({ size: 'A4', margin: 48 });
+  const chunks = [];
+  document.on('data', (chunk) => chunks.push(chunk));
+  document.on('error', reject);
+  document.on('end', () => resolve(Buffer.concat(chunks)));
+  const moneyText = (paise) => `₹${money(paise).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const detail = (label, value, x, y, width = 220) => {
+    document.font('Helvetica-Bold').fontSize(8).fillColor('#6a7f87').text(label.toUpperCase(), x, y);
+    document.font('Helvetica').fontSize(10).fillColor('#16313b').text(value || '—', x, y + 13, { width });
+  };
+  document.rect(0, 0, 612, 132).fill('#071b24');
+  document.image(logo, 48, 30, { fit: [70, 70] });
+  document.font('Helvetica-Bold').fontSize(22).fillColor('#ffffff').text('INNOVATION LABS', 132, 43);
+  document.font('Helvetica').fontSize(9).fillColor('#73e6f4').text('SECURE WALLET PAYMENTS', 134, 73);
+  document.font('Helvetica-Bold').fontSize(22).fillColor('#16313b').text('PAYMENT RECEIPT', 48, 166);
+  document.roundedRect(400, 157, 164, 34, 8).fill('#e4f8ef');
+  document.font('Helvetica-Bold').fontSize(10).fillColor('#24735e').text('✓  PAYMENT SUCCESSFUL', 412, 169);
+  document.roundedRect(48, 219, 516, 100, 10).fill('#f0f8fa');
+  document.font('Helvetica').fontSize(9).fillColor('#5b747c').text('AMOUNT PAID', 70, 241);
+  document.font('Helvetica-Bold').fontSize(28).fillColor('#0b5363').text(moneyText(transfer.amountPaise), 70, 258);
+  detail('Payment method', 'Innovation Labs Wallet', 350, 241, 190);
+  detail('Transaction date', new Date(transfer.completedAt).toLocaleString('en-IN'), 350, 280, 190);
+  document.moveTo(48, 350).lineTo(564, 350).strokeColor('#cbd8dc').stroke();
+  document.font('Helvetica-Bold').fontSize(11).fillColor('#16313b').text('TRANSACTION DETAILS', 48, 370);
+  detail('Transaction ID', transfer.transferId, 48, 400, 240);
+  detail('Status', 'Successful', 320, 400, 220);
+  detail('Description', transfer.remarks || 'Personal Innovation Labs Wallet transfer', 48, 452, 516);
+  document.font('Helvetica-Bold').fontSize(11).fillColor('#16313b').text('SENDER', 48, 520);
+  document.font('Helvetica-Bold').fontSize(11).fillColor('#16313b').text('RECIPIENT', 320, 520);
+  detail('Name', sender.name, 48, 548, 220);
+  detail('Registered account', sender.email, 48, 588, 220);
+  detail('Wallet ID', senderWalletId, 48, 628, 220);
+  detail('Name', receiver.name, 320, 548, 220);
+  detail('Registered account', receiver.email, 320, 588, 220);
+  detail('Wallet ID', receiverWalletId, 320, 628, 220);
+  document.moveTo(48, 704).lineTo(564, 704).strokeColor('#cbd8dc').stroke();
+  document.font('Helvetica').fontSize(8).fillColor('#6a7f87').text('This is a digitally generated transaction receipt from Innovation Labs.', 48, 723, { width: 516, align: 'center' });
+  document.text('Please retain this receipt for your records.', 48, 738, { width: 516, align: 'center' });
+    document.end();
+  });
+};
+
 const renderInvoicePdf = (invoice) => new Promise((resolve, reject) => {
   const document = new PDFDocument({ size: 'A4', margin: 48, bufferPages: true });
   const chunks = [];
@@ -6801,7 +6851,7 @@ app.post('/api/checkout/payment-qr/pay', requireSession, requireDatabase, requir
       const deliveryRequired = orderRequiresDelivery(safeItems);
       const checkoutData = calculateOrder(safeItems, attempt.service);
       const calculatedBase = checkoutData.totalPaise;
-      if (attempt.totalPaise > calculatedBase || attempt.totalPaise < 0) throw Object.assign(new Error('The checkout amount no longer matches the order.'), { status: 409 });
+      if (attempt.totalPaise !== calculatedBase || attempt.totalPaise < 0) throw Object.assign(new Error('The checkout amount no longer matches the order.'), { status: 409 });
       const inventoryDeductedAt = await applyInventoryReduction(session, safeItems, { validateProductSnapshot: true });
       const orderId = `IL-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
       const before = wallet.balancePaise;
@@ -7231,6 +7281,35 @@ app.post('/api/wallet/transfers/execute', requireSession, requireDatabase, requi
     }
     throw error;
   }
+});
+
+app.get('/api/wallet/transfers/:transferId/receipt', requireSession, requireDatabase, async (req, res) => {
+  const transfer = await WalletTransfer.findOne({
+    transferId: req.params.transferId,
+    senderUserId: req.session.sub,
+    status: 'COMPLETED',
+  }).lean();
+  if (!transfer) return res.status(404).json({ message: 'The completed wallet transfer could not be found.' });
+  const [sender, receiver, senderWallet, receiverWallet] = await Promise.all([
+    User.findOne({ googleId: transfer.senderUserId }).select('name email').lean(),
+    User.findOne({ googleId: transfer.receiverUserId }).select('name email').lean(),
+    Wallet.findOne({ userId: transfer.senderUserId }).select('walletId').lean(),
+    Wallet.findOne({ userId: transfer.receiverUserId }).select('walletId').lean(),
+  ]);
+  if (!sender || !receiver || !senderWallet?.walletId || !receiverWallet?.walletId) {
+    return res.status(409).json({ message: 'The account details for this transfer are unavailable.' });
+  }
+  const pdf = await renderTransferReceiptPdf({
+    transfer,
+    sender,
+    receiver,
+    senderWalletId: senderWallet.walletId,
+    receiverWalletId: receiverWallet.walletId,
+  });
+  res.set('Cache-Control', 'private, no-store');
+  res.set('Content-Type', 'application/pdf');
+  res.set('Content-Disposition', `attachment; filename="innovation-labs-transfer-${transfer.transferId}.pdf"`);
+  return res.send(pdf);
 });
 
 app.post('/api/checkout/quote', requireSession, requireDatabase, async (req, res) => {
