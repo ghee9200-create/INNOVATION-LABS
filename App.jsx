@@ -4950,7 +4950,7 @@ function PromoPurchaseSuccess({ success, nextPromoReservationId, onCopy, onConti
   </div></main>;
 }
 
-function CheckoutQrPaymentPanel({ checkoutReference, amount, onReady, onExpired }) {
+function CheckoutQrPaymentPanel({ checkoutReference, amount, address, onReady, onExpired }) {
   const [qrImage, setQrImage] = useState('');
   const [error, setError] = useState('');
   const [verifiedAmount, setVerifiedAmount] = useState(null);
@@ -4963,7 +4963,7 @@ function CheckoutQrPaymentPanel({ checkoutReference, amount, onReady, onExpired 
     setVerifiedAmount(null);
     requestApi('/api/checkout/payment-qr/start', {
       method: 'POST',
-      body: JSON.stringify({ checkoutReference }),
+      body: JSON.stringify({ checkoutReference, address }),
     })
       .then(async (result) => {
         const verification = await requestApi('/api/checkout/payment-qr/verify', {
@@ -4985,7 +4985,7 @@ function CheckoutQrPaymentPanel({ checkoutReference, amount, onReady, onExpired 
       })
       .catch((requestError) => { if (active) setError(requestError.message || 'The official Innovation Labs QR could not be loaded.'); });
     return () => { active = false; };
-  }, [checkoutReference, onReady]);
+  }, [address, checkoutReference, onReady]);
   useEffect(() => {
     if (!expiresAt) return undefined;
     let expired = false;
@@ -5500,10 +5500,11 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
         {displayedCheckoutStep === 5 && (
           <div className="checkout-card checkout-step-card" key="checkout-step-5">
             <h3>Step 5 — {walletPaymentMode === 'pin' ? 'Pay With PIN' : walletPaymentMode === 'qr' ? 'Pay With QR Code' : 'Pay With Wallet ID'}</h3>
-            {checkoutQrExpired && <div className="alert-box" role="alert"><strong>Payment Time Expired</strong><p>Your payment was not confirmed within 4 minutes. Please try again.</p></div>}
+            {checkoutQrExpired && <div className="alert-box" role="alert"><strong>Payment session expired</strong><p>Your checkout payment has been cancelled. Redirecting to the home page...</p></div>}
             {paymentMethod === 'wallet' && walletPaymentMode === 'qr' && !checkoutQrExpired && <CheckoutQrPaymentPanel
               checkoutReference={checkoutReference}
               amount={checkoutEstimate?.total}
+              address={address}
               onReady={handleMerchantQrReady}
               onExpired={handleMerchantQrExpired}
             />}
@@ -6963,8 +6964,13 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
       if (seconds === 0) {
         expired = true;
         setCheckoutQrExpired(true);
-        setError('Payment Time Expired\nYour payment was not confirmed within 4 minutes. Please try again.');
-        window.setTimeout(() => navigate('/'), 2000);
+        requestApi('/api/checkout/payment-qr/expire', {
+          method: 'POST',
+          body: JSON.stringify({ checkoutReference: checkoutQrPayment.checkoutReference }),
+        }).catch(() => undefined).finally(() => {
+          setError('Payment session expired. Your checkout payment has been cancelled.');
+          window.setTimeout(() => navigate('/'), 2000);
+        });
       }
     };
     updateRemaining();

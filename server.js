@@ -6739,13 +6739,13 @@ const expireCheckoutAttemptIfNeeded = async (reference, userId) => {
     {
       reference,
       userId,
-      status: { $in: ['Open'] },
+      status: { $in: ['Open', 'Payment Initiated'] },
       paymentStatus: 'Pending',
       expiresAt: { $lte: now },
     },
     {
       $set: {
-        status: 'Interrupted',
+        status: 'Expired',
         paymentStatus: 'Failed',
         reason: 'Payment expired after four minutes without provider confirmation.',
         exitedAt: now,
@@ -6754,6 +6754,30 @@ const expireCheckoutAttemptIfNeeded = async (reference, userId) => {
     { new: true },
   );
 };
+const expireCheckoutAttempts = async () => {
+  const now = new Date();
+  await CheckoutAttempt.updateMany(
+    {
+      status: { $in: ['Open', 'Payment Initiated'] },
+      paymentStatus: 'Pending',
+      expiresAt: { $lte: now },
+    },
+    {
+      $set: {
+        status: 'Expired',
+        paymentStatus: 'Failed',
+        reason: 'Payment expired after four minutes without provider confirmation.',
+        exitedAt: now,
+      },
+    },
+  );
+};
+const checkoutExpirySweep = setInterval(() => {
+  if (mongoose.connection.readyState === 1) {
+    expireCheckoutAttempts().catch((error) => console.error('Checkout expiry sweep failed:', error.name));
+  }
+}, 10_000);
+checkoutExpirySweep.unref();
 
 app.get('/api/checkout/payment-qr', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
   const reference = typeof req.query.reference === 'string' ? req.query.reference.trim() : '';
@@ -6761,7 +6785,7 @@ app.get('/api/checkout/payment-qr', requireSession, requireDatabase, requireActi
   const attempt = await CheckoutAttempt.findOne({
     reference,
     userId: req.session.sub,
-    status: { $in: ['Open', 'Completing', 'Completed', 'Interrupted'] },
+    status: { $in: ['Open', 'Completing', 'Completed', 'Interrupted', 'Expired'] },
   }).select('reference totalPaise paymentStatus status expiresAt reason').lean();
   if (!attempt) return res.status(409).json({ message: 'This checkout is no longer active. Return to checkout and try again.' });
   const completedOrder = attempt.status === 'Completed'
@@ -6782,16 +6806,35 @@ app.get('/api/checkout/payment-qr', requireSession, requireDatabase, requireActi
 
 app.post('/api/checkout/payment-qr/start', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
   const reference = typeof req.body?.checkoutReference === 'string' ? req.body.checkoutReference.trim() : '';
+  await expireCheckoutAttemptIfNeeded(reference, req.session.sub);
   let attempt = await CheckoutAttempt.findOne({
     reference,
     userId: req.session.sub,
     status: { $in: ['Open', 'Payment Initiated'] },
   });
-  if (attempt && !attempt.expiresAt) {
-    attempt.status = 'Open';
-    attempt.stage = 'Payment Initiated';
-    attempt.paymentStatus = 'Pending';
-    attempt.expiresAt = new Date(Date.now() + 4 * 60 * 1000);
+  if (attempt) {
+    const deliveryRequired = orderRequiresDelivery(attempt.items);
+    const requestedAddress = req.body?.address;
+    const hasRequestedAddress = requestedAddress && typeof requestedAddress === 'object' && !Array.isArray(requestedAddress);
+    if (deliveryRequired && hasRequestedAddress && !validateAddress(requestedAddress)) {
+      return res.status(400).json({ message: 'Complete the required delivery address fields before starting payment.' });
+    }
+    if (deliveryRequired && !validateAddress(attempt.address)) {
+      const savedUser = await User.findOne({ googleId: req.session.sub }).select('address').lean();
+      const resolvedAddress = hasRequestedAddress ? requestedAddress : savedUser?.address;
+      if (!validateAddress(resolvedAddress)) {
+        return res.status(400).json({ message: 'Complete the required delivery address fields before starting payment.' });
+      }
+      attempt.address = resolvedAddress;
+    } else if (deliveryRequired && hasRequestedAddress) {
+      attempt.address = requestedAddress;
+    }
+    if (!attempt.expiresAt) {
+      attempt.status = 'Open';
+      attempt.stage = 'Payment Initiated';
+      attempt.paymentStatus = 'Pending';
+      attempt.expiresAt = new Date(Date.now() + 4 * 60 * 1000);
+    }
     await attempt.save();
   }
   attempt = attempt?.toObject();
@@ -11146,7 +11189,7 @@ const CheckoutAttempt = mongoose.model('CheckoutAttempt', new mongoose.Schema({
   totalPaise: { type: Number, required: true, min: 0 },
   currency: { type: String, default: 'INR' },
   stage: { type: String, enum: ['Checkout Opened', 'Payment Initiated'], default: 'Checkout Opened' },
-  status: { type: String, enum: ['Open', 'Completing', 'Explicitly Cancelled', 'Interrupted', 'Payment Review', 'Completed'], default: 'Open', index: true },
+  status: { type: String, enum: ['Open', 'Completing', 'Explicitly Cancelled', 'Interrupted', 'Expired', 'Payment Review', 'Completed'], default: 'Open', index: true },
   reason: { type: String, default: '' },
   paymentStatus: { type: String, enum: ['Not Started', 'Pending', 'Paid', 'Failed'], default: 'Not Started' },
   paymentReference: String,
