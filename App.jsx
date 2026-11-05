@@ -1879,7 +1879,7 @@ function App() {
   };
 
   const requestWalletIdPayment = async (payerWalletId) => {
-    const checkoutReference = checkoutAttemptRef.current || await createCheckoutAttempt();
+    const checkoutReference = await beginCheckoutPayment();
     if (!checkoutReference) throw new Error('Checkout has not been recorded. Please try again.');
     const idempotencyKey = globalThis.crypto?.randomUUID?.()
       || `wallet-id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -7159,6 +7159,7 @@ function WalletTransferWorkspace({ wallet, onWalletUpdate, onBackToOverview, acc
 function WalletPaymentRequestsPage() {
   const navigate = useNavigate();
   const [requests, setRequests] = useState([]);
+  const [recentRequests, setRecentRequests] = useState([]);
   const [selectedRequest, setSelectedRequest] = useState(null);
   const [pin, setPin] = useState('');
   const [busy, setBusy] = useState(false);
@@ -7167,9 +7168,10 @@ function WalletPaymentRequestsPage() {
   const loadRequests = useCallback(async () => {
     const result = await requestApi('/api/wallet/payment-requests/pending');
     const nextRequests = result.requests || [];
+    setRecentRequests(result.recentRequests || []);
     setRequests(nextRequests);
-    setSelectedRequest((current) => current && nextRequests.some((request) => request.requestId === current.requestId)
-      ? current
+    setSelectedRequest((current) => current
+      ? nextRequests.find((request) => request.requestId === current.requestId) || null
       : null);
   }, []);
 
@@ -7189,21 +7191,6 @@ function WalletPaymentRequestsPage() {
     return () => window.clearInterval(intervalId);
   }, [loadRequests]);
 
-  const rejectRequest = async (requestId) => {
-    setBusy(true);
-    setError('');
-    try {
-      await requestApi(`/api/wallet/payment-requests/${encodeURIComponent(requestId)}/reject`, { method: 'POST', body: '{}' });
-      setSelectedRequest(null);
-      setPin('');
-      await loadRequests();
-    } catch (requestError) {
-      setError(requestError.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const approveRequest = async () => {
     if (!selectedRequest || pin.length !== 4 || busy) return;
     setBusy(true);
@@ -7222,21 +7209,62 @@ function WalletPaymentRequestsPage() {
     }
   };
 
-  return <main className="page-shell"><div className="container narrow-container">
-    <button type="button" className="wallet-payment-back" onClick={() => navigate('/wallet')}>← <span>Wallet</span></button>
-    <header className="wallet-payment-header"><span className="eyebrow">WALLET PAYMENT REQUEST</span><h1>Approve Payment</h1><p>Review the fixed checkout amount before authorizing it with your Wallet PIN.</p></header>
-    {error && <div className="alert-box" role="alert">{error}</div>}
-    {!requests.length && <section className="wallet-payment-card"><p>No pending payment requests.</p></section>}
-    {requests.map((request) => <section className="wallet-payment-card" key={request.requestId}>
-      <p>Payment request from Innovation Labs</p>
-      <div className="summary-row"><span>Requested by</span><strong>{request.requesterName}</strong></div>
-      <div className="summary-row"><span>Checkout reference</span><strong>{request.checkoutReference}</strong></div>
-      <div className="summary-row total"><span>Fixed amount</span><strong>₹{Number(request.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>
-      {selectedRequest?.requestId === request.requestId
-        ? <div className="wallet-pin-approval"><label>Wallet PIN<input type="password" inputMode="numeric" maxLength={4} value={pin} onChange={(event) => setPin(event.target.value.replace(/\D/g, ''))} /></label><div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => rejectRequest(request.requestId)}>Reject Payment</button><button type="button" className="primary-btn" disabled={busy || pin.length !== 4} onClick={approveRequest}>{busy ? 'Processing...' : 'Approve Payment'}</button></div></div>
-        : <div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => rejectRequest(request.requestId)}>Reject Payment</button><button type="button" className="primary-btn" disabled={busy} onClick={() => { setSelectedRequest(request); setPin(''); setError(''); }}>Review Payment</button></div>}
-    </section>)}
-  </div></main>;
+  const visibleRequests = selectedRequest
+    ? requests.filter((request) => request.requestId === selectedRequest.requestId)
+    : requests;
+  const displayStatus = (request) => request.paymentStatus
+    || (request.status === 'Approved' ? 'SUCCESS'
+      : request.status === 'Processing' ? 'PROCESSING'
+        : request.status === 'Pending' ? 'PENDING'
+          : request.status === 'Rejected' || request.status === 'Cancelled' || request.status === 'Expired' ? 'FAILED'
+            : request.status?.toUpperCase() || 'PENDING');
+
+  return <main className="page-shell wallet-request-page">
+    <div className="container narrow-container wallet-request-shell">
+      <header className="wallet-request-brand">
+        <img src={innovationLabsLogo} alt="Innovation Labs" />
+        <span>INNOVATION LABS <small>SECURE WALLET PAYMENTS</small></span>
+      </header>
+      <header className="wallet-payment-header wallet-request-heading">
+        <span className="eyebrow">WALLET PAYMENT REQUEST</span>
+        <h1>{selectedRequest ? 'Review payment' : 'Payment requests'}</h1>
+        <p>Confirm the checkout amount, then authorize it with your existing Wallet PIN.</p>
+      </header>
+      {error && <div className="wallet-payment-error" role="alert">{error}</div>}
+      {!requests.length && <section className="wallet-payment-card wallet-request-empty"><span aria-hidden="true">✓</span><h2>No pending requests</h2><p>New Innovation Labs payment requests will appear here.</p></section>}
+      {visibleRequests.map((request) => <section className="wallet-payment-card wallet-request-card" key={request.requestId}>
+        <div className="wallet-request-card-brand"><span className="wallet-payment-avatar" aria-hidden="true">IL</span><div><strong>Innovation Labs</strong><small>Checkout payment request</small></div><span className={`wallet-request-status ${request.paymentStatus === 'PROCESSING' || request.status === 'Processing' ? 'is-processing' : ''}`}>{displayStatus(request)}</span></div>
+        <div className="wallet-request-amount">
+          <span>Amount requested</span>
+          <strong>₹{Number(request.amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
+          <small>Fixed checkout amount · cannot be changed</small>
+        </div>
+        <dl className="wallet-request-details">
+          <div><dt>Requested by</dt><dd>{request.requesterName}</dd></div>
+          <div><dt>Checkout reference</dt><dd>{request.checkoutReference}</dd></div>
+          <div><dt>Paying Wallet ID</dt><dd>{request.payerWalletId}</dd></div>
+        </dl>
+        {selectedRequest?.requestId === request.requestId && request.status === 'Processing'
+          ? <p className="wallet-request-processing" role="status"><span className="wallet-id-spinner" aria-hidden="true" /> Payment is processing securely. Keep this page open.</p>
+          : selectedRequest?.requestId === request.requestId ? <div className="wallet-request-verification">
+          <h2>Verify with your Wallet PIN</h2>
+          <p>Enter the four digits of your existing Wallet PIN. This is not an OTP.</p>
+          <PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy} />
+          <button type="button" className="wallet-payment-primary" disabled={busy || pin.length !== 4 || request.status !== 'Pending'} onClick={approveRequest}>
+            {busy ? <><span className="wallet-id-spinner" aria-hidden="true" /> Processing securely…</> : 'Pay'}
+          </button>
+        </div> : <button type="button" className="wallet-payment-primary" disabled={busy || request.status !== 'Pending'} onClick={() => { setSelectedRequest(request); setPin(''); setError(''); }}>Pay</button>}
+      </section>)}
+      {!selectedRequest && recentRequests.length > 0 && <section className="wallet-request-history">
+        <h2>Recent payment requests</h2>
+        {recentRequests.map((request) => <article className="wallet-request-history-item" key={request.requestId}>
+          <div><strong>{request.requesterName}</strong><small>{request.checkoutReference}</small></div>
+          <div className="wallet-request-history-result"><strong>₹{Number(request.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong><span>{displayStatus(request)}</span></div>
+          {request.transactionId && <small className="wallet-request-transaction">Transaction ID · {request.transactionId}</small>}
+        </article>)}
+      </section>}
+    </div>
+  </main>;
 }
 
 function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {

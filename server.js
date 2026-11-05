@@ -600,6 +600,7 @@ const WalletPaymentRequest = mongoose.model('WalletPaymentRequest', new mongoose
   payerWalletId: { type: String, required: true },
   amountPaise: { type: Number, required: true, min: 1 },
   status: { type: String, enum: ['Pending', 'Processing', 'Approved', 'Rejected', 'Cancelled', 'Expired'], default: 'Pending', index: true },
+  paymentStatus: { type: String, enum: ['PENDING', 'PROCESSING', 'SUCCESS', 'FAILED'], default: 'PENDING', index: true },
   statusHistory: { type: [mongoose.Schema.Types.Mixed], default: [] },
   paymentReference: { type: String, unique: true, sparse: true },
   orderId: { type: String, unique: true, sparse: true },
@@ -6795,6 +6796,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
   if (existing) return res.json({
     requestId: existing.requestId,
     status: existing.status,
+    paymentStatus: existing.paymentStatus || 'PENDING',
     amount: money(existing.amountPaise),
     checkoutReference: existing.checkoutReference,
     expiresAt: existing.expiresAt,
@@ -6812,7 +6814,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
     await WalletPaymentRequest.updateMany(
       { requestId: { $in: expiredRequests.map((request) => request.requestId) }, status: { $in: ['Pending', 'Processing'] } },
       {
-        $set: { status: 'Expired' },
+        $set: { status: 'Expired', paymentStatus: 'FAILED' },
         $unset: { activeCheckoutKey: 1 },
         $push: { statusHistory: { status: 'Payment Expired', at: now } },
       },
@@ -6836,6 +6838,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
   if (activeRequest) return res.json({
     requestId: activeRequest.requestId,
     status: activeRequest.status,
+    paymentStatus: activeRequest.paymentStatus || 'PENDING',
     amount: money(activeRequest.amountPaise),
     checkoutReference: activeRequest.checkoutReference,
     payerWalletId: activeRequest.payerWalletId,
@@ -6876,6 +6879,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
         payerWalletId: wallet.walletId,
         amountPaise: currentAttempt.totalPaise,
         expiresAt,
+        paymentStatus: 'PENDING',
         statusHistory: [
           { status: 'Wallet ID Entered', at: now },
           { status: 'Wallet ID Verified', at: now },
@@ -6921,6 +6925,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
   return res.status(201).json({
     requestId: request.requestId,
     status: request.status,
+    paymentStatus: request.paymentStatus || 'PENDING',
     amount: money(request.amountPaise),
     checkoutReference,
     payerWalletId: request.payerWalletId,
@@ -6933,21 +6938,21 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
 app.get('/api/checkout/wallet-id/status', requireSession, requireDatabase, async (req, res) => {
   const reference = typeof req.query.reference === 'string' ? req.query.reference.trim() : '';
   let request = await WalletPaymentRequest.findOne({ checkoutReference: reference, requesterUserId: req.session.sub })
-    .sort({ createdAt: -1 }).select('requestId status amountPaise orderId expiresAt payerWalletId payerUserId requesterUserId').lean();
+    .sort({ createdAt: -1 }).select('requestId status paymentStatus amountPaise orderId expiresAt payerWalletId payerUserId requesterUserId').lean();
   const now = new Date();
   if (!request) return res.json({ status: 'Not Started', serverTime: now.toISOString() });
   if (['Pending', 'Processing'].includes(request.status) && request.expiresAt <= now) {
     const expiredRequest = await WalletPaymentRequest.findOneAndUpdate(
       { requestId: request.requestId, status: { $in: ['Pending', 'Processing'] }, expiresAt: { $lte: now } },
       {
-        $set: { status: 'Expired' },
+        $set: { status: 'Expired', paymentStatus: 'FAILED' },
         $unset: { activeCheckoutKey: 1 },
         $push: { statusHistory: { status: 'Payment Expired', at: now } },
       },
       { new: true },
-    ).select('requestId status amountPaise orderId expiresAt payerWalletId payerUserId requesterUserId').lean() || request;
+    ).select('requestId status paymentStatus amountPaise orderId expiresAt payerWalletId payerUserId requesterUserId').lean() || request;
     request = expiredRequest.status === 'Expired' ? expiredRequest : await WalletPaymentRequest.findById(request._id)
-      .select('requestId status amountPaise orderId expiresAt payerWalletId payerUserId requesterUserId').lean() || expiredRequest;
+      .select('requestId status paymentStatus amountPaise orderId expiresAt payerWalletId payerUserId requesterUserId').lean() || expiredRequest;
     if (request.status === 'Expired') broadcastWalletPaymentRequestUpdate(request, {
       requestId: request.requestId,
       checkoutReference: reference,
@@ -6958,6 +6963,7 @@ app.get('/api/checkout/wallet-id/status', requireSession, requireDatabase, async
   return res.json({
     requestId: request.requestId,
     status: request.status,
+    paymentStatus: request.paymentStatus || (request.status === 'Approved' ? 'SUCCESS' : request.status === 'Processing' ? 'PROCESSING' : request.status === 'Pending' ? 'PENDING' : 'FAILED'),
     amount: money(request.amountPaise),
     orderId: request.orderId || null,
     expiresAt: request.expiresAt,
@@ -6974,7 +6980,7 @@ app.get('/api/wallet/payment-requests/pending', requireSession, requireDatabase,
   if (expiredRequests.length) await WalletPaymentRequest.updateMany(
     { requestId: { $in: expiredRequests.map((request) => request.requestId) }, status: { $in: ['Pending', 'Processing'] } },
     {
-      $set: { status: 'Expired' },
+      $set: { status: 'Expired', paymentStatus: 'FAILED' },
       $unset: { activeCheckoutKey: 1 },
       $push: { statusHistory: { status: 'Payment Expired', at: now } },
     },
@@ -6985,9 +6991,14 @@ app.get('/api/wallet/payment-requests/pending', requireSession, requireDatabase,
     status: 'Expired',
     serverTime: now.toISOString(),
   }));
-  const requests = await WalletPaymentRequest.find({ payerUserId: req.session.sub, status: 'Pending', expiresAt: { $gt: now } })
+  const requests = await WalletPaymentRequest.find({ payerUserId: req.session.sub, status: { $in: ['Pending', 'Processing'] }, expiresAt: { $gt: now } })
     .sort({ createdAt: -1 }).limit(20).lean();
-  const requesterIds = requests.map((request) => request.requesterUserId);
+  const recentRequests = await WalletPaymentRequest.find({
+    payerUserId: req.session.sub,
+    status: { $nin: ['Pending', 'Processing'] },
+  }).sort({ createdAt: -1 }).limit(10)
+    .select('requestId checkoutReference requesterUserId amountPaise status paymentStatus paymentReference createdAt approvedAt').lean();
+  const requesterIds = [...new Set([...requests, ...recentRequests].map((request) => request.requesterUserId))];
   const users = await User.find({ googleId: { $in: requesterIds } }).select('googleId name').lean();
   const names = new Map(users.map((user) => [user.googleId, safeRecipientName(user.name)]));
   return res.json({ requests: requests.map((request) => ({
@@ -6995,7 +7006,20 @@ app.get('/api/wallet/payment-requests/pending', requireSession, requireDatabase,
     checkoutReference: request.checkoutReference,
     amount: money(request.amountPaise),
     requesterName: names.get(request.requesterUserId) || 'Innovation Labs customer',
+    payerWalletId: request.payerWalletId,
+    status: request.status,
+    paymentStatus: request.paymentStatus || (request.status === 'Approved' ? 'SUCCESS' : request.status === 'Processing' ? 'PROCESSING' : request.status === 'Pending' ? 'PENDING' : 'FAILED'),
     expiresAt: request.expiresAt,
+  })), recentRequests: recentRequests.map((request) => ({
+    requestId: request.requestId,
+    checkoutReference: request.checkoutReference,
+    amount: money(request.amountPaise),
+    requesterName: names.get(request.requesterUserId) || 'Innovation Labs customer',
+    status: request.status,
+    paymentStatus: request.paymentStatus || (request.status === 'Approved' ? 'SUCCESS' : 'FAILED'),
+    transactionId: request.paymentReference || null,
+    createdAt: request.createdAt,
+    completedAt: request.approvedAt || null,
   })) });
 });
 
@@ -7004,7 +7028,7 @@ app.post('/api/wallet/payment-requests/:requestId/cancel', requireSession, requi
   const request = await WalletPaymentRequest.findOneAndUpdate(
     { requestId: req.params.requestId, $or: [{ payerUserId: req.session.sub }, { requesterUserId: req.session.sub }], status: 'Pending', expiresAt: { $gt: now } },
     {
-      $set: { status: 'Cancelled' },
+      $set: { status: 'Cancelled', paymentStatus: 'FAILED' },
       $unset: { activeCheckoutKey: 1 },
       $push: { statusHistory: { status: 'Payment Cancelled', at: now } },
     },
@@ -7025,7 +7049,7 @@ app.post('/api/wallet/payment-requests/:requestId/reject', requireSession, requi
   const request = await WalletPaymentRequest.findOneAndUpdate(
     { requestId: req.params.requestId, payerUserId: req.session.sub, status: 'Pending', expiresAt: { $gt: now } },
     {
-      $set: { status: 'Rejected', rejectedAt: now },
+      $set: { status: 'Rejected', paymentStatus: 'FAILED', rejectedAt: now },
       $unset: { activeCheckoutKey: 1 },
       $push: { statusHistory: { status: 'Payment Rejected', at: now } },
     },
@@ -7054,7 +7078,7 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
   const claimed = await WalletPaymentRequest.findOneAndUpdate(
     { requestId: req.params.requestId, payerUserId: req.session.sub, status: 'Pending', expiresAt: { $gt: now } },
     {
-      $set: { status: 'Processing' },
+      $set: { status: 'Processing', paymentStatus: 'PROCESSING' },
       $push: { statusHistory: { status: 'Payment Processing', at: now } },
     },
     { new: true },
@@ -7063,7 +7087,7 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
     await WalletPaymentRequest.updateOne(
       { requestId: req.params.requestId, payerUserId: req.session.sub, status: { $in: ['Pending', 'Processing'] }, expiresAt: { $lte: now } },
       {
-        $set: { status: 'Expired' },
+        $set: { status: 'Expired', paymentStatus: 'FAILED' },
         $unset: { activeCheckoutKey: 1 },
         $push: { statusHistory: { status: 'Payment Expired', at: now } },
       },
@@ -7083,6 +7107,7 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
       if (request.status !== 'Processing' || request.expiresAt <= new Date()) {
         if (['Pending', 'Processing'].includes(request.status) && request.expiresAt <= new Date()) {
           request.status = 'Expired';
+          request.paymentStatus = 'FAILED';
           request.activeCheckoutKey = undefined;
           request.statusHistory.push({ status: 'Payment Expired', at: new Date() });
           await request.save({ session });
@@ -7090,6 +7115,9 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
         throw Object.assign(new Error('This payment request has expired or was already completed.'), { status: 409 });
       }
       const wallet = await Wallet.findOne({ userId: req.session.sub }).session(session);
+      if (wallet?.lockedUntil && wallet.lockedUntil > new Date()) {
+        throw Object.assign(new Error('Wallet security verification is temporarily locked. Please try again later.'), { status: 429 });
+      }
       if (!wallet?.pinHash || !verifyPin(pin, wallet.pinHash)) throw Object.assign(new Error('Incorrect Wallet PIN. Please try again.'), { status: 401 });
       const limitState = await getWalletLimitStatus(req.session.sub, wallet.balancePaise, session);
       const spendCheck = enforceAvailableWalletSpendLimit(wallet.balancePaise, request.amountPaise, limitState, 'Wallet balance');
@@ -7113,7 +7141,7 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
       const before = wallet.balancePaise;
       const walletAfter = await Wallet.findOneAndUpdate(
         { _id: wallet._id, balancePaise: { $gte: request.amountPaise }, availableBalancePaise: { $gte: request.amountPaise } },
-        { $inc: { balancePaise: -request.amountPaise, availableBalancePaise: -request.amountPaise } },
+        { $inc: { balancePaise: -request.amountPaise, availableBalancePaise: -request.amountPaise }, $set: { failedPinAttempts: 0, lockedUntil: null } },
         { new: true, session },
       );
       if (!walletAfter) throw Object.assign(new Error('Insufficient wallet balance for this payment.'), { status: 402 });
@@ -7142,6 +7170,7 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
       if (customOrders.length) await CustomOrder.updateMany({ _id: { $in: customOrders.map((item) => item._id) }, userId: request.requesterUserId, status: 'Accepted' }, { $set: { status: 'Ordered', orderedAt: new Date() } }, { session });
       await Notification.create([{ userId: request.requesterUserId, message: `Order ${orderId} was approved and paid from ${wallet.walletId}.` }], { session });
       request.status = 'Approved';
+      request.paymentStatus = 'SUCCESS';
       request.orderId = orderId;
       request.paymentReference = `wallet-id-payment:${request.requestId}`;
       request.approvedAt = new Date();
@@ -7179,6 +7208,37 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
     return res.status(result.duplicate ? 200 : 201).json({ order: result.order, wallet: walletView(result.wallet), duplicate: result.duplicate });
   } catch (error) {
     const failedAt = new Date();
+    if (error.status === 401) {
+      const pinWallet = await Wallet.findOne({ userId: req.session.sub })
+        .select('_id pinHash failedPinAttempts lockedUntil').lean();
+      if (pinWallet?.pinHash) {
+        if (pinWallet.lockedUntil && pinWallet.lockedUntil > failedAt) {
+          error.status = 429;
+          error.message = 'Wallet security verification is temporarily locked. Please try again later.';
+        } else {
+          const nextFailureCount = { $add: [{ $ifNull: ['$failedPinAttempts', 0] }, 1] };
+          const shouldLock = { $gte: [nextFailureCount, 5] };
+          const failedAttempt = await Wallet.findOneAndUpdate(
+            {
+              _id: pinWallet._id,
+              pinHash: pinWallet.pinHash,
+              $or: [{ lockedUntil: null }, { lockedUntil: { $exists: false } }, { lockedUntil: { $lte: failedAt } }],
+            },
+            [{
+              $set: {
+                failedPinAttempts: { $cond: [shouldLock, 0, nextFailureCount] },
+                lockedUntil: { $cond: [shouldLock, new Date(failedAt.getTime() + 5 * 60 * 1000), '$lockedUntil'] },
+              },
+            }],
+            { new: true },
+          ).select('lockedUntil').lean();
+          if (!failedAttempt || failedAttempt.lockedUntil > failedAt) {
+            error.status = 429;
+            error.message = 'Too many incorrect Wallet PIN attempts. Wallet payments are locked for 5 minutes.';
+          }
+        }
+      }
+    }
     const current = await WalletPaymentRequest.findOne({ requestId: req.params.requestId, status: 'Processing' }).select('requestId checkoutReference requesterUserId payerUserId expiresAt').lean();
     if (current) {
       const expired = current.expiresAt <= failedAt;
@@ -7186,9 +7246,9 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
       await WalletPaymentRequest.updateOne(
         { requestId: current.requestId, status: 'Processing' },
         {
-          $set: { status },
+          $set: { status, paymentStatus: expired || status === 'Cancelled' || Boolean(error.status) ? 'FAILED' : 'PENDING' },
           ...(status === 'Pending' ? {} : { $unset: { activeCheckoutKey: 1 } }),
-          $push: { statusHistory: { status: expired ? 'Payment Expired' : status === 'Cancelled' ? 'Payment Cancelled' : 'Awaiting Payment', at: failedAt } },
+          $push: { statusHistory: { status: expired ? 'Payment Expired' : status === 'Cancelled' ? 'Payment Cancelled' : error.status ? 'Payment Failed' : 'Awaiting Payment', at: failedAt } },
         },
       );
       broadcastWalletPaymentRequestUpdate(current, {
