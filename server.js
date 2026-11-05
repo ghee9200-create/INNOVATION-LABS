@@ -217,7 +217,7 @@ const Order = mongoose.model('Order', new mongoose.Schema({
   deliveryCharge: { type: Number, required: true, min: 0 },
   total: { type: Number, required: true, min: 0 },
   paymentStatus: { type: String, default: 'Paid' },
-  paymentMethod: { type: String, enum: ['Razorpay', 'Wallet'], default: 'Razorpay' },
+  paymentMethod: { type: String, enum: ['Razorpay', 'Wallet', 'Wallet QR'], default: 'Razorpay' },
   payerWalletId: String,
   walletBalanceAfterPaise: { type: Number, min: 0 },
   inventoryDeductedAt: Date,
@@ -1869,7 +1869,7 @@ const createInvoiceForOrder = async (session, order) => {
   if (!order || order.paymentStatus !== 'Paid' || !order.orderId) return null;
   const existing = await Invoice.findOne({ orderId: order.orderId }).session(session).lean();
   if (existing) return existing;
-  const walletPayment = order.paymentMethod === 'Wallet'
+  const walletPayment = ['Wallet', 'Wallet QR'].includes(order.paymentMethod)
     ? await WalletTransaction.findOne({ orderId: order.orderId, type: 'Purchase', status: 'Successful' }).session(session).select('referenceId').lean()
     : null;
   const invoice = {
@@ -6733,13 +6733,36 @@ const verifyCheckoutQrPayload = (payload) => {
   }
 };
 
+const expireCheckoutAttemptIfNeeded = async (reference, userId) => {
+  const now = new Date();
+  return CheckoutAttempt.findOneAndUpdate(
+    {
+      reference,
+      userId,
+      status: { $in: ['Open'] },
+      paymentStatus: 'Pending',
+      expiresAt: { $lte: now },
+    },
+    {
+      $set: {
+        status: 'Interrupted',
+        paymentStatus: 'Failed',
+        reason: 'Payment expired after four minutes without provider confirmation.',
+        exitedAt: now,
+      },
+    },
+    { new: true },
+  );
+};
+
 app.get('/api/checkout/payment-qr', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
   const reference = typeof req.query.reference === 'string' ? req.query.reference.trim() : '';
+  await expireCheckoutAttemptIfNeeded(reference, req.session.sub);
   const attempt = await CheckoutAttempt.findOne({
     reference,
     userId: req.session.sub,
-    status: { $in: ['Open', 'Completing', 'Completed'] },
-  }).select('reference totalPaise paymentStatus status').lean();
+    status: { $in: ['Open', 'Completing', 'Completed', 'Interrupted'] },
+  }).select('reference totalPaise paymentStatus status expiresAt reason').lean();
   if (!attempt) return res.status(409).json({ message: 'This checkout is no longer active. Return to checkout and try again.' });
   const completedOrder = attempt.status === 'Completed'
     ? await Order.findOne({ checkoutReference: attempt.reference }).select('orderId').lean()
@@ -6751,17 +6774,27 @@ app.get('/api/checkout/payment-qr', requireSession, requireDatabase, requireActi
     amount: money(attempt.totalPaise),
     paymentStatus: attempt.paymentStatus,
     checkoutStatus: attempt.status,
+    expiresAt: attempt.expiresAt,
+    reason: attempt.reason,
     orderId: completedOrder?.orderId || null,
   });
 });
 
 app.post('/api/checkout/payment-qr/start', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
   const reference = typeof req.body?.checkoutReference === 'string' ? req.body.checkoutReference.trim() : '';
-  const attempt = await CheckoutAttempt.findOneAndUpdate(
-    { reference, userId: req.session.sub, status: { $in: ['Open', 'Payment Initiated'] } },
-    { $set: { status: 'Open', stage: 'Payment Initiated', paymentStatus: 'Pending' } },
-    { new: true },
-  ).select('reference totalPaise paymentStatus status').lean();
+  let attempt = await CheckoutAttempt.findOne({
+    reference,
+    userId: req.session.sub,
+    status: { $in: ['Open', 'Payment Initiated'] },
+  });
+  if (attempt && !attempt.expiresAt) {
+    attempt.status = 'Open';
+    attempt.stage = 'Payment Initiated';
+    attempt.paymentStatus = 'Pending';
+    attempt.expiresAt = new Date(Date.now() + 4 * 60 * 1000);
+    await attempt.save();
+  }
+  attempt = attempt?.toObject();
   if (!attempt) return res.status(409).json({ message: 'This checkout is no longer active. Return to checkout and try again.' });
   return res.json({
     qrPayload: encodeCheckoutQrPayload(attempt),
@@ -6770,7 +6803,17 @@ app.post('/api/checkout/payment-qr/start', requireSession, requireDatabase, requ
     amount: money(attempt.totalPaise),
     paymentStatus: attempt.paymentStatus,
     checkoutStatus: attempt.status,
+    expiresAt: attempt.expiresAt,
   });
+});
+
+app.post('/api/checkout/payment-qr/expire', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
+  const reference = typeof req.body?.checkoutReference === 'string' ? req.body.checkoutReference.trim() : '';
+  const expired = await expireCheckoutAttemptIfNeeded(reference, req.session.sub);
+  const attempt = expired || await CheckoutAttempt.findOne({ reference, userId: req.session.sub })
+    .select('status paymentStatus expiresAt reason').lean();
+  if (!attempt) return res.status(404).json({ message: 'This checkout payment session was not found.' });
+  return res.json({ status: attempt.status, paymentStatus: attempt.paymentStatus, expiresAt: attempt.expiresAt, reason: attempt.reason });
 });
 
 app.post('/api/checkout/payment-qr/verify', requireSession, requireDatabase, requireActiveExclusiveQrTransfer, async (req, res) => {
@@ -6799,7 +6842,8 @@ app.post('/api/checkout/payment-qr/resolve', requireSession, requireDatabase, re
   const attempt = await CheckoutAttempt.findOne({
     reference: payload.reference,
     status: { $in: ['Open', 'Payment Initiated'] },
-  }).select('reference totalPaise paymentStatus').lean();
+    expiresAt: { $gt: new Date() },
+  }).select('reference totalPaise paymentStatus expiresAt').lean();
   if (!attempt || attempt.totalPaise !== payload.amountPaise) {
     return res.status(409).json({ message: 'This QR payment request is expired or no longer available.' });
   }
@@ -6808,6 +6852,7 @@ app.post('/api/checkout/payment-qr/resolve', requireSession, requireDatabase, re
     checkoutReference: attempt.reference,
     amount: money(attempt.totalPaise),
     paymentStatus: attempt.paymentStatus,
+    expiresAt: attempt.expiresAt,
   });
 });
 
@@ -6821,8 +6866,29 @@ app.post('/api/checkout/payment-qr/pay', requireSession, requireDatabase, requir
   const subscription = await currentSubscription(req.session.sub);
   if (subscription?.plan !== 'Exclusive') return res.status(403).json({ message: 'QR wallet payments are available to active Exclusive subscribers only.' });
   try {
+    await CheckoutAttempt.updateOne(
+      {
+        reference: payload.reference,
+        status: 'Open',
+        paymentStatus: 'Pending',
+        expiresAt: { $lte: new Date() },
+      },
+      {
+        $set: {
+          status: 'Interrupted',
+          paymentStatus: 'Failed',
+          reason: 'Payment expired after four minutes without provider confirmation.',
+          exitedAt: new Date(),
+        },
+      },
+    );
     const result = await withMongoTransaction(async (session) => {
-      const attempt = await CheckoutAttempt.findOne({ reference: payload.reference, status: { $in: ['Open', 'Payment Initiated'] } }).session(session);
+      const attempt = await CheckoutAttempt.findOne({
+        reference: payload.reference,
+        status: { $in: ['Open', 'Payment Initiated'] },
+        paymentStatus: 'Pending',
+        expiresAt: { $gt: new Date() },
+      }).session(session);
       if (!attempt || attempt.totalPaise !== payload.amountPaise) throw Object.assign(new Error('This QR payment request is expired or no longer available.'), { status: 409 });
       const referenceId = `checkout-qr:${attempt.reference}:${idempotencyKey}`;
       const duplicate = await WalletTransaction.findOne({ userId: req.session.sub, referenceId }).session(session).lean();
@@ -6849,6 +6915,9 @@ app.post('/api/checkout/payment-qr/pay', requireSession, requireDatabase, requir
       }));
       const { safeItems } = await resolveOrderItems(items, attempt.userId);
       const deliveryRequired = orderRequiresDelivery(safeItems);
+      if (deliveryRequired && !validateAddress(attempt.address)) {
+        throw Object.assign(new Error('The checkout delivery address is missing or incomplete. Please return to checkout and try again.'), { status: 409 });
+      }
       const checkoutData = calculateOrder(safeItems, attempt.service);
       const calculatedBase = checkoutData.totalPaise;
       if (attempt.totalPaise > calculatedBase || attempt.totalPaise < 0) throw Object.assign(new Error('The checkout amount no longer matches the order.'), { status: 409 });
@@ -6864,7 +6933,7 @@ app.post('/api/checkout/payment-qr/pay', requireSession, requireDatabase, requir
         userName: owner.name || owner.email?.split('@')[0] || 'Innovation Labs customer',
         userEmail: owner.email || attempt.customerEmail,
         items: orderItemsSnapshot(safeItems),
-        address: null,
+        address: deliveryRequired ? attempt.address : null,
         deliveryRequired,
         service: attempt.service,
         projectDescription: '',
@@ -11072,6 +11141,7 @@ const CheckoutAttempt = mongoose.model('CheckoutAttempt', new mongoose.Schema({
   customerEmail: { type: String, required: true, lowercase: true },
   customerPhone: { type: String, default: '' },
   items: { type: [mongoose.Schema.Types.Mixed], required: true },
+  address: { type: mongoose.Schema.Types.Mixed },
   service: { type: String, required: true },
   totalPaise: { type: Number, required: true, min: 0 },
   currency: { type: String, default: 'INR' },
@@ -11080,6 +11150,7 @@ const CheckoutAttempt = mongoose.model('CheckoutAttempt', new mongoose.Schema({
   reason: { type: String, default: '' },
   paymentStatus: { type: String, enum: ['Not Started', 'Pending', 'Paid', 'Failed'], default: 'Not Started' },
   paymentReference: String,
+  expiresAt: Date,
   razorpayOrderId: String,
   exitedAt: Date,
   completedAt: Date,
@@ -11498,13 +11569,33 @@ app.get('/api/checkout-attempts/:reference', requireSession, requireDatabase, as
   });
 });
 app.post('/api/checkout-attempts/:reference/stage', requireSession, requireDatabase, async (req, res) => {
+  const currentAttempt = await CheckoutAttempt.findOne({
+    reference: req.params.reference,
+    userId: req.session.sub,
+    status: 'Open',
+  }).select('items expiresAt').lean();
+  if (!currentAttempt) return res.status(409).json({ message: 'This checkout is no longer active.' });
+  const address = req.body?.address;
+  const hasAddress = address && typeof address === 'object' && !Array.isArray(address);
+  const deliveryRequired = (currentAttempt.items || []).some((item) => !item.discountOfferId);
+  if (deliveryRequired && (!hasAddress || !validateAddress(address))) {
+    return res.status(400).json({ message: 'Complete the required delivery address fields before starting payment.' });
+  }
+  const stageUpdate = {
+    $set: {
+      address,
+      stage: 'Payment Initiated',
+      paymentStatus: 'Pending',
+    },
+  };
+  if (!currentAttempt.expiresAt) stageUpdate.$set.expiresAt = new Date(Date.now() + 4 * 60 * 1000);
   const attempt = await CheckoutAttempt.findOneAndUpdate(
     { reference: req.params.reference, userId: req.session.sub, status: 'Open' },
-    { $set: { stage: 'Payment Initiated', paymentStatus: 'Pending' } },
+    stageUpdate,
     { new: true },
   );
   if (!attempt) return res.status(409).json({ message: 'This checkout is no longer active.' });
-  return res.json({ status: attempt.status, stage: attempt.stage });
+  return res.json({ status: attempt.status, stage: attempt.stage, expiresAt: attempt.expiresAt });
 });
 app.post('/api/checkout-attempts/:reference/razorpay/order', requireSession, requireDatabase, requirePurchaseAge, async (req, res) => {
   const attempt = await CheckoutAttempt.findOne({

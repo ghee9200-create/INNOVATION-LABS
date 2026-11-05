@@ -1400,7 +1400,9 @@ function App() {
     if (!reference) throw new Error('Checkout has not been recorded. Please try again.');
     await requestApi(`/api/checkout-attempts/${encodeURIComponent(reference)}/stage`, {
       method: 'POST',
-      body: '{}',
+      body: JSON.stringify({
+        address: cart.some((item) => !item.discountOfferId) ? address : undefined,
+      }),
     });
     return reference;
   };
@@ -4948,10 +4950,12 @@ function PromoPurchaseSuccess({ success, nextPromoReservationId, onCopy, onConti
   </div></main>;
 }
 
-function CheckoutQrPaymentPanel({ checkoutReference, amount, onReady }) {
+function CheckoutQrPaymentPanel({ checkoutReference, amount, onReady, onExpired }) {
   const [qrImage, setQrImage] = useState('');
   const [error, setError] = useState('');
   const [verifiedAmount, setVerifiedAmount] = useState(null);
+  const [expiresAt, setExpiresAt] = useState(null);
+  const [remainingSeconds, setRemainingSeconds] = useState(null);
   useEffect(() => {
     let active = true;
     setQrImage('');
@@ -4975,16 +4979,37 @@ function CheckoutQrPaymentPanel({ checkoutReference, amount, onReady }) {
         if (active) {
           setQrImage(image);
           setVerifiedAmount(verification.amount);
+          setExpiresAt(result.expiresAt);
           onReady({ qrPayload: result.qrPayload, checkoutReference, amount: verification.amount, paymentStatus: result.paymentStatus });
         }
       })
       .catch((requestError) => { if (active) setError(requestError.message || 'The official Innovation Labs QR could not be loaded.'); });
     return () => { active = false; };
   }, [checkoutReference, onReady]);
+  useEffect(() => {
+    if (!expiresAt) return undefined;
+    let expired = false;
+    const updateRemaining = () => {
+      const seconds = Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 1000));
+      setRemainingSeconds(seconds);
+      if (seconds === 0 && !expired) {
+        expired = true;
+        requestApi('/api/checkout/payment-qr/expire', {
+          method: 'POST',
+          body: JSON.stringify({ checkoutReference }),
+        }).then((result) => {
+          if (result.paymentStatus !== 'Paid') onExpired();
+        }).catch(() => onExpired());
+      }
+    };
+    updateRemaining();
+    const intervalId = window.setInterval(updateRemaining, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [checkoutReference, expiresAt, onExpired]);
   const displayAmount = verifiedAmount ?? amount;
   return <section className="wallet-checkout-summary" aria-live="polite">
     <h4>Pay With QR Code</h4>
-    {qrImage ? <><div className="wallet-qr-image-wrap"><img src={qrImage} alt="Innovation Labs checkout payment QR code" /></div><div className="summary-row"><span>Company</span><strong>Innovation Labs</strong></div><div className="summary-row"><span>Order reference</span><strong>{checkoutReference}</strong></div><div className="summary-row total"><span>Payment amount</span><strong>₹{Number(displayAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div><p>Scan this checkout payment request, then confirm payment with your Innovation Labs Wallet PIN. The amount is fixed and cannot be edited.</p></> : error ? <p className="voice-error" role="alert">{error}</p> : <p role="status">Preparing the Innovation Labs checkout QR code...</p>}
+    {qrImage ? <><div className="wallet-qr-image-wrap"><img src={qrImage} alt="Innovation Labs checkout payment QR code" /></div><div className="summary-row"><span>Company</span><strong>Innovation Labs</strong></div><div className="summary-row"><span>Order reference</span><strong>{checkoutReference}</strong></div><div className="summary-row total"><span>Payment amount</span><strong>₹{Number(displayAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div><p>Waiting for QR Payment...</p>{remainingSeconds != null && <p role="timer">Time remaining: {String(Math.floor(remainingSeconds / 60)).padStart(2, '0')}:{String(remainingSeconds % 60).padStart(2, '0')}</p>}<p>Scan this checkout payment request, then confirm payment with your Innovation Labs Wallet PIN. The amount is fixed and cannot be edited.</p></> : error ? <p className="voice-error" role="alert">{error}</p> : <p role="status">Preparing the Innovation Labs checkout QR code...</p>}
   </section>;
 }
 
@@ -5005,6 +5030,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
   const [walletPaymentMode, setWalletPaymentMode] = useState('pin');
   const [checkoutQrVerified, setCheckoutQrVerified] = useState(null);
   const [checkoutQrPaymentStatus, setCheckoutQrPaymentStatus] = useState('');
+  const [checkoutQrExpired, setCheckoutQrExpired] = useState(false);
   const [payerWalletId, setPayerWalletId] = useState('');
   const [payerWalletOwner, setPayerWalletOwner] = useState('');
   const [payerWalletIdVerified, setPayerWalletIdVerified] = useState(false);
@@ -5014,6 +5040,10 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
     setCheckoutQrVerified(value);
     setCheckoutQrPaymentStatus(value.paymentStatus || 'Pending');
   }, []);
+  const handleMerchantQrExpired = useCallback(() => {
+    setCheckoutQrExpired(true);
+    window.setTimeout(() => navigate('/'), 2000);
+  }, [navigate]);
   useRealtimeEvents(Boolean(auth && checkoutReference), (eventName, data) => {
     if (eventName !== 'checkout_payment_completed' || data?.checkoutReference !== checkoutReference) return;
     navigate(`/order-placed/${encodeURIComponent(data.orderId)}`);
@@ -5192,6 +5222,7 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
 
   useEffect(() => {
     setCheckoutQrVerified(null);
+    setCheckoutQrExpired(false);
     setCheckoutQrPaymentStatus('');
     setPayerWalletIdVerified(false);
     setPayerWalletOwner('');
@@ -5469,10 +5500,12 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
         {displayedCheckoutStep === 5 && (
           <div className="checkout-card checkout-step-card" key="checkout-step-5">
             <h3>Step 5 — {walletPaymentMode === 'pin' ? 'Pay With PIN' : walletPaymentMode === 'qr' ? 'Pay With QR Code' : 'Pay With Wallet ID'}</h3>
-            {paymentMethod === 'wallet' && walletPaymentMode === 'qr' &&             <CheckoutQrPaymentPanel
+            {checkoutQrExpired && <div className="alert-box" role="alert"><strong>Payment Time Expired</strong><p>Your payment was not confirmed within 4 minutes. Please try again.</p></div>}
+            {paymentMethod === 'wallet' && walletPaymentMode === 'qr' && !checkoutQrExpired && <CheckoutQrPaymentPanel
               checkoutReference={checkoutReference}
               amount={checkoutEstimate?.total}
               onReady={handleMerchantQrReady}
+              onExpired={handleMerchantQrExpired}
             />}
             {paymentMethod === 'wallet' && walletPaymentMode === 'wallet-id' && <section className="wallet-checkout-summary wallet-id-checkout-panel">
               <div className="wallet-id-checkout-heading">
@@ -6890,6 +6923,8 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
   const [recipient, setRecipient] = useState(null);
   const [transfer, setTransfer] = useState(null);
   const [checkoutQrPayment, setCheckoutQrPayment] = useState(null);
+  const [checkoutQrExpired, setCheckoutQrExpired] = useState(false);
+  const [checkoutQrRemainingSeconds, setCheckoutQrRemainingSeconds] = useState(null);
   const [stage, setStage] = useState('scan');
   const [amount, setAmount] = useState('');
   const [amountPaise, setAmountPaise] = useState(0);
@@ -6917,6 +6952,25 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
   const onRequestUnlockRef = useRef(onRequestUnlock);
   onRequestUnlockRef.current = onRequestUnlock;
   const availableBalance = Number(wallet?.availableBalance ?? wallet?.balance ?? 0);
+
+  useEffect(() => {
+    if (stage !== 'checkout-qr' || !checkoutQrPayment?.expiresAt) return undefined;
+    let expired = false;
+    const updateRemaining = () => {
+      if (expired) return;
+      const seconds = Math.max(0, Math.ceil((new Date(checkoutQrPayment.expiresAt).getTime() - Date.now()) / 1000));
+      setCheckoutQrRemainingSeconds(seconds);
+      if (seconds === 0) {
+        expired = true;
+        setCheckoutQrExpired(true);
+        setError('Payment Time Expired\nYour payment was not confirmed within 4 minutes. Please try again.');
+        window.setTimeout(() => navigate('/'), 2000);
+      }
+    };
+    updateRemaining();
+    const intervalId = window.setInterval(updateRemaining, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [checkoutQrPayment, navigate, stage]);
 
   useEffect(() => {
     if (!auth) return undefined;
@@ -7009,6 +7063,8 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
           body: JSON.stringify({ qrPayload }),
         });
         setCheckoutQrPayment({ ...result, qrPayload: qrPayload.trim() });
+        setCheckoutQrExpired(false);
+        setCheckoutQrRemainingSeconds(null);
         setPin('');
         setPinVisible(false);
         setStage('checkout-qr');
@@ -7032,7 +7088,7 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
   }, [stopScanner]);
 
   const submitCheckoutQrPayment = async () => {
-    if (busy || pin.length !== 4 || !checkoutQrPayment) return;
+    if (busy || pin.length !== 4 || !checkoutQrPayment || checkoutQrExpired) return;
     setBusy(true);
     setError('');
     if (!transferKeyRef.current) transferKeyRef.current = globalThis.crypto?.randomUUID?.()
@@ -7362,8 +7418,7 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
           <strong className="wallet-payment-pin-amount">₹{Number(checkoutQrPayment.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
           <small>Order reference · {checkoutQrPayment.checkoutReference}</small>
         </div>
-        <p>Payment will be deducted from this Wallet account. The amount cannot be changed.</p>
-        <button type="button" className="wallet-payment-primary" disabled={busy} onClick={() => { setPin(''); setStage('checkout-qr-pin'); }}>PAY ₹{Number(checkoutQrPayment.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</button>
+        {checkoutQrExpired ? <div className="voice-error" role="alert"><strong>Payment Time Expired</strong><p>Your payment was not confirmed within 4 minutes. Please try again.</p></div> : <><p>Waiting for QR Payment...</p>{checkoutQrRemainingSeconds != null && <p role="timer">Time remaining: {String(Math.floor(checkoutQrRemainingSeconds / 60)).padStart(2, '0')}:{String(checkoutQrRemainingSeconds % 60).padStart(2, '0')}</p>}<p>Payment will be deducted from this Wallet account. The amount cannot be changed.</p><button type="button" className="wallet-payment-primary" disabled={busy} onClick={() => { setPin(''); setStage('checkout-qr-pin'); }}>PAY ₹{Number(checkoutQrPayment.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</button></>}
       </section>}
 
       {stage === 'checkout-qr-pin' && checkoutQrPayment && <section className="wallet-payment-card wallet-payment-pin-stage">
