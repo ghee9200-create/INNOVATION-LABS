@@ -6704,3 +6704,16 @@ body.modal-open {
 .plans-page .ai-trial-status-facts strong { color: #7de6f1; }
 .checkout-estimate-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #ff9ca7; font-size: .86rem; line-height: 1.5; }
 .checkout-estimate-error .secondary-btn { flex: 0 0 auto; }
+.wallet-purchase-options { display: grid; gap: 14px; margin-top: 16px; }
+.wallet-purchase-options h3 { margin: 0; font-size: 1rem; }
+.wallet-purchase-option-buttons { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.wallet-purchase-option-buttons button { min-height: 48px; }
+.wallet-purchase-option-panel { display: grid; gap: 12px; padding: 16px; border: 1px solid rgba(0,209,255,0.18); border-radius: 12px; background: rgba(0,209,255,0.035); }
+.wallet-purchase-option-panel p { margin: 0; color: var(--muted); line-height: 1.45; }
+.wallet-purchase-option-panel label { display: grid; gap: 7px; }
+.wallet-purchase-qr { width: min(100%, 260px); justify-self: center; padding: 8px; border-radius: 12px; background: #fff; }
+.wallet-purchase-options .wallet-payment-keypad { width: min(100%, 320px); }
+@media (max-width: 600px) {
+  .wallet-purchase-option-buttons { grid-template-columns: 1fr; }
+  .wallet-purchase-option-buttons button { width: 100%; }
+}

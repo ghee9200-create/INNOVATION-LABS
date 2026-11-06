@@ -1394,9 +1394,9 @@ function App() {
           setCartPriceNotice(`Product price updated (${result.priceChanges.map((item) => `${item.name}: ₹${Number(item.previousPrice).toLocaleString('en-IN')} → ₹${Number(item.currentPrice).toLocaleString('en-IN')}`).join(', ')}). Review the updated total before payment.`);
         }
         if (Array.isArray(result.items)) {
-          const currentById = new Map(result.items.map((item) => [String(item.id), item]));
+          const currentById = new Map(result.items.map((item) => [String(item.discountOfferId || item.id), item]));
           setCart((current) => current.map((cartItem) => {
-            const latest = currentById.get(String(cartItem.id));
+            const latest = currentById.get(String(cartItem.discountOfferId || cartItem.id));
             return latest ? { ...cartItem, name: latest.name, category: latest.category, price: Number(latest.price) } : cartItem;
           }));
         }
@@ -2078,6 +2078,7 @@ function App() {
         <Route path="/wallet/payment-requests" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletPaymentRequestsPage />} />
         <Route path="/wallet/payment-requests/:requestId/pin" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletPaymentPinPage />} />
         <Route path="/wallet/scan-pay" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletQrTransferPage auth={auth} accessVersion={walletAccessVersion} onRequestUnlock={() => openWalletUnlock(true, '/wallet/scan-pay')} />} />
+        <Route path="/wallet/purchase-qr-scan" element={authLoading ? <AccountLoadingPage /> : !auth ? <SignInRequiredPage onSignIn={() => openModal('google-login')} /> : <WalletQrTransferPage auth={auth} accessVersion={walletAccessVersion} purchaseQrOnly onRequestUnlock={() => openWalletUnlock(true, '/wallet/purchase-qr-scan')} />} />
         <Route path="/refund/:orderId" element={authLoading ? <AccountLoadingPage /> : auth ? <RefundRequestPage auth={auth} onSubmitted={handleRefundSubmitted} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/refunds/:id" element={authLoading ? <AccountLoadingPage /> : auth ? <RefundStatusPage auth={auth} /> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
         <Route path="/admin/refunds" element={authLoading ? <AccountLoadingPage /> : auth?.isAdmin ? <AdminWorkspaceLayout currentPath="/admin/refunds"><AdminRefundsPage auth={auth} refunds={adminRefunds} error={adminOrderError} /></AdminWorkspaceLayout> : <SignInRequiredPage onSignIn={() => openModal('google-login')} />} />
@@ -2968,6 +2969,7 @@ function SubscriptionCheckoutPage({ auth, onSubscriptionChange }) {
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
   const [activation, setActivation] = useState(null);
+  const [walletPurchaseIntent, setWalletPurchaseIntent] = useState(null);
   const idempotencyKeyRef = useRef(globalThis.crypto?.randomUUID?.() || `plan-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`);
 
   useEffect(() => {
@@ -2976,6 +2978,7 @@ function SubscriptionCheckoutPage({ auth, onSubscriptionChange }) {
     if (!preview) setLoading(true);
     setMessage('');
     setActivation(null);
+    setWalletPurchaseIntent(null);
     requestApi(`/api/subscription/checkout/${encodeURIComponent(plan || '')}?months=${encodeURIComponent(durationMonths)}`)
       .then((result) => { if (active) setPreview(result); })
       .catch((error) => { if (active) setMessage(error.message || 'Subscription checkout is unavailable.'); })
@@ -3006,6 +3009,33 @@ function SubscriptionCheckoutPage({ auth, onSubscriptionChange }) {
     } catch (error) {
       setMessage(`Your subscription is active, but account details could not be refreshed: ${error.message}`);
     }
+  };
+
+  const prepareWalletSubscription = async () => {
+    if (busy || !preview || !previewIsCurrent) return;
+    setBusy(true);
+    setMessage('');
+    try {
+      const result = await requestApi('/api/subscription/purchase-intents', {
+        method: 'POST',
+        body: JSON.stringify({
+          plan: preview.plan,
+          durationMonths: preview.durationMonths,
+          idempotencyKey: idempotencyKeyRef.current,
+        }),
+      });
+      setWalletPurchaseIntent(result.purchase);
+    } catch (error) {
+      setMessage(error.message || 'Wallet payment could not be prepared.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const completeExternalSubscription = async () => {
+    const result = await requestApi('/api/subscription');
+    if (!result.current || result.current.plan === 'Starter') throw new Error('Subscription activation has not been confirmed yet.');
+    await completeActivation({ subscription: result.current, cashback: 0, credits: 0 });
   };
 
   const payWallet = async (event) => {
@@ -3150,7 +3180,14 @@ function SubscriptionCheckoutPage({ auth, onSubscriptionChange }) {
             <label><input type="radio" name="subscription-payment-method" value="Wallet" checked={paymentMethod === 'Wallet'} disabled={busy} onChange={() => { setPaymentMethod('Wallet'); setMessage(''); }} /> Innovation Labs Wallet</label>
             <label><input type="radio" name="subscription-payment-method" value="Razorpay" checked={paymentMethod === 'Razorpay'} disabled={busy} onChange={() => { setPaymentMethod('Razorpay'); setMessage(''); }} /> Razorpay</label>
           </div>
-          {paymentMethod === 'Wallet' && <button type="button" className="primary-btn full subscription-pay-button" disabled={busy || !previewIsCurrent || !preview.wallet.walletRecordAvailable || Number(preview.wallet.availableBalance) < Number(expectedTotalPaise) / 100} onClick={() => { setMessage(''); setPin(''); setPinOpen(true); }}>Verify Wallet PIN</button>}
+          {paymentMethod === 'Wallet' && !walletPurchaseIntent && <button type="button" className="primary-btn full subscription-pay-button" disabled={busy || !previewIsCurrent} onClick={prepareWalletSubscription}>{busy ? 'Preparing secure payment…' : 'NEXT'}</button>}
+          {paymentMethod === 'Wallet' && walletPurchaseIntent && <WalletPurchaseMethodOptions
+            purchaseCategory="subscription"
+            purchaseId={walletPurchaseIntent.purchaseId}
+            amount={walletPurchaseIntent.amount}
+            onPinPayment={() => { setMessage(''); setPin(''); setPinOpen(true); }}
+            onPaymentComplete={completeExternalSubscription}
+          />}
           {paymentMethod === 'Razorpay' && <button type="button" className="primary-btn full subscription-pay-button" disabled={busy || !previewIsCurrent} onClick={payRazorpay}>
             {busy ? <><span className="subscription-spinner" aria-hidden="true" />Processing payment...</> : `PAY ${displayPrice(preview.pricePaise)} WITH RAZORPAY`}
           </button>}
@@ -3168,6 +3205,7 @@ function SubscriptionCheckoutPage({ auth, onSubscriptionChange }) {
         <p>Pay {displayPrice(preview?.pricePaise)} for the {displayPlanName(preview?.plan)} subscription.</p>
         <label>Enter your 4-digit Wallet PIN</label>
         <PinBoxes value={pin} onChange={(value) => { setPin(value); setMessage(''); }} focusVersion={pinFocusVersion} disabled={busy} />
+        <WalletNumericKeypad value={pin} onChange={(value) => { setPin(value); setMessage(''); }} disabled={busy} />
         {message && <p className="plan-dialog-error" role="alert">{message}</p>}
         <div className="plan-payment-options">
           <button type="button" className="secondary-btn" disabled={busy} onClick={() => setPinOpen(false)}>Cancel</button>
@@ -3565,6 +3603,169 @@ function AIBillCreditSection() {
   </>;
 }
 
+function WalletPurchaseMethodOptions({ purchaseCategory, purchaseId, amount, details, onPinPayment, onPaymentComplete }) {
+  const [method, setMethod] = useState('');
+  const [walletId, setWalletId] = useState('');
+  const [payment, setPayment] = useState(null);
+  const [qrImage, setQrImage] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [remainingSeconds, setRemainingSeconds] = useState(null);
+  const completedRef = useRef('');
+  const onPaymentCompleteRef = useRef(onPaymentComplete);
+  onPaymentCompleteRef.current = onPaymentComplete;
+
+  useEffect(() => {
+    if (!payment?.paymentId || !['PENDING', 'PROCESSING'].includes(payment.status)) return undefined;
+    let active = true;
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const result = await requestApi(`/api/wallet/purchase-payments/${encodeURIComponent(payment.paymentId)}`);
+        if (!active) return;
+        setPayment((current) => ({ ...current, ...result }));
+        if (result.status === 'SUCCESS' && completedRef.current !== result.paymentId) {
+          await onPaymentCompleteRef.current?.(result);
+          completedRef.current = result.paymentId;
+        }
+      } catch (requestError) {
+        if (active) setError(requestError.message);
+      } finally {
+        inFlight = false;
+      }
+    };
+    refresh();
+    const intervalId = window.setInterval(refresh, 2500);
+    return () => { active = false; window.clearInterval(intervalId); };
+  }, [payment?.paymentId, payment?.status]);
+
+  useEffect(() => {
+    if (!payment?.expiresAt || !['PENDING', 'PROCESSING'].includes(payment.status)) {
+      setRemainingSeconds(null);
+      return undefined;
+    }
+    const update = () => {
+      setRemainingSeconds(Math.max(0, Math.ceil((new Date(payment.expiresAt).getTime() - Date.now()) / 1000)));
+    };
+    update();
+    const intervalId = window.setInterval(update, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [payment?.expiresAt, payment?.status]);
+
+  const displayAmount = `₹${Number(payment?.amount ?? amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const startQr = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const result = await requestApi('/api/wallet/purchase-qr', {
+        method: 'POST',
+        body: JSON.stringify({ purchaseCategory, purchaseId }),
+      });
+      const image = await QRCode.toDataURL(result.qrPayload, {
+        width: 400, margin: 3, errorCorrectionLevel: 'H',
+        color: { dark: '#07151c', light: '#ffffff' },
+      });
+      setQrImage(image);
+      setPayment({
+        paymentId: result.intentId,
+        purchaseCategory,
+        purchaseId,
+        amount: result.amount,
+        expiresAt: result.expiresAt,
+        status: 'PENDING',
+      });
+      setMethod('qr');
+    } catch (requestError) {
+      setError(requestError.message || 'The purchase QR could not be prepared.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startWalletId = async () => {
+    if (busy || !walletId.trim()) {
+      setError('Enter the paying Wallet ID.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const result = await requestApi('/api/wallet/purchase-requests', {
+        method: 'POST',
+        body: JSON.stringify({
+          purchaseCategory,
+          purchaseId,
+          walletId: walletId.trim(),
+          idempotencyKey: globalThis.crypto?.randomUUID?.() || `purchase-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+          details,
+        }),
+      });
+      setPayment({
+        paymentId: result.requestId,
+        purchaseCategory,
+        purchaseId,
+        amount: result.amount,
+        expiresAt: result.expiresAt,
+        status: result.paymentStatus || 'PENDING',
+        requestStatus: result.status,
+      });
+      setMethod('wallet-id');
+    } catch (requestError) {
+      setError(requestError.message || 'The Wallet ID payment request could not be created.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <section className="wallet-purchase-options" aria-label="Wallet payment options">
+    <h3>Choose how to pay with Wallet</h3>
+    {!method && <div className="wallet-purchase-option-buttons">
+      <button type="button" className="secondary-btn" disabled={busy} onClick={() => setMethod('pin')}>Verify with PIN</button>
+      <button type="button" className="secondary-btn" disabled={busy} onClick={startQr}>Pay with QR Code</button>
+      <button type="button" className="secondary-btn" disabled={busy} onClick={() => { setError(''); setMethod('wallet-id'); }}>Pay with Wallet ID</button>
+    </div>}
+    {method === 'pin' && <div className="wallet-purchase-option-panel">
+      <p>Pay {displayAmount} from your Innovation Labs Wallet.</p>
+      <button type="button" className="secondary-btn" onClick={() => setMethod('')}>Back</button>
+      <button type="button" className="primary-btn full" onClick={onPinPayment}>Enter Wallet PIN</button>
+    </div>}
+    {method === 'wallet-id' && !payment && <div className="wallet-purchase-option-panel">
+      <label>Paying Wallet ID<input value={walletId} onChange={(event) => setWalletId(event.target.value)} autoComplete="off" /></label>
+      <p>Payment is requested from the verified Wallet owner. The amount is fixed at {displayAmount}.</p>
+      <div className="modal-actions"><button type="button" className="secondary-btn" onClick={() => setMethod('')}>Back</button><button type="button" className="primary-btn" disabled={busy || !walletId.trim()} onClick={startWalletId}>{busy ? 'Sending request…' : 'Request Payment'}</button></div>
+    </div>}
+    {method === 'qr' && payment && <div className="wallet-purchase-option-panel">
+      {qrImage && <img className="wallet-purchase-qr" src={qrImage} alt="Wallet purchase payment QR code" />}
+      <p>Scan with Innovation Labs Wallet · Fixed amount {displayAmount}</p>
+      <Link className="secondary-btn" to="/wallet/purchase-qr-scan">Open Wallet QR scanner</Link>
+      {remainingSeconds != null && <p role="timer">Expires in {String(Math.floor(remainingSeconds / 60)).padStart(2, '0')}:{String(remainingSeconds % 60).padStart(2, '0')}</p>}
+      {payment.status === 'SUCCESS' && <p role="status">Payment Successful</p>}
+      {payment.status === 'FAILED' && <p role="alert">Payment request expired or failed. Start a fresh request.</p>}
+      {payment.status === 'FAILED' && <button type="button" className="secondary-btn" onClick={() => { setPayment(null); setQrImage(''); setMethod(''); }}>Start again</button>}
+    </div>}
+    {method === 'wallet-id' && payment && <div className="wallet-purchase-option-panel">
+      <strong>AWAITING PAYMENT</strong><p>Requested amount {displayAmount}</p>
+      {remainingSeconds != null && <p role="timer">Expires in {String(Math.floor(remainingSeconds / 60)).padStart(2, '0')}:{String(remainingSeconds % 60).padStart(2, '0')}</p>}
+      {payment.status === 'SUCCESS' && <p role="status">Payment Successful</p>}
+      {payment.status === 'FAILED' && <p role="alert">Payment request expired or failed. Start a fresh request.</p>}
+      {payment.status === 'FAILED' && <button type="button" className="secondary-btn" onClick={() => { setPayment(null); setMethod(''); }}>Start again</button>}
+    </div>}
+    {busy && !payment && <p role="status">Preparing secure payment…</p>}
+    {error && <p className="voice-error" role="alert">{error}</p>}
+  </section>;
+}
+
+function WalletNumericKeypad({ value, onChange, disabled = false }) {
+  const update = (key) => onChange(key === 'delete'
+    ? value.slice(0, -1)
+    : key === 'clear' ? '' : value.length < 4 ? `${value}${key}` : value);
+  return <div className="wallet-payment-keypad wallet-payment-pin-keypad" aria-label="Wallet PIN numeric keyboard">
+    {['1', '2', '3', '4', '5', '6', '7', '8', '9', 'delete', '0', 'clear'].map((key) => <button type="button" key={key} disabled={disabled} onClick={() => update(key)}>{key === 'delete' ? '⌫' : key === 'clear' ? '×' : key}</button>)}
+  </div>;
+}
+
 function AddCreditsPage() {
   const navigate = useNavigate();
   const [credits, setCredits] = useState('');
@@ -3677,6 +3878,12 @@ function AddCreditsPage() {
     } finally { setBusy(false); }
   };
 
+  const completeExternalCreditPayment = async () => {
+    if (!purchase) return;
+    const result = await requestApi(`/api/credits/purchase/${encodeURIComponent(purchase.purchaseId)}`);
+    setSuccess({ purchase: result.purchase, balance: result.creditBalance || 0 });
+  };
+
   const reconcilePendingCreditPayment = async () => {
     if (!pendingPayment || busy) return;
     setBusy(true);
@@ -3716,11 +3923,17 @@ function AddCreditsPage() {
         <div><span>Balance After Payment</span><strong>{walletBalance == null ? 'Shown after verification' : `₹${Math.max(0, walletBalance - purchase.totalAmount).toLocaleString('en-IN')}`}</strong></div>
         {walletBalance != null && walletBalance < purchase.totalAmount && <><p className="wallet-insufficient">Insufficient wallet balance. Required: ₹{purchase.totalAmount.toLocaleString('en-IN')} · Available: ₹{walletBalance.toLocaleString('en-IN')}</p><Link className="secondary-btn small" to="/wallet">Add Money to Wallet</Link></>}
       </div>}
-      {purchase?.paymentMethod === 'Wallet' && (walletBalance == null || walletBalance >= purchase.totalAmount) && <button type="button" className="primary-btn full" disabled={busy} onClick={() => setPinOpen(true)}>{busy ? 'Processing Payment...' : `Pay ₹${purchase.totalAmount.toLocaleString('en-IN')}`}</button>}
+      {purchase?.paymentMethod === 'Wallet' && <WalletPurchaseMethodOptions
+        purchaseCategory="credits"
+        purchaseId={purchase.purchaseId}
+        amount={purchase.totalAmount}
+        onPinPayment={() => setPinOpen(true)}
+        onPaymentComplete={completeExternalCreditPayment}
+      />}
       {purchase?.paymentMethod === 'Razorpay' && <button type="button" className="primary-btn full" disabled={busy} onClick={() => openOnlineCreditCheckout(purchase)}>{busy ? 'Opening Online Payment...' : 'Continue Online Payment'}</button>}
-      {!purchase && <button className="primary-btn full" disabled={busy || !validQuantity}>{busy ? 'Preparing Payment...' : 'Continue'}</button>}
+      {!purchase && <button className="primary-btn full" disabled={busy || !validQuantity}>{busy ? 'Preparing Payment...' : method === 'Wallet' ? 'NEXT' : 'Continue'}</button>}
     </form>
-    {pinOpen && <div className="wallet-lock-overlay"><div className="wallet-pin-modal"><h2>Confirm Wallet Payment</h2><p>Amount ₹{purchase.totalAmount.toLocaleString('en-IN')} · {purchase.credits.toLocaleString('en-IN')} Credits</p><p>Enter your 4-digit wallet PIN.</p><PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} /><>{error && <p className="voice-error" role="alert">{error}</p>}</><div className="modal-actions"><button className="secondary-btn" disabled={busy} onClick={() => setPinOpen(false)}>Cancel</button><button className="primary-btn" disabled={busy || pin.length !== 4} onClick={confirmWalletPayment}>{busy ? 'Confirming...' : 'Confirm Payment'}</button></div></div></div>}
+    {pinOpen && <div className="wallet-lock-overlay"><div className="wallet-pin-modal"><h2>Confirm Wallet Payment</h2><p>Amount ₹{purchase.totalAmount.toLocaleString('en-IN')} · {purchase.credits.toLocaleString('en-IN')} Credits</p><p>Enter your 4-digit wallet PIN.</p><PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} /><WalletNumericKeypad value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy} />{error && <p className="voice-error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => setPinOpen(false)}>Cancel</button><button type="button" className="primary-btn" disabled={busy || pin.length !== 4} onClick={confirmWalletPayment}>{busy ? 'Confirming...' : 'Confirm Payment'}</button></div></div></div>}
   </div></main>;
 }
 
@@ -3835,6 +4048,15 @@ function AddBillsPage() {
     } finally { setBusy(false); }
   };
 
+  const completeExternalBillPayment = async () => {
+    if (!purchase) return;
+    const [purchaseResult, bills] = await Promise.all([
+      requestApi(`/api/bills/purchase/${encodeURIComponent(purchase.purchaseId)}`),
+      requestApi('/api/ai-bills'),
+    ]);
+    setSuccess({ ...purchaseResult, bills });
+  };
+
   const reconcilePendingPurchase = async () => {
     if (!pendingOnlinePurchase || busy) return;
     setBusy(true);
@@ -3896,14 +4118,21 @@ function AddBillsPage() {
         {Number(walletBalance || 0) < Number(purchase.totalAmount) && <><p className="wallet-insufficient">Insufficient wallet balance. Required: ₹{Number(purchase.totalAmount).toLocaleString('en-IN')}.</p><Link className="secondary-btn small" to="/wallet">Add Money to Wallet</Link></>}
         <button type="button" className="secondary-btn small" disabled={busy} onClick={() => { setPurchase(null); setWalletBalance(null); }}>Change payment method</button>
       </div>}
-      {purchase?.paymentMethod === 'Wallet' && Number(walletBalance || 0) >= Number(purchase.totalAmount) && <button type="button" className="primary-btn full" disabled={busy} onClick={() => setPinOpen(true)}>{busy ? 'Processing Payment…' : `Pay ₹${Number(purchase.totalAmount).toLocaleString('en-IN')}`}</button>}
-      {!purchase && <button className="primary-btn full" disabled={busy || !validQuantity}>{busy ? 'Preparing Payment…' : 'Continue to Payment'}</button>}
+      {purchase?.paymentMethod === 'Wallet' && <WalletPurchaseMethodOptions
+        purchaseCategory="ai-bills"
+        purchaseId={purchase.purchaseId}
+        amount={purchase.totalAmount}
+        onPinPayment={() => setPinOpen(true)}
+        onPaymentComplete={completeExternalBillPayment}
+      />}
+      {!purchase && <button className="primary-btn full" disabled={busy || !validQuantity}>{busy ? 'Preparing Payment…' : method === 'Wallet' ? 'NEXT' : 'Continue to Payment'}</button>}
     </form>
     {pinOpen && <div className="wallet-lock-overlay"><div className="wallet-pin-modal" role="dialog" aria-modal="true" aria-labelledby="bill-wallet-payment-title">
       <h2 id="bill-wallet-payment-title">Confirm Wallet Payment</h2><p>₹{Number(purchase.totalAmount).toLocaleString('en-IN')} · {purchase.quantity} AI bill{purchase.quantity === 1 ? '' : 's'}</p><p>Enter your 4-digit wallet PIN.</p>
       <PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} />
+      <WalletNumericKeypad value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy} />
       {error && <p className="voice-error" role="alert">{error}</p>}
-      <div className="modal-actions"><button className="secondary-btn" disabled={busy} onClick={() => setPinOpen(false)}>Cancel</button><button className="primary-btn" disabled={busy || pin.length !== 4} onClick={confirmWalletPayment}>{busy ? 'Confirming…' : 'Confirm Payment'}</button></div>
+      <div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => setPinOpen(false)}>Cancel</button><button type="button" className="primary-btn" disabled={busy || pin.length !== 4} onClick={confirmWalletPayment}>{busy ? 'Confirming…' : 'Confirm Payment'}</button></div>
     </div></div>}
   </div></main>;
 }
@@ -4691,6 +4920,7 @@ function PromoCodePaymentPage({ auth, address, setAddress, savedAddresses, saveA
   const navigate = useNavigate();
   const [reservation, setReservation] = useState(null);
   const [paymentMethod, setPaymentMethod] = useState('');
+  const [walletOptionsReady, setWalletOptionsReady] = useState(false);
   const [walletBalance, setWalletBalance] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -4724,6 +4954,7 @@ function PromoCodePaymentPage({ auth, address, setAddress, savedAddresses, saveA
       if (!active) return;
       setReservation(result);
       setPaymentMethod(result.paymentMethod || '');
+      setWalletOptionsReady(false);
       setWalletBalance(result.walletBalance);
       setRecipientEmail(result.giftRecipientEmail || '');
       setRecipientVerified(Boolean(result.giftRecipientEmail) && result.recipientType === 'gift' && result.purchaseType === 'online');
@@ -4761,6 +4992,7 @@ function PromoCodePaymentPage({ auth, address, setAddress, savedAddresses, saveA
     try {
       const result = await requestApi(`/api/promo-codes/reservations/${encodeURIComponent(reservationId)}/payment-method`, { method: 'PATCH', body: JSON.stringify({ paymentMethod: method }) });
       setPaymentMethod(result.paymentMethod);
+      setWalletOptionsReady(false);
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -4774,6 +5006,15 @@ function PromoCodePaymentPage({ auth, address, setAddress, savedAddresses, saveA
     setPin('');
     navigate(`/order-placed/${encodeURIComponent(savedOrder.orderId || savedOrder.id)}`, { state: { order: savedOrder } });
   };
+
+  const completeExternalPromoPayment = async () => {
+    const result = await requestApi(`/api/promo-codes/reservations/${encodeURIComponent(reservationId)}`);
+    if (!result.order) throw new Error('The Promo Code order has not been confirmed yet.');
+    finishPurchase({ ...result, reservationId });
+  };
+
+  const promoPayableAmount = Number(reservation?.paymentEstimate?.payableAmount ?? reservation?.promoCode?.amount ?? 0);
+  const promoDiscountAmount = Number(reservation?.paymentEstimate?.subscriptionDiscount ?? 0);
 
   const verifyGiftRecipient = async () => {
     if (busy || recipientVerifyBusy) return;
@@ -4942,10 +5183,10 @@ function PromoCodePaymentPage({ auth, address, setAddress, savedAddresses, saveA
       <Link className="back-link" to="/cart">← Back to Cart</Link>
       <header className="promo-payment-heading"><span className="eyebrow">{reservation.purchaseType === 'offline' ? 'Offline purchase' : 'Online purchase'}{reservation.recipientType === 'gift' ? ' · Gift' : ''}</span><h1>Secure Payment</h1><p>{reservation.recipientType === 'gift' ? `Promo Code gift for ${reservation.giftRecipientEmail || recipientEmail}` : 'Promo Code purchase'}</p></header>
       {error && <div className="alert-box" role="alert">{error}</div>}
-      {reservation.purchaseType === 'offline' && <PromoOfflineOrderSummary amount={reservation.promoCode.amount} buyer={auth} buyerAddress={reservation.recipientType === 'gift' ? buyerDeliveryAddress : null} recipientAddress={deliveryAddress} recipientType={reservation.recipientType} recipientEmail={recipientEmail} />}
-      <section className="promo-payment-card"><div className="promo-payment-code"><span>Promo Code</span><strong>Hidden until purchase</strong></div><div className="promo-payment-value"><span>Wallet Value</span><strong>₹{reservation.promoCode.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div><div className="promo-payment-methods"><strong>Payment Method</strong><label><input type="radio" name="promo-payment-method" checked={paymentMethod === 'Wallet'} disabled={busy} onChange={() => choosePayment('Wallet')} /> Wallet</label><label><input type="radio" name="promo-payment-method" checked={paymentMethod === 'Razorpay'} disabled={busy} onChange={() => choosePayment('Razorpay')} /> Razorpay / Online Payment</label></div>{paymentMethod === 'Wallet' && <div className="promo-payment-wallet"><div><span>Wallet Balance</span><strong>{walletBalance == null ? 'Available after authorization' : `₹${walletBalance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`}</strong></div><div><span>Promo Code Value</span><strong>₹{reservation.promoCode.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{walletBalance != null && <div><span>Remaining Wallet Balance</span><strong>₹{Math.max(0, walletBalance - reservation.promoCode.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}</div>}<div className="promo-payment-total"><span>Total</span><strong>₹{reservation.promoCode.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{paymentMethod === 'Wallet' ? <><p className="promo-pin-note">Your 4-digit Wallet PIN will be required to authorize this payment.</p><button className="primary-btn full" disabled={busy} onClick={() => setPinOpen(true)}>Continue Payment</button></> : paymentMethod === 'Razorpay' ? <button className="primary-btn full" disabled={busy} onClick={payRazorpay}>{busy ? 'Preparing secure payment...' : 'Continue Payment'}</button> : <button className="primary-btn full" disabled>Choose a payment method</button>}</section>
+      {reservation.purchaseType === 'offline' && <PromoOfflineOrderSummary amount={reservation.promoCode.amount} payableAmount={promoPayableAmount} subscriptionDiscount={promoDiscountAmount} buyer={auth} buyerAddress={reservation.recipientType === 'gift' ? buyerDeliveryAddress : null} recipientAddress={deliveryAddress} recipientType={reservation.recipientType} recipientEmail={recipientEmail} />}
+      <section className="promo-payment-card"><div className="promo-payment-code"><span>Promo Code</span><strong>Hidden until purchase</strong></div><div className="promo-payment-value"><span>Wallet Value</span><strong>₹{reservation.promoCode.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div><div className="promo-payment-methods"><strong>Payment Method</strong><label><input type="radio" name="promo-payment-method" checked={paymentMethod === 'Wallet'} disabled={busy} onChange={() => choosePayment('Wallet')} /> Wallet</label><label><input type="radio" name="promo-payment-method" checked={paymentMethod === 'Razorpay'} disabled={busy} onChange={() => choosePayment('Razorpay')} /> Razorpay / Online Payment</label></div>{paymentMethod === 'Wallet' && <div className="promo-payment-wallet"><div><span>Wallet Balance</span><strong>{walletBalance == null ? 'Available after authorization' : `₹${walletBalance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`}</strong></div><div><span>Promo Code Value</span><strong>₹{reservation.promoCode.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{promoDiscountAmount > 0 && <div><span>Subscription Discount</span><strong>−₹{promoDiscountAmount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}{walletBalance != null && <div><span>Remaining Wallet Balance</span><strong>₹{Math.max(0, walletBalance - promoPayableAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>}</div>}<div className="promo-payment-total"><span>Amount Payable</span><strong>₹{promoPayableAmount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></div>{paymentMethod === 'Wallet' ? walletOptionsReady ? <WalletPurchaseMethodOptions purchaseCategory="wallet-promo-code" purchaseId={reservationId} amount={promoPayableAmount} details={{ address: deliveryAddress, recipientAddress: deliveryAddress, buyerAddress: buyerDeliveryAddress, recipientEmail }} onPinPayment={() => setPinOpen(true)} onPaymentComplete={completeExternalPromoPayment} /> : <button type="button" className="primary-btn full" disabled={busy} onClick={() => setWalletOptionsReady(true)}>NEXT</button> : paymentMethod === 'Razorpay' ? <button className="primary-btn full" disabled={busy} onClick={payRazorpay}>{busy ? 'Preparing secure payment...' : 'Continue Payment'}</button> : <button className="primary-btn full" disabled>Choose a payment method</button>}</section>
     </>}
-    {pinOpen && <div className="wallet-lock-overlay"><form className="wallet-pin-modal transfer-pin-modal" role="dialog" aria-modal="true" aria-labelledby="promo-pin-title" onSubmit={payWallet}><h2 id="promo-pin-title">Wallet Security</h2><p>Enter your 4-digit Wallet PIN to authorize this Promo Code purchase.</p><PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy} />{error && <p className="voice-error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => { setPinOpen(false); setPin(''); }}>Cancel</button><button className="primary-btn" disabled={busy || pin.length !== 4}>{busy ? 'Processing payment...' : 'Confirm Payment'}</button></div></form></div>}
+    {pinOpen && <div className="wallet-lock-overlay"><form className="wallet-pin-modal transfer-pin-modal" role="dialog" aria-modal="true" aria-labelledby="promo-pin-title" onSubmit={payWallet}><h2 id="promo-pin-title">Wallet Security</h2><p>Enter your 4-digit Wallet PIN to authorize this Promo Code purchase.</p><p>Amount payable: <strong>₹{promoPayableAmount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></p><PinBoxes value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy} /><WalletNumericKeypad value={pin} onChange={(value) => { setPin(value); setError(''); }} disabled={busy} />{error && <p className="voice-error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-btn" disabled={busy} onClick={() => { setPinOpen(false); setPin(''); }}>Cancel</button><button className="primary-btn" disabled={busy || pin.length !== 4}>{busy ? 'Processing payment...' : 'Confirm Payment'}</button></div></form></div>}
     {success && view === 'success' && <div className="wallet-lock-overlay"><section className="wallet-pin-modal promo-code-purchased-modal" role="dialog" aria-modal="true" aria-labelledby="promo-purchased-title"><h2 id="promo-purchased-title">Promo Code Purchased</h2><code>{success.promoCode.code}</code><button className="secondary-btn" onClick={copyPromoCode}>{copyState}</button><button className="primary-btn full" onClick={continueToOrder}>OK</button></section></div>}
   </div></main>;
 }
@@ -4958,10 +5199,10 @@ function GiftRecipientStep({ email, busy, error, onEmailChange, onContinue }) {
   </div></main>;
 }
 
-function PromoOfflineOrderSummary({ amount, buyer, buyerAddress, recipientAddress, recipientType, recipientEmail }) {
+function PromoOfflineOrderSummary({ amount, payableAmount = amount, subscriptionDiscount = 0, buyer, buyerAddress, recipientAddress, recipientType, recipientEmail }) {
   const addressText = (value) => [value?.fullName, value?.phoneNumber, value?.addressLine1, value?.addressLine2, value?.city, value?.state, value?.pinCode, value?.country, value?.deliveryInstructions].filter(Boolean).join(', ');
   return <section className="promo-payment-card promo-checkout-order-summary"><h2>Offline Order Summary</h2>
-    <dl className="order-information-list"><div><dt>Buyer</dt><dd>{buyer.name} · {buyer.email}</dd></div><div><dt>Promo Code Product</dt><dd>Digital Wallet Credit × 1</dd></div><div><dt>Wallet Credit Value</dt><dd>₹{Number(amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div><div><dt>Product Price</dt><dd>₹{Number(amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div><div><dt>Delivery Charges</dt><dd>Included</dd></div><div><dt>Final Amount</dt><dd>₹{Number(amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>{recipientType === 'gift' && <div><dt>Gift Recipient</dt><dd>{recipientEmail || 'Recipient at delivery address'}</dd></div>}<div><dt>Buyer Contact Address</dt><dd>{addressText(buyerAddress || recipientAddress)}</dd></div><div><dt>Delivery Address</dt><dd>{addressText(recipientAddress)}</dd></div></dl>
+    <dl className="order-information-list"><div><dt>Buyer</dt><dd>{buyer.name} · {buyer.email}</dd></div><div><dt>Promo Code Product</dt><dd>Digital Wallet Credit × 1</dd></div><div><dt>Wallet Credit Value</dt><dd>₹{Number(amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div><div><dt>Product Price</dt><dd>₹{Number(amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div><div><dt>Delivery Charges</dt><dd>Included</dd></div>{subscriptionDiscount > 0 && <div><dt>Subscription Discount</dt><dd>−₹{Number(subscriptionDiscount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>}<div><dt>Final Amount</dt><dd>₹{Number(payableAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</dd></div>{recipientType === 'gift' && <div><dt>Gift Recipient</dt><dd>{recipientEmail || 'Recipient at delivery address'}</dd></div>}<div><dt>Buyer Contact Address</dt><dd>{addressText(buyerAddress || recipientAddress)}</dd></div><div><dt>Delivery Address</dt><dd>{addressText(recipientAddress)}</dd></div></dl>
   </section>;
 }
 
@@ -5170,7 +5411,9 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       && requiredAmounts.every((key) => isNonNegativeAmount(estimate[key]))
       && Math.abs(Number(estimate.total) - Math.max(0, expectedTotal)) < 0.02
       && estimate.items.every((item, index) => (
-        String(item.id) === String(cart[index]?.id)
+        String(cart[index]?.discountOfferId
+          ? item.discountOfferId
+          : item.id) === String(cart[index]?.discountOfferId || cart[index]?.id)
         && Number(item.quantity) === Number(cart[index]?.quantity)
         && isNonNegativeAmount(item.lineTotal)
       ));
@@ -7199,6 +7442,12 @@ function WalletPaymentRequestsPage() {
         : request.status === 'Pending' ? 'PENDING'
           : request.status === 'Rejected' || request.status === 'Cancelled' || request.status === 'Expired' ? 'FAILED'
             : request.status?.toUpperCase() || 'PENDING');
+  const purchaseCategoryLabel = (category) => ({
+    credits: 'AI Credits purchase',
+    'ai-bills': 'AI Bill Credits purchase',
+    subscription: 'Subscription purchase',
+    'wallet-promo-code': 'Wallet Promo Code purchase',
+  }[category] || 'Checkout payment request');
 
   return <main className="page-shell wallet-request-page">
     <div className="container narrow-container wallet-request-shell">
@@ -7214,7 +7463,7 @@ function WalletPaymentRequestsPage() {
       {error && <div className="wallet-payment-error" role="alert">{error}</div>}
       {!requests.length && <section className="wallet-payment-card wallet-request-empty"><span aria-hidden="true">✓</span><h2>No pending requests</h2><p>New Innovation Labs payment requests will appear here.</p></section>}
       {requests.map((request) => <section className="wallet-payment-card wallet-request-card" key={request.requestId}>
-        <div className="wallet-request-card-brand"><span className="wallet-payment-avatar" aria-hidden="true">IL</span><div><strong>Innovation Labs</strong><small>Checkout payment request</small></div><span className={`wallet-request-status ${request.paymentStatus === 'PROCESSING' || request.status === 'Processing' ? 'is-processing' : ''}`}>{displayStatus(request)}</span></div>
+        <div className="wallet-request-card-brand"><span className="wallet-payment-avatar" aria-hidden="true">IL</span><div><strong>Innovation Labs</strong><small>{purchaseCategoryLabel(request.purchaseCategory)}</small></div><span className={`wallet-request-status ${request.paymentStatus === 'PROCESSING' || request.status === 'Processing' ? 'is-processing' : ''}`}>{displayStatus(request)}</span></div>
         <div className="wallet-request-amount">
           <span>Amount requested</span>
           <strong>₹{Number(request.amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
@@ -7222,7 +7471,7 @@ function WalletPaymentRequestsPage() {
         </div>
         <dl className="wallet-request-details">
           <div><dt>Requested by</dt><dd>{request.requesterName}</dd></div>
-          <div><dt>Checkout reference</dt><dd>{request.checkoutReference}</dd></div>
+          <div><dt>{request.purchaseCategory ? 'Purchase reference' : 'Checkout reference'}</dt><dd>{request.purchaseId || request.checkoutReference}</dd></div>
           <div><dt>Paying Wallet ID</dt><dd>{request.payerWalletId}</dd></div>
         </dl>
         <button type="button" className="wallet-payment-primary" disabled={request.status !== 'Pending'} onClick={() => navigate(`/wallet/payment-requests/${encodeURIComponent(request.requestId)}/pin`)}>Pay</button>
@@ -7319,6 +7568,12 @@ function WalletPaymentPinPage() {
   const successful = request?.status === 'Approved' || request?.paymentStatus === 'SUCCESS';
   const paymentStatus = request?.paymentStatus
     || (request?.status === 'Pending' ? 'PENDING' : request?.status === 'Processing' ? 'PROCESSING' : 'FAILED');
+  const purchaseCategoryLabel = ({
+    credits: 'AI Credits purchase',
+    'ai-bills': 'AI Bill Credits purchase',
+    subscription: 'Subscription purchase',
+    'wallet-promo-code': 'Wallet Promo Code purchase',
+  })[request?.purchaseCategory] || 'Checkout payment request';
 
   return <main className="page-shell wallet-request-page">
     <div className="container narrow-container wallet-request-shell">
@@ -7345,7 +7600,7 @@ function WalletPaymentPinPage() {
                 ? navigate(`/order-placed/${encodeURIComponent(order?.orderId || request.orderId)}`, order ? { state: { order } } : {})
                 : navigate('/wallet/payment-requests')}>{order?.orderId || request.orderId ? 'Continue to Order' : 'Done'}</button>
             </> : <>
-              <div className="wallet-request-card-brand"><span className="wallet-payment-avatar" aria-hidden="true">IL</span><div><strong>Innovation Labs</strong><small>Checkout payment request</small></div><span className={`wallet-request-status${paymentStatus === 'PROCESSING' ? ' is-processing' : ''}`}>{paymentStatus}</span></div>
+              <div className="wallet-request-card-brand"><span className="wallet-payment-avatar" aria-hidden="true">IL</span><div><strong>Innovation Labs</strong><small>{purchaseCategoryLabel}</small></div><span className={`wallet-request-status${paymentStatus === 'PROCESSING' ? ' is-processing' : ''}`}>{paymentStatus}</span></div>
               <h1 className="wallet-request-pin-heading">Enter Your Wallet PIN</h1>
               <div className="wallet-request-amount">
                 <span>Amount requested</span>
@@ -7354,7 +7609,7 @@ function WalletPaymentPinPage() {
               </div>
               <dl className="wallet-request-details">
                 <div><dt>Payment request</dt><dd>{request.requestId}</dd></div>
-                <div><dt>Checkout reference</dt><dd>{request.checkoutReference}</dd></div>
+                <div><dt>{request.purchaseCategory ? 'Purchase reference' : 'Checkout reference'}</dt><dd>{request.purchaseId || request.checkoutReference}</dd></div>
                 <div><dt>Paying Wallet ID</dt><dd>{request.payerWalletId}</dd></div>
                 <div><dt>Payment status</dt><dd>{paymentStatus}</dd></div>
               </dl>
@@ -7377,7 +7632,7 @@ function WalletPaymentPinPage() {
   </main>;
 }
 
-function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
+function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock, purchaseQrOnly = false }) {
   const navigate = useNavigate();
   const [wallet, setWallet] = useState(null);
   const [recipient, setRecipient] = useState(null);
@@ -7423,12 +7678,15 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
       if (seconds === 0) {
         expired = true;
         setCheckoutQrExpired(true);
-        requestApi('/api/checkout/payment-qr/expire', {
-          method: 'POST',
-          body: JSON.stringify({ checkoutReference: checkoutQrPayment.checkoutReference }),
-        }).catch(() => undefined).finally(() => {
-          setError('Payment session expired. Your checkout payment has been cancelled.');
-          window.setTimeout(() => navigate('/'), 2000);
+        const expireRequest = checkoutQrPayment.purchaseCategory
+          ? requestApi(`/api/wallet/purchase-payments/${encodeURIComponent(checkoutQrPayment.intentId)}`)
+          : requestApi('/api/checkout/payment-qr/expire', {
+            method: 'POST',
+            body: JSON.stringify({ checkoutReference: checkoutQrPayment.checkoutReference }),
+          });
+        expireRequest.catch(() => undefined).finally(() => {
+          setError('Payment session expired. Please start a new payment request.');
+          if (!checkoutQrPayment.purchaseCategory) window.setTimeout(() => navigate('/'), 2000);
         });
       }
     };
@@ -7438,6 +7696,12 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
   }, [checkoutQrPayment, navigate, stage]);
 
   useEffect(() => {
+    if (purchaseQrOnly) {
+      setQrTransferAvailable(true);
+      setQrAccessError('');
+      setQrAccessLoading(false);
+      return undefined;
+    }
     if (!auth) return undefined;
     let active = true;
     let requestInFlight = false;
@@ -7467,7 +7731,7 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
       active = false;
       window.clearInterval(intervalId);
     };
-  }, [auth?.id, qrAccessRefresh]);
+  }, [auth?.id, purchaseQrOnly, qrAccessRefresh]);
 
   useEffect(() => {
     if (!auth || !qrTransferAvailable) {
@@ -7535,6 +7799,23 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
         setStage('checkout-qr');
         return;
       }
+      if (qrPayload.trim().startsWith('ILPUR1.')) {
+        const result = await requestApi('/api/wallet/purchase-qr/resolve', {
+          method: 'POST',
+          body: JSON.stringify({ qrPayload }),
+        });
+        setCheckoutQrPayment({
+          ...result,
+          checkoutReference: `${result.purchaseCategory}:${result.purchaseId}`,
+          paymentStatus: 'Pending',
+        });
+        setCheckoutQrExpired(false);
+        setCheckoutQrRemainingSeconds(null);
+        setPin('');
+        setPinVisible(false);
+        setStage('checkout-qr');
+        return;
+      }
       const result = await requestApi('/api/wallet/transfers/qr/resolve', {
         method: 'POST',
         body: JSON.stringify({ qrPayload }),
@@ -7559,18 +7840,26 @@ function WalletQrTransferPage({ auth, accessVersion, onRequestUnlock }) {
     if (!transferKeyRef.current) transferKeyRef.current = globalThis.crypto?.randomUUID?.()
       || `checkout-qr-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     try {
-      const result = await requestApi('/api/checkout/payment-qr/pay', {
+      const isPurchaseQr = checkoutQrPayment.purchaseCategory != null;
+      const result = await requestApi(isPurchaseQr ? '/api/wallet/purchase-qr/pay' : '/api/checkout/payment-qr/pay', {
         method: 'POST',
         body: JSON.stringify({
           qrPayload: checkoutQrPayment.qrPayload,
           pin,
-          idempotencyKey: transferKeyRef.current,
+          ...(isPurchaseQr ? {} : { idempotencyKey: transferKeyRef.current }),
         }),
       });
       setCheckoutQrPayment(null);
       setPin('');
       setStage('success');
-      setTransfer({ transferId: result.order.orderId, amount: checkoutQrPayment.amount, status: 'Completed', recipientName: 'Innovation Labs', completedAt: new Date().toISOString(), order: result.order });
+      setTransfer({
+        transferId: result.order?.orderId || result.purchaseId || result.intentId,
+        amount: checkoutQrPayment.amount,
+        status: 'Completed',
+        recipientName: 'Innovation Labs',
+        completedAt: new Date().toISOString(),
+        order: result.order,
+      });
     } catch (requestError) {
       setPin('');
       setError(requestError.message || 'QR payment could not be completed.');

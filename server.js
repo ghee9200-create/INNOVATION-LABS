@@ -593,6 +593,8 @@ const WalletTransfer = mongoose.model('WalletTransfer', WalletTransferSchema);
 const WalletPaymentRequest = mongoose.model('WalletPaymentRequest', new mongoose.Schema({
   requestId: { type: String, required: true, unique: true, index: true },
   idempotencyKey: { type: String, required: true, unique: true },
+  purchaseCategory: { type: String, enum: ['credits', 'ai-bills', 'subscription', 'wallet-promo-code'] },
+  purchaseId: String,
   activeCheckoutKey: { type: String, select: false },
   checkoutReference: { type: String, required: true, index: true },
   requesterUserId: { type: String, required: true, index: true },
@@ -610,6 +612,34 @@ const WalletPaymentRequest = mongoose.model('WalletPaymentRequest', new mongoose
 }, { timestamps: true }));
 WalletPaymentRequest.schema.index({ payerUserId: 1, status: 1, createdAt: -1 });
 WalletPaymentRequest.schema.index({ activeCheckoutKey: 1 }, { unique: true, sparse: true });
+WalletPaymentRequest.schema.index({ purchaseCategory: 1, purchaseId: 1, status: 1 });
+const WalletPurchaseQrIntent = mongoose.model('WalletPurchaseQrIntent', new mongoose.Schema({
+  intentId: { type: String, required: true, unique: true, index: true },
+  activePurchaseKey: { type: String, select: false },
+  purchaseCategory: { type: String, enum: ['credits', 'ai-bills', 'subscription', 'wallet-promo-code'], required: true },
+  purchaseId: { type: String, required: true },
+  requesterUserId: { type: String, required: true, index: true },
+  payerUserId: { type: String, index: true },
+  amountPaise: { type: Number, required: true, min: 1 },
+  status: { type: String, enum: ['Pending', 'Processing', 'Paid', 'Cancelled', 'Expired'], default: 'Pending', index: true },
+  expiresAt: { type: Date, required: true, index: true },
+  paymentReference: String,
+  completedAt: Date,
+}, { timestamps: true }));
+WalletPurchaseQrIntent.schema.index({ purchaseCategory: 1, purchaseId: 1, status: 1 });
+WalletPurchaseQrIntent.schema.index({ activePurchaseKey: 1 }, { unique: true, sparse: true });
+const SubscriptionPurchaseIntent = mongoose.model('SubscriptionPurchaseIntent', new mongoose.Schema({
+  purchaseId: { type: String, required: true, unique: true, index: true },
+  userId: { type: String, required: true, index: true },
+  plan: { type: String, enum: ['Medium', 'Premium', 'Exclusive'], required: true },
+  durationMonths: { type: Number, required: true, min: 1, max: maxSubscriptionDurationMonths },
+  amountPaise: { type: Number, required: true, min: 1 },
+  idempotencyKey: { type: String, required: true, unique: true },
+  status: { type: String, enum: ['pending', 'completed', 'failed', 'cancelled'], default: 'pending', index: true },
+  paymentReference: String,
+  paymentMethod: { type: String, enum: ['Wallet', 'Razorpay'], default: 'Wallet' },
+  completedAt: Date,
+}, { timestamps: true }));
 const SubscriptionSchema = new mongoose.Schema({
   userId: { type: String, required: true },
   plan: { type: String, enum: Object.keys(planConfig), required: true },
@@ -5305,6 +5335,50 @@ app.patch('/api/subscription/auto-renew', requireSession, requireDatabase, async
   return res.json({ subscription: planPaymentResponse(updated).subscription });
 });
 
+app.post('/api/subscription/purchase-intents', requireSession, requireDatabase, requirePurchaseAge, async (req, res) => {
+  const plan = String(req.body?.plan || '');
+  const idempotencyKey = req.body?.idempotencyKey;
+  let durationMonths;
+  try { durationMonths = subscriptionDurationMonths(req.body?.durationMonths); }
+  catch (error) { return res.status(error.status || 400).json({ message: error.message }); }
+  if (!['Medium', 'Premium', 'Exclusive'].includes(plan)) return res.status(400).json({ message: 'Choose an available paid plan.' });
+  if (typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9:_-]{8,120}$/.test(idempotencyKey)) return res.status(400).json({ message: 'A valid purchase reference is required.' });
+  const amountPaise = planConfig[plan].pricePaise * durationMonths;
+  if (!Number.isSafeInteger(amountPaise) || amountPaise < 1) return res.status(400).json({ message: 'The selected subscription total is invalid.' });
+  if (await currentSubscription(req.session.sub)) return res.status(409).json({ message: 'Your current plan remains active until it expires.' });
+  let purchase = await SubscriptionPurchaseIntent.findOne({ idempotencyKey, userId: req.session.sub }).lean();
+  if (purchase && (purchase.plan !== plan || purchase.durationMonths !== durationMonths || purchase.amountPaise !== amountPaise)) {
+    return res.status(409).json({ message: 'This payment reference is already used for a different subscription.' });
+  }
+  if (!purchase) {
+    try {
+      purchase = await SubscriptionPurchaseIntent.create({
+        purchaseId: crypto.randomUUID(),
+        userId: req.session.sub,
+        plan,
+        durationMonths,
+        amountPaise,
+        idempotencyKey,
+      });
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+      purchase = await SubscriptionPurchaseIntent.findOne({ idempotencyKey, userId: req.session.sub }).lean();
+      if (!purchase || purchase.plan !== plan || purchase.durationMonths !== durationMonths) {
+        return res.status(409).json({ message: 'This subscription purchase reference is already in use.' });
+      }
+    }
+  }
+  return res.json({
+    purchase: {
+      purchaseId: purchase.purchaseId,
+      plan: purchase.plan,
+      durationMonths: purchase.durationMonths,
+      amount: money(purchase.amountPaise),
+      status: purchase.status,
+    },
+  });
+});
+
 app.post('/api/subscription/wallet', requireSession, requireDatabase, requirePurchaseAge, async (req, res) => {
   const plan = String(req.body?.plan || '');
   const pin = req.body?.pin;
@@ -5428,7 +5502,13 @@ app.post('/api/subscription/wallet', requireSession, requireDatabase, requirePur
         description: `${displayPlanName(plan)} subscription (${durationMonths} month${durationMonths === 1 ? '' : 's'})`,
         status: 'Successful',
       }], { session });
-      return activateSubscription(session, { userId: req.session.sub, plan, paymentMethod: 'Wallet', paymentReference, durationMonths });
+      const activated = await activateSubscription(session, { userId: req.session.sub, plan, paymentMethod: 'Wallet', paymentReference, durationMonths });
+      await SubscriptionPurchaseIntent.updateOne(
+        { userId: req.session.sub, idempotencyKey, status: 'pending' },
+        { $set: { status: 'completed', paymentReference, completedAt: new Date() } },
+        { session },
+      );
+      return activated;
     });
     const wallet = await Wallet.findOne({ userId: req.session.sub }).select('balancePaise restrictedBalancePaise').lean();
     return res.status(201).json({ ...planPaymentResponse(result), walletBalance: money(walletAvailableBalancePaise(wallet)) });
@@ -6972,6 +7052,525 @@ app.get('/api/checkout/wallet-id/status', requireSession, requireDatabase, async
   });
 });
 
+const walletPurchaseCategories = ['credits', 'ai-bills', 'subscription', 'wallet-promo-code'];
+const getWalletPurchaseForRequest = async (purchaseCategory, purchaseId, userId, session = null) => {
+  const query = (model) => model.findOne({ purchaseId, userId }).session(session);
+  if (purchaseCategory === 'credits') {
+    const purchase = await query(CreditPurchase);
+    if (!purchase || purchase.status !== 'pending') throw Object.assign(new Error('This AI credit purchase is no longer payable.'), { status: 409 });
+    return { purchase, amountPaise: purchase.totalAmountPaise, title: `${purchase.credits} AI credits` };
+  }
+  if (purchaseCategory === 'ai-bills') {
+    const purchase = await query(AIBillPurchase);
+    if (!purchase || purchase.status !== 'pending') throw Object.assign(new Error('This AI bill purchase is no longer payable.'), { status: 409 });
+    return { purchase, amountPaise: purchase.totalAmountPaise, title: `${purchase.quantity} AI bills` };
+  }
+  if (purchaseCategory === 'subscription') {
+    const purchase = await SubscriptionPurchaseIntent.findOne({ purchaseId, userId }).session(session);
+    if (!purchase || purchase.status !== 'pending') throw Object.assign(new Error('This subscription purchase is no longer payable.'), { status: 409 });
+    return { purchase, amountPaise: purchase.amountPaise, title: `${displayPlanName(purchase.plan)} subscription` };
+  }
+  if (purchaseCategory === 'wallet-promo-code') {
+    const purchase = await PromoCode.findOne({
+      reservationId: purchaseId,
+      'reservationOwner.userId': userId,
+      status: 'reserved',
+      reservationExpiresAt: { $gt: new Date() },
+    }).session(session);
+    if (!purchase) throw Object.assign(new Error('This Promo Code reservation is no longer payable.'), { status: 409 });
+    const discount = await subscriptionDiscountForAmount(userId, purchase.amountPaise, session);
+    const amountPaise = Math.max(0, purchase.amountPaise - discount.amountPaise);
+    if (amountPaise < 1) throw Object.assign(new Error('The Promo Code purchase amount is invalid.'), { status: 400 });
+    return { purchase, amountPaise, title: 'Wallet Promo Code' };
+  }
+  throw Object.assign(new Error('Choose a supported purchase category.'), { status: 400 });
+};
+
+const settleWalletPurchaseRequest = async (session, request, payerWallet, paymentReference) => {
+  const { purchaseCategory, purchaseId, requesterUserId, amountPaise } = request;
+  const resolved = await getWalletPurchaseForRequest(purchaseCategory, purchaseId, requesterUserId, session);
+  if (resolved.amountPaise !== amountPaise) throw Object.assign(new Error('The requested payment amount no longer matches the purchase.'), { status: 409 });
+  if (payerWallet.lockedUntil && payerWallet.lockedUntil > new Date()) throw Object.assign(new Error('Wallet security verification is temporarily locked. Please try again later.'), { status: 429 });
+  const limitState = await getWalletLimitStatus(payerWallet.userId, payerWallet.balancePaise, session);
+  const spendCheck = enforceAvailableWalletSpendLimit(payerWallet.balancePaise, amountPaise, limitState, 'Wallet balance');
+  if (!spendCheck.allowed || payerWallet.balancePaise < amountPaise) throw Object.assign(new Error(spendCheck.message || 'Insufficient wallet balance.'), { status: 402 });
+  await assertWalletSpendAvailable(payerWallet.userId, payerWallet, amountPaise, session);
+  const before = payerWallet.balancePaise;
+  const debited = await Wallet.findOneAndUpdate(
+    { _id: payerWallet._id, balancePaise: { $gte: amountPaise }, availableBalancePaise: { $gte: amountPaise } },
+    { $inc: { balancePaise: -amountPaise, availableBalancePaise: -amountPaise }, $set: { failedPinAttempts: 0, lockedUntil: null } },
+    { new: true, session },
+  );
+  if (!debited) throw Object.assign(new Error('Insufficient wallet balance.'), { status: 402 });
+  const sharedPaymentReference = paymentReference;
+  let purchaseResult;
+  if (purchaseCategory === 'credits') {
+    const purchase = resolved.purchase;
+    purchase.paymentMethod = 'Wallet';
+    purchase.walletTransactionId = sharedPaymentReference;
+    purchaseResult = await addPurchasedCredits(session, purchase, sharedPaymentReference);
+  } else if (purchaseCategory === 'ai-bills') {
+    const purchase = resolved.purchase;
+    purchase.paymentMethod = 'Wallet';
+    purchase.paymentReference = sharedPaymentReference;
+    purchase.walletTransactionId = sharedPaymentReference;
+    purchaseResult = await grantPurchasedBills(session, purchase);
+    await purchase.save({ session });
+  } else if (purchaseCategory === 'subscription') {
+    const purchase = resolved.purchase;
+    if (await currentSubscription(requesterUserId, session)) throw Object.assign(new Error('Your current plan remains active until it expires.'), { status: 409 });
+    purchase.paymentMethod = 'Wallet';
+    purchase.paymentReference = sharedPaymentReference;
+    const subscription = await activateSubscription(session, {
+      userId: requesterUserId,
+      plan: purchase.plan,
+      durationMonths: purchase.durationMonths,
+      paymentMethod: 'Wallet',
+      paymentReference: sharedPaymentReference,
+    });
+    purchase.status = 'completed';
+    purchase.completedAt = new Date();
+    await purchase.save({ session });
+    purchaseResult = { subscription };
+  } else {
+    const promo = resolved.purchase;
+    const requester = await User.findOne({ googleId: requesterUserId }).session(session).lean();
+    if (!requester) throw Object.assign(new Error('The Promo Code purchaser account could not be found.'), { status: 409 });
+    if (promo.purchaseType === 'offline') {
+      if (!validateAddress(promo.recipientAddress) || promo.recipientType === 'gift' && !validateAddress(promo.buyerAddress)) {
+        throw Object.assign(new Error('Complete the Promo Code delivery address before payment.'), { status: 409 });
+      }
+    }
+    const recipient = await resolvePromoRecipient(session, {
+      promo,
+      userId: requesterUserId,
+      userEmail: requester.email,
+      recipientEmail: promo.giftRecipientEmail,
+    });
+    promo.purchasePayableAmountPaise = amountPaise;
+    promo.purchaseSubscriptionDiscountAmountPaise = promo.amountPaise - amountPaise;
+    promo.paymentMethod = 'Wallet';
+    promo.purchaseIdempotencyKey = sharedPaymentReference;
+    const customerDetails = {
+      promo,
+      reservationId: promo.reservationId,
+      userId: requesterUserId,
+      userName: requester.name || requester.email?.split('@')[0] || 'Innovation Labs customer',
+      userEmail: requester.email,
+      paymentMethod: 'Wallet',
+      idempotencyKey: sharedPaymentReference,
+      walletBalanceAfterPaise: debited.balancePaise,
+    };
+    purchaseResult = promo.purchaseType === 'offline'
+      ? await createOfflinePromoCodeOrder(session, {
+        ...customerDetails,
+        address: promo.recipientAddress,
+        recipientAddress: promo.recipientAddress,
+        buyerAddress: promo.buyerAddress,
+        ...recipient,
+        recipientType: promo.recipientType,
+      })
+      : await completePromoCodeOrder(session, customerDetails);
+  }
+  await WalletTransaction.create([{
+    userId: payerWallet.userId,
+    type: 'Purchase',
+    amountPaise: -amountPaise,
+    balanceBeforePaise: before,
+    balanceAfterPaise: debited.balancePaise,
+    payerWalletId: payerWallet.walletId,
+    referenceId: sharedPaymentReference,
+    orderId: purchaseResult?.order?.orderId,
+    description: `Wallet payment for ${resolved.title}`,
+    status: 'Successful',
+  }], { session });
+  await Notification.create([{
+    userId: requesterUserId,
+    message: `${resolved.title} was paid successfully from Wallet ${payerWallet.walletId}.`,
+  }], { session });
+  return { purchaseCategory, purchaseId, requesterUserId, amountPaise, purchase: purchaseResult, wallet: debited.toObject() };
+};
+
+const encodeWalletPurchaseQrPayload = (intent) => {
+  const encoded = Buffer.from(JSON.stringify({
+    version: 1,
+    intentId: intent.intentId,
+    amountPaise: intent.amountPaise,
+    expiresAt: intent.expiresAt.toISOString(),
+  })).toString('base64url');
+  const signature = crypto.createHmac('sha256', sessionSecret).update(encoded).digest('base64url');
+  return `ILPUR1.${encoded}.${signature}`;
+};
+
+const verifyWalletPurchaseQrPayload = (payload) => {
+  const parts = String(payload || '').split('.');
+  if (parts.length !== 3 || parts[0] !== 'ILPUR1') return null;
+  const expected = crypto.createHmac('sha256', sessionSecret).update(parts[1]).digest('base64url');
+  const signature = Buffer.from(parts[2]);
+  const expectedSignature = Buffer.from(expected);
+  if (signature.length !== expectedSignature.length || !crypto.timingSafeEqual(signature, expectedSignature)) return null;
+  try {
+    const body = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (body.version !== 1 || typeof body.intentId !== 'string' || !Number.isSafeInteger(body.amountPaise)) return null;
+    return body;
+  } catch {
+    return null;
+  }
+};
+
+app.post('/api/wallet/purchase-requests', requireSession, requireDatabase, async (req, res) => {
+  const { purchaseCategory, purchaseId, walletId, idempotencyKey, details = {} } = req.body || {};
+  if (!walletPurchaseCategories.includes(purchaseCategory) || typeof purchaseId !== 'string' || !purchaseId.trim()
+    || typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9:_-]{8,120}$/.test(idempotencyKey)) {
+    return res.status(400).json({ message: 'A valid purchase, Wallet ID, and payment reference are required.' });
+  }
+  const normalizedWalletId = normalizeWalletId(walletId);
+  if (!validateWalletId(normalizedWalletId)) return res.status(400).json({ message: 'Enter a valid Innovation Labs Wallet ID.' });
+  let resolved;
+  try {
+    resolved = await getWalletPurchaseForRequest(purchaseCategory, purchaseId, req.session.sub);
+  } catch (error) {
+    return res.status(error.status || 400).json({ message: error.message });
+  }
+  if (purchaseCategory === 'wallet-promo-code') {
+    const promo = resolved.purchase;
+    if (promo.purchaseType === 'online' && promo.recipientType === 'gift' && !promo.giftRecipientId) {
+      return res.status(409).json({ message: 'Verify the gift recipient email before continuing to payment.' });
+    }
+    if (promo.purchaseType === 'offline') {
+      const deliveryAddress = details.recipientAddress || details.address;
+      if (!validateAddress(deliveryAddress)) return res.status(400).json({ message: 'Complete the recipient delivery address fields for Offline Purchase.' });
+      if (promo.recipientType === 'gift' && !validateAddress(details.buyerAddress)) return res.status(400).json({ message: 'Complete the buyer contact address fields for Offline Gift Purchase.' });
+      promo.recipientAddress = deliveryAddress;
+      promo.buyerAddress = promo.recipientType === 'gift' ? details.buyerAddress : undefined;
+    }
+    promo.paymentMethod = 'Wallet';
+    await promo.save();
+  }
+  const wallet = await Wallet.findOne({ walletId: normalizedWalletId }).select('walletId userId').lean();
+  if (!wallet) return res.status(404).json({ message: 'This Wallet ID does not exist.' });
+  if (wallet.userId === req.session.sub) return res.status(400).json({ message: 'Use Verify with PIN or QR Code for your own Wallet.' });
+  const existing = await WalletPaymentRequest.findOne({ idempotencyKey, requesterUserId: req.session.sub }).lean();
+  if (existing) {
+    if (existing.purchaseCategory !== purchaseCategory || existing.purchaseId !== purchaseId || existing.payerWalletId !== normalizedWalletId) {
+      return res.status(409).json({ message: 'This payment reference is already used for a different purchase or Wallet ID.' });
+    }
+    return res.json({
+      requestId: existing.requestId,
+      status: existing.status,
+      paymentStatus: existing.paymentStatus,
+      purchaseCategory: existing.purchaseCategory,
+      purchaseId: existing.purchaseId,
+      amount: money(existing.amountPaise),
+      expiresAt: existing.expiresAt,
+      serverTime: new Date().toISOString(),
+      duplicate: true,
+    });
+  }
+  const now = new Date();
+  const checkoutReference = `purchase:${purchaseCategory}:${purchaseId}`;
+  const active = await WalletPaymentRequest.findOne({
+    requesterUserId: req.session.sub,
+    purchaseCategory,
+    purchaseId,
+    status: { $in: ['Pending', 'Processing'] },
+    expiresAt: { $gt: now },
+  }).lean();
+  if (active) {
+    if (active.payerWalletId !== normalizedWalletId) {
+      return res.status(409).json({ message: 'A payment request for this purchase is already active with a different Wallet ID.' });
+    }
+    if (active.amountPaise !== resolved.amountPaise) {
+      return res.status(409).json({ message: 'The active payment request no longer matches the purchase amount.' });
+    }
+    return res.json({
+      requestId: active.requestId,
+      purchaseCategory,
+      purchaseId,
+      status: active.status,
+      paymentStatus: active.paymentStatus || 'PENDING',
+      amount: money(active.amountPaise),
+      expiresAt: active.expiresAt,
+      serverTime: now.toISOString(),
+      duplicate: true,
+    });
+  }
+  const requestId = crypto.randomUUID();
+  const expiresAt = new Date(now.getTime() + 4 * 60 * 1000);
+  try {
+    const request = await WalletPaymentRequest.create({
+      requestId,
+      idempotencyKey,
+      purchaseCategory,
+      purchaseId,
+      checkoutReference,
+      activeCheckoutKey: `${checkoutReference}:${req.session.sub}`,
+      requesterUserId: req.session.sub,
+      payerUserId: wallet.userId,
+      payerWalletId: wallet.walletId,
+      amountPaise: resolved.amountPaise,
+      expiresAt,
+      statusHistory: [{ status: 'Wallet ID Verified', at: now }, { status: 'Awaiting Payment', at: now }],
+    });
+    await Notification.create([{
+      userId: wallet.userId,
+      message: `A Wallet ID payment request for ${money(resolved.amountPaise)} is waiting for your approval.`,
+      type: 'wallet_payment_request',
+      data: { requestId, purchaseCategory, purchaseId },
+    }]);
+    broadcastWalletPaymentRequestUpdate(request, {
+      requestId,
+      checkoutReference,
+      purchaseCategory,
+      status: 'Pending',
+      expiresAt,
+      serverTime: now.toISOString(),
+    });
+    return res.status(201).json({
+      requestId,
+      purchaseCategory,
+      purchaseId,
+      status: 'Pending',
+      paymentStatus: 'PENDING',
+      amount: money(resolved.amountPaise),
+      expiresAt,
+      serverTime: now.toISOString(),
+    });
+  } catch (error) {
+    if (error.code === 11000) {
+      const activeRequest = await WalletPaymentRequest.findOne({
+        requesterUserId: req.session.sub,
+        purchaseCategory,
+        purchaseId,
+        status: { $in: ['Pending', 'Processing'] },
+        expiresAt: { $gt: new Date() },
+      }).lean();
+      if (activeRequest?.payerWalletId === normalizedWalletId && activeRequest.amountPaise === resolved.amountPaise) {
+        return res.json({
+          requestId: activeRequest.requestId,
+          purchaseCategory,
+          purchaseId,
+          status: activeRequest.status,
+          paymentStatus: activeRequest.paymentStatus || 'PENDING',
+          amount: money(activeRequest.amountPaise),
+          expiresAt: activeRequest.expiresAt,
+          serverTime: new Date().toISOString(),
+          duplicate: true,
+        });
+      }
+      return res.status(409).json({ message: 'An active payment request already exists for this purchase.' });
+    }
+    throw error;
+  }
+});
+
+app.post('/api/wallet/purchase-qr', requireSession, requireDatabase, async (req, res) => {
+  const { purchaseCategory, purchaseId } = req.body || {};
+  if (!walletPurchaseCategories.includes(purchaseCategory) || typeof purchaseId !== 'string' || !purchaseId.trim()) {
+    return res.status(400).json({ message: 'Choose a valid purchase for QR payment.' });
+  }
+  let resolved;
+  try {
+    resolved = await getWalletPurchaseForRequest(purchaseCategory, purchaseId, req.session.sub);
+  } catch (error) {
+    return res.status(error.status || 400).json({ message: error.message });
+  }
+  const now = new Date();
+  await WalletPurchaseQrIntent.updateMany(
+    { requesterUserId: req.session.sub, purchaseCategory, purchaseId, status: 'Pending', expiresAt: { $lte: now } },
+    { $set: { status: 'Expired' }, $unset: { activePurchaseKey: 1 } },
+  );
+  const existing = await WalletPurchaseQrIntent.findOne({
+    requesterUserId: req.session.sub, purchaseCategory, purchaseId, status: 'Pending', expiresAt: { $gt: now },
+  }).lean();
+  let intent = existing;
+  if (!intent) {
+    try {
+      intent = await WalletPurchaseQrIntent.create({
+        intentId: crypto.randomUUID(),
+        activePurchaseKey: `${req.session.sub}:${purchaseCategory}:${purchaseId}`,
+        purchaseCategory,
+        purchaseId,
+        requesterUserId: req.session.sub,
+        amountPaise: resolved.amountPaise,
+        expiresAt: new Date(now.getTime() + 4 * 60 * 1000),
+      });
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+      intent = await WalletPurchaseQrIntent.findOne({
+        requesterUserId: req.session.sub,
+        purchaseCategory,
+        purchaseId,
+        status: 'Pending',
+        expiresAt: { $gt: new Date() },
+      }).lean();
+      if (!intent) throw error;
+    }
+  }
+  if (intent.amountPaise !== resolved.amountPaise) return res.status(409).json({ message: 'The purchase amount changed. Start a new QR payment.' });
+  return res.json({
+    qrPayload: encodeWalletPurchaseQrPayload(intent),
+    intentId: intent.intentId,
+    purchaseCategory,
+    purchaseId,
+    amount: money(intent.amountPaise),
+    expiresAt: intent.expiresAt,
+    serverTime: now.toISOString(),
+  });
+});
+
+app.post('/api/wallet/purchase-qr/resolve', requireSession, requireDatabase, async (req, res) => {
+  const payload = verifyWalletPurchaseQrPayload(req.body?.qrPayload);
+  if (!payload) return res.status(400).json({ message: 'This purchase QR code is invalid or has been altered.' });
+  const intent = await WalletPurchaseQrIntent.findOne({
+    intentId: payload.intentId,
+    amountPaise: payload.amountPaise,
+    expiresAt: { $gt: new Date() },
+    status: 'Pending',
+  }).lean();
+  if (!intent || intent.requesterUserId === req.session.sub) return res.status(409).json({ message: 'This purchase QR payment is expired or unavailable.' });
+  let resolved;
+  try {
+    resolved = await getWalletPurchaseForRequest(intent.purchaseCategory, intent.purchaseId, intent.requesterUserId);
+  } catch (error) {
+    return res.status(error.status || 400).json({ message: error.message });
+  }
+  if (resolved.amountPaise !== intent.amountPaise) return res.status(409).json({ message: 'The requested amount no longer matches this purchase.' });
+  const requester = await User.findOne({ googleId: intent.requesterUserId }).select('name').lean();
+  return res.json({
+    intentId: intent.intentId,
+    qrPayload: req.body.qrPayload,
+    purchaseCategory: intent.purchaseCategory,
+    purchaseId: intent.purchaseId,
+    requesterName: safeRecipientName(requester?.name),
+    amount: money(intent.amountPaise),
+    expiresAt: intent.expiresAt,
+  });
+});
+
+app.post('/api/wallet/purchase-qr/pay', requireSession, requireDatabase, requirePurchaseAge, async (req, res) => {
+  const payload = verifyWalletPurchaseQrPayload(req.body?.qrPayload);
+  const pin = req.body?.pin;
+  if (!payload || !validatePin(pin)) return res.status(400).json({ message: 'A valid purchase QR and 4-digit Wallet PIN are required.' });
+  try {
+    const result = await withMongoTransaction(async (session) => {
+      const intent = await WalletPurchaseQrIntent.findOneAndUpdate(
+        { intentId: payload.intentId, amountPaise: payload.amountPaise, status: 'Pending', expiresAt: { $gt: new Date() }, requesterUserId: { $ne: req.session.sub } },
+        { $set: { status: 'Processing', payerUserId: req.session.sub } },
+        { new: true, session },
+      );
+      if (!intent) throw Object.assign(new Error('This purchase QR payment is expired or was already processed.'), { status: 409 });
+      const wallet = await Wallet.findOne({ userId: req.session.sub }).session(session);
+      if (!wallet?.pinHash || !verifyPin(pin, wallet.pinHash)) throw Object.assign(new Error('Incorrect Wallet PIN. Please try again.'), { status: 401 });
+      const paymentReference = `purchase-qr:${intent.intentId}`;
+      const result = await settleWalletPurchaseRequest(session, {
+        purchaseCategory: intent.purchaseCategory,
+        purchaseId: intent.purchaseId,
+        requesterUserId: intent.requesterUserId,
+        amountPaise: intent.amountPaise,
+      }, wallet, paymentReference);
+      intent.status = 'Paid';
+      intent.paymentReference = paymentReference;
+      intent.completedAt = new Date();
+      intent.activePurchaseKey = undefined;
+      await intent.save({ session });
+      return result;
+    });
+    broadcastSse('wallet_balance_updated', { userId: req.session.sub }, req.session.sub);
+    broadcastSse('wallet_purchase_payment_completed', { purchaseCategory: result.purchaseCategory, purchaseId: result.purchaseId, paymentStatus: 'SUCCESS' }, result.requesterUserId);
+    return res.json({ ...result, duplicate: false });
+  } catch (error) {
+    if (error.status === 401) {
+      const pinWallet = await Wallet.findOne({ userId: req.session.sub })
+        .select('_id pinHash failedPinAttempts lockedUntil').lean();
+      if (pinWallet?.pinHash) {
+        const failedAt = new Date();
+        if (pinWallet.lockedUntil && pinWallet.lockedUntil > failedAt) {
+          error.status = 429;
+          error.message = 'Wallet security verification is temporarily locked. Please try again later.';
+        } else {
+          const nextFailureCount = { $add: [{ $ifNull: ['$failedPinAttempts', 0] }, 1] };
+          const shouldLock = { $gte: [nextFailureCount, 5] };
+          const failedAttempt = await Wallet.findOneAndUpdate(
+            {
+              _id: pinWallet._id,
+              pinHash: pinWallet.pinHash,
+              $or: [{ lockedUntil: null }, { lockedUntil: { $exists: false } }, { lockedUntil: { $lte: failedAt } }],
+            },
+            [{
+              $set: {
+                failedPinAttempts: { $cond: [shouldLock, 0, nextFailureCount] },
+                lockedUntil: { $cond: [shouldLock, new Date(failedAt.getTime() + 5 * 60 * 1000), '$lockedUntil'] },
+              },
+            }],
+            { new: true },
+          ).select('lockedUntil').lean();
+          if (!failedAttempt || failedAttempt.lockedUntil > failedAt) {
+            error.status = 429;
+            error.message = 'Too many incorrect Wallet PIN attempts. Wallet payments are locked for 5 minutes.';
+          }
+        }
+      }
+    }
+    if (error.status) return res.status(error.status).json({ message: error.message });
+    if (error.code === 11000) return res.status(409).json({ message: 'This purchase QR payment has already been processed.' });
+    throw error;
+  }
+});
+
+app.get('/api/wallet/purchase-payments/:id', requireSession, requireDatabase, async (req, res) => {
+  const now = new Date();
+  let request = await WalletPaymentRequest.findOne({
+    requestId: req.params.id,
+    requesterUserId: req.session.sub,
+  }).select('requestId purchaseCategory purchaseId amountPaise status paymentStatus paymentReference expiresAt approvedAt').lean();
+  if (request) {
+    if (['Pending', 'Processing'].includes(request.status) && request.expiresAt <= now) {
+      request = await WalletPaymentRequest.findOneAndUpdate(
+        { requestId: request.requestId, requesterUserId: req.session.sub, status: { $in: ['Pending', 'Processing'] }, expiresAt: { $lte: now } },
+        { $set: { status: 'Expired', paymentStatus: 'FAILED' }, $unset: { activeCheckoutKey: 1 } },
+        { new: true },
+      ).select('requestId purchaseCategory purchaseId amountPaise status paymentStatus paymentReference expiresAt approvedAt').lean() || request;
+    }
+    return res.json({
+      paymentId: request.requestId,
+      purchaseCategory: request.purchaseCategory,
+      purchaseId: request.purchaseId,
+      amount: money(request.amountPaise),
+      status: request.paymentStatus || 'PENDING',
+      requestStatus: request.status,
+      transactionId: request.paymentReference || null,
+      expiresAt: request.expiresAt,
+      completedAt: request.approvedAt || null,
+      serverTime: now.toISOString(),
+    });
+  }
+  let intent = await WalletPurchaseQrIntent.findOne({
+    intentId: req.params.id,
+    requesterUserId: req.session.sub,
+  }).select('intentId purchaseCategory purchaseId amountPaise status paymentReference expiresAt completedAt').lean();
+  if (!intent) return res.status(404).json({ message: 'Wallet purchase payment was not found.' });
+  if (intent.status === 'Pending' && intent.expiresAt <= now) {
+    intent = await WalletPurchaseQrIntent.findOneAndUpdate(
+      { intentId: intent.intentId, requesterUserId: req.session.sub, status: 'Pending', expiresAt: { $lte: now } },
+      { $set: { status: 'Expired' }, $unset: { activePurchaseKey: 1 } },
+      { new: true },
+    ).select('intentId purchaseCategory purchaseId amountPaise status paymentReference expiresAt completedAt').lean() || intent;
+  }
+  return res.json({
+    paymentId: intent.intentId,
+    purchaseCategory: intent.purchaseCategory,
+    purchaseId: intent.purchaseId,
+    amount: money(intent.amountPaise),
+    status: intent.status === 'Paid' ? 'SUCCESS' : ['Expired', 'Cancelled'].includes(intent.status) ? 'FAILED' : intent.status.toUpperCase(),
+    requestStatus: intent.status,
+    transactionId: intent.paymentReference || null,
+    expiresAt: intent.expiresAt,
+    completedAt: intent.completedAt || null,
+    serverTime: now.toISOString(),
+  });
+});
+
 app.get('/api/wallet/payment-requests/pending', requireSession, requireDatabase, async (req, res) => {
   const now = new Date();
   const expiredRequests = await WalletPaymentRequest.find(
@@ -6997,13 +7596,15 @@ app.get('/api/wallet/payment-requests/pending', requireSession, requireDatabase,
     payerUserId: req.session.sub,
     status: { $nin: ['Pending', 'Processing'] },
   }).sort({ createdAt: -1 }).limit(10)
-    .select('requestId checkoutReference requesterUserId amountPaise status paymentStatus paymentReference createdAt approvedAt').lean();
+    .select('requestId checkoutReference purchaseCategory purchaseId requesterUserId amountPaise status paymentStatus paymentReference createdAt approvedAt').lean();
   const requesterIds = [...new Set([...requests, ...recentRequests].map((request) => request.requesterUserId))];
   const users = await User.find({ googleId: { $in: requesterIds } }).select('googleId name').lean();
   const names = new Map(users.map((user) => [user.googleId, safeRecipientName(user.name)]));
   return res.json({ requests: requests.map((request) => ({
     requestId: request.requestId,
     checkoutReference: request.checkoutReference,
+    purchaseCategory: request.purchaseCategory || null,
+    purchaseId: request.purchaseId || null,
     amount: money(request.amountPaise),
     requesterName: names.get(request.requesterUserId) || 'Innovation Labs customer',
     payerWalletId: request.payerWalletId,
@@ -7013,6 +7614,8 @@ app.get('/api/wallet/payment-requests/pending', requireSession, requireDatabase,
   })), recentRequests: recentRequests.map((request) => ({
     requestId: request.requestId,
     checkoutReference: request.checkoutReference,
+    purchaseCategory: request.purchaseCategory || null,
+    purchaseId: request.purchaseId || null,
     amount: money(request.amountPaise),
     requesterName: names.get(request.requesterUserId) || 'Innovation Labs customer',
     status: request.status,
@@ -7028,7 +7631,7 @@ app.get('/api/wallet/payment-requests/:requestId', requireSession, requireDataba
   let request = await WalletPaymentRequest.findOne({
     requestId: req.params.requestId,
     payerUserId: req.session.sub,
-  }).select('requestId checkoutReference requesterUserId payerUserId payerWalletId amountPaise status paymentStatus paymentReference orderId expiresAt approvedAt createdAt').lean();
+  }).select('requestId checkoutReference purchaseCategory purchaseId requesterUserId payerUserId payerWalletId amountPaise status paymentStatus paymentReference orderId expiresAt approvedAt createdAt').lean();
   if (!request) return res.status(404).json({ message: 'Payment request was not found.' });
   if (['Pending', 'Processing'].includes(request.status) && request.expiresAt <= now) {
     request = await WalletPaymentRequest.findOneAndUpdate(
@@ -7039,10 +7642,12 @@ app.get('/api/wallet/payment-requests/:requestId', requireSession, requireDataba
         $push: { statusHistory: { status: 'Payment Expired', at: now } },
       },
       { new: true },
-    ).select('requestId checkoutReference requesterUserId payerUserId payerWalletId amountPaise status paymentStatus paymentReference orderId expiresAt approvedAt createdAt').lean() || request;
+    ).select('requestId checkoutReference purchaseCategory purchaseId requesterUserId payerUserId payerWalletId amountPaise status paymentStatus paymentReference orderId expiresAt approvedAt createdAt').lean() || request;
     if (request.status === 'Expired') broadcastWalletPaymentRequestUpdate(request, {
       requestId: request.requestId,
       checkoutReference: request.checkoutReference,
+      purchaseCategory: request.purchaseCategory || null,
+      purchaseId: request.purchaseId || null,
       status: request.status,
       serverTime: now.toISOString(),
     });
@@ -7051,6 +7656,8 @@ app.get('/api/wallet/payment-requests/:requestId', requireSession, requireDataba
   return res.json({
     requestId: request.requestId,
     checkoutReference: request.checkoutReference,
+    purchaseCategory: request.purchaseCategory || null,
+    purchaseId: request.purchaseId || null,
     requesterName: safeRecipientName(sender?.name),
     payerWalletId: request.payerWalletId,
     amount: money(request.amountPaise),
@@ -7112,6 +7719,16 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
   const now = new Date();
   const priorRequest = await WalletPaymentRequest.findOne({ requestId: req.params.requestId, payerUserId: req.session.sub }).lean();
   if (!priorRequest) return res.status(404).json({ message: 'Payment request was not found.' });
+  if (priorRequest.status === 'Approved' && priorRequest.purchaseCategory) {
+    return res.json({
+      purchaseCategory: priorRequest.purchaseCategory,
+      purchaseId: priorRequest.purchaseId,
+      amount: money(priorRequest.amountPaise),
+      status: priorRequest.paymentStatus,
+      transactionId: priorRequest.paymentReference,
+      duplicate: true,
+    });
+  }
   if (priorRequest.status === 'Approved' && priorRequest.orderId) {
     const existing = await Order.findOne({ orderId: priorRequest.orderId }).lean();
     if (existing) return res.json({ order: existing, duplicate: true });
@@ -7164,6 +7781,30 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
       const spendCheck = enforceAvailableWalletSpendLimit(wallet.balancePaise, request.amountPaise, limitState, 'Wallet balance');
       if (!spendCheck.allowed || wallet.balancePaise < request.amountPaise) {
         throw Object.assign(new Error(spendCheck.message || 'Insufficient wallet balance for this payment.'), { status: 402 });
+      }
+      if (request.purchaseCategory) {
+        if (!walletPurchaseCategories.includes(request.purchaseCategory) || !request.purchaseId) {
+          throw Object.assign(new Error('This purchase payment request is incomplete.'), { status: 409 });
+        }
+        const paymentReference = `wallet-id-payment:${request.requestId}`;
+        const purchaseResult = await settleWalletPurchaseRequest(session, request, wallet, paymentReference);
+        request.status = 'Approved';
+        request.paymentStatus = 'SUCCESS';
+        request.paymentReference = paymentReference;
+        request.approvedAt = new Date();
+        request.activeCheckoutKey = undefined;
+        request.statusHistory.push(
+          { status: 'Payment Approved', at: new Date() },
+          { status: 'Payment Successful', at: new Date() },
+        );
+        await request.save({ session });
+        return {
+          ...purchaseResult,
+          requesterUserId: request.requesterUserId,
+          payerUserId: request.payerUserId,
+          requestId: request.requestId,
+          checkoutReference: request.checkoutReference,
+        };
       }
       const attempt = await CheckoutAttempt.findOne({ reference: request.checkoutReference, userId: request.requesterUserId, status: { $in: ['Open', 'Payment Initiated'] }, paymentStatus: 'Pending' }).session(session);
       if (!attempt || (attempt.expiresAt && attempt.expiresAt <= new Date())) throw Object.assign(new Error('The original checkout is no longer active.'), { status: 409 });
@@ -7233,6 +7874,34 @@ app.post('/api/wallet/payment-requests/:requestId/approve', requireSession, requ
         requestId: request.requestId,
       };
     });
+    if (result.purchaseCategory) {
+      broadcastWalletPaymentRequestUpdate({
+        requesterUserId: result.requesterUserId,
+        payerUserId: result.payerUserId,
+      }, {
+        requestId: result.requestId,
+        checkoutReference: result.checkoutReference,
+        purchaseCategory: result.purchaseCategory,
+        purchaseId: result.purchaseId,
+        status: 'Approved',
+        serverTime: new Date().toISOString(),
+      });
+      broadcastSse('wallet_balance_updated', { balance: money(result.wallet.balancePaise) }, req.session.sub);
+      broadcastSse('wallet_purchase_payment_completed', {
+        purchaseCategory: result.purchaseCategory,
+        purchaseId: result.purchaseId,
+        paymentStatus: 'SUCCESS',
+      }, result.requesterUserId);
+      return res.status(201).json({
+        purchaseCategory: result.purchaseCategory,
+        purchaseId: result.purchaseId,
+        amount: money(result.amountPaise),
+        status: 'SUCCESS',
+        transactionId: `wallet-id-payment:${result.requestId}`,
+        duplicate: false,
+        purchase: result.purchase,
+      });
+    }
     broadcastSse('cart_updated', { items: result.cartItems || [] }, result.requesterUserId || result.order.userId);
     broadcastSse('checkout_payment_completed', { checkoutReference: result.order.checkoutReference, orderId: result.order.orderId, amount: result.order.total }, result.requesterUserId || result.order.userId);
     broadcastWalletPaymentRequestUpdate({
@@ -8074,6 +8743,7 @@ app.post('/api/checkout/quote', requireSession, requireDatabase, async (req, res
     return res.json({
       items: safeItems.map((item) => ({
         id: item.id,
+        ...(item.discountOfferId ? { discountOfferId: item.discountOfferId } : {}),
         name: item.name,
         quantity: item.quantity,
         unitPrice: money(toPaise(item.price)),
@@ -9717,6 +10387,19 @@ app.get('/api/promo-codes/reservations/:reservationId', requireSession, requireD
   if (!['reserved', 'pending_approval', 'purchased', 'used'].includes(promo.status)) return res.status(409).json({ message: 'This Promo Code reservation is no longer available.' });
   const wallet = await Wallet.findOne({ userId: req.session.sub }).select('balancePaise restrictedBalancePaise').lean();
   const order = ['reserved'].includes(promo.status) ? null : await Order.findOne({ orderId: promo.orderId, userId: req.session.sub }).lean();
+  const paymentEstimate = promo.status === 'reserved' && !(promo.razorpayOrderId && promo.purchasePayableAmountPaise == null)
+    ? await subscriptionDiscountForAmount(req.session.sub, promo.amountPaise)
+    : {
+      amountPaise: Number(promo.purchaseSubscriptionDiscountAmountPaise || 0),
+      plan: promo.purchaseSubscriptionDiscountPlan || 'Starter',
+      percentage: Number(promo.purchaseSubscriptionDiscountPercent || 0),
+    };
+  const discountAmountPaise = promo.status === 'reserved' && !(promo.razorpayOrderId && promo.purchasePayableAmountPaise == null)
+    ? paymentEstimate.amountPaise
+    : Number(promo.purchaseSubscriptionDiscountAmountPaise || 0);
+  const payableAmountPaise = promo.status === 'reserved'
+    ? Math.max(0, promo.amountPaise - discountAmountPaise)
+    : Number(promo.purchasePayableAmountPaise ?? promo.amountPaise);
   return res.json({
     reservationId: promo.reservationId,
     status: promo.status,
@@ -9725,6 +10408,13 @@ app.get('/api/promo-codes/reservations/:reservationId', requireSession, requireD
     giftRecipientEmail: promo.giftRecipientEmail || null,
     paymentMethod: promo.paymentMethod || null,
     promoCode: { id: String(promo._id), name: 'Digital Wallet Credit', amount: money(promo.amountPaise), code: promo.recipientType === 'gift' ? null : ['purchased', 'used'].includes(promo.status) ? promo.code : null, available: promo.status === 'reserved' || promo.status === 'purchased' },
+    paymentEstimate: {
+      baseAmount: money(promo.amountPaise),
+      subscriptionDiscount: money(discountAmountPaise),
+      subscriptionDiscountPlan: promo.status === 'reserved' ? paymentEstimate.plan : promo.purchaseSubscriptionDiscountPlan || 'Starter',
+      subscriptionDiscountPercent: promo.status === 'reserved' ? paymentEstimate.percentage : Number(promo.purchaseSubscriptionDiscountPercent || 0),
+      payableAmount: money(payableAmountPaise),
+    },
     expiresAt: promo.reservationExpiresAt,
     walletBalance: wallet && hasWalletUnlock(req) ? money(walletAvailableBalancePaise(wallet)) : null,
     orderId: promo.status === 'reserved' ? null : promo.orderId,
@@ -9874,26 +10564,47 @@ app.post('/api/promo-codes/reservations/:reservationId/razorpay/order', requireS
     }
   }
   if (!razorpayKeyId || !razorpayKeySecret) return res.status(503).json({ message: 'Razorpay is not configured for Promo Code purchases.' });
-  if (promo.razorpayOrderId) return res.json({ orderId: promo.razorpayOrderId, keyId: razorpayKeyId, amountPaise: promo.amountPaise, promoCode: 'Digital Wallet Credit' });
+  if (promo.razorpayOrderId) return res.json({
+    orderId: promo.razorpayOrderId,
+    keyId: razorpayKeyId,
+    amountPaise: Number(promo.purchasePayableAmountPaise ?? promo.amountPaise),
+    promoCode: 'Digital Wallet Credit',
+  });
+  const subscriptionDiscount = await subscriptionDiscountForAmount(req.session.sub, promo.amountPaise);
+  const payableAmountPaise = Math.max(0, promo.amountPaise - subscriptionDiscount.amountPaise);
+  if (!Number.isSafeInteger(payableAmountPaise) || payableAmountPaise < 1) {
+    return res.status(400).json({ message: 'The Promo Code payable amount is invalid.' });
+  }
+  promo.purchasePayableAmountPaise = payableAmountPaise;
+  promo.purchaseSubscriptionDiscountAmountPaise = subscriptionDiscount.amountPaise;
+  promo.purchaseSubscriptionDiscountPlan = subscriptionDiscount.plan;
+  promo.purchaseSubscriptionDiscountPercent = subscriptionDiscount.percentage;
+  await promo.save();
   try {
     const response = await fetch('https://api.razorpay.com/v1/orders', {
       method: 'POST',
       headers: { Authorization: `Basic ${Buffer.from(`${razorpayKeyId}:${razorpayKeySecret}`).toString('base64')}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ amount: promo.amountPaise, currency: 'INR', receipt: `promo-${promo.reservationId}`, expire_by: Math.floor(promo.reservationExpiresAt.getTime() / 1000) }),
+      body: JSON.stringify({ amount: payableAmountPaise, currency: 'INR', receipt: `promo-${promo.reservationId}`, expire_by: Math.floor(promo.reservationExpiresAt.getTime() / 1000) }),
     });
     const razorpayOrder = await response.json();
     if (!response.ok) return res.status(502).json({ message: 'Razorpay could not create the Promo Code payment.' });
     const updated = await PromoCode.findOneAndUpdate(
       { _id: promo._id, status: 'reserved', reservationId: promo.reservationId, 'reservationOwner.userId': req.session.sub, paymentMethod: 'Razorpay', razorpayOrderId: { $in: [null, ''] } },
-      { $set: { razorpayOrderId: razorpayOrder.id } },
+      { $set: {
+        razorpayOrderId: razorpayOrder.id,
+        purchasePayableAmountPaise: payableAmountPaise,
+        purchaseSubscriptionDiscountAmountPaise: subscriptionDiscount.amountPaise,
+        purchaseSubscriptionDiscountPlan: subscriptionDiscount.plan,
+        purchaseSubscriptionDiscountPercent: subscriptionDiscount.percentage,
+      } },
       { new: true },
     ).lean();
     if (!updated) {
       const winner = await PromoCode.findById(promo._id).lean();
       if (!winner?.razorpayOrderId) return res.status(409).json({ message: 'This Promo Code reservation is no longer available.' });
-      return res.json({ orderId: winner.razorpayOrderId, keyId: razorpayKeyId, amountPaise: winner.amountPaise, promoCode: 'Digital Wallet Credit' });
+      return res.json({ orderId: winner.razorpayOrderId, keyId: razorpayKeyId, amountPaise: Number(winner.purchasePayableAmountPaise ?? winner.amountPaise), promoCode: 'Digital Wallet Credit' });
     }
-    return res.json({ orderId: updated.razorpayOrderId, keyId: razorpayKeyId, amountPaise: updated.amountPaise, promoCode: 'Digital Wallet Credit' });
+    return res.json({ orderId: updated.razorpayOrderId, keyId: razorpayKeyId, amountPaise: Number(updated.purchasePayableAmountPaise ?? updated.amountPaise), promoCode: 'Digital Wallet Credit' });
   } catch {
     return res.status(503).json({ message: 'Promo Code online payment is temporarily unavailable.' });
   }
@@ -9926,7 +10637,7 @@ app.post('/api/promo-codes/reservations/:reservationId/razorpay/verify', require
   try {
     const response = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}`, { headers: { Authorization: `Basic ${Buffer.from(`${razorpayKeyId}:${razorpayKeySecret}`).toString('base64')}` } });
     const payment = await response.json();
-    if (!response.ok || payment.amount !== promo.amountPaise || payment.order_id !== orderId || payment.currency !== 'INR' || payment.status !== 'captured') {
+    if (!response.ok || payment.amount !== Number(promo.purchasePayableAmountPaise ?? promo.amountPaise) || payment.order_id !== orderId || payment.currency !== 'INR' || payment.status !== 'captured') {
       return res.status(409).json({ message: 'Payment amount or status could not be verified.' });
     }
   } catch {
@@ -12424,9 +13135,9 @@ app.post('/api/checkout-attempts', requireSession, requireDatabase, async (req, 
         stage: 'Checkout Opened',
       });
     }
-    const requestedItemsById = new Map(items.map((item) => [String(item?.id || ''), item]));
+    const requestedItemsById = new Map(items.map((item) => [String(item?.discountOfferId || item?.id || ''), item]));
     const priceChanges = safeItems.flatMap((item) => {
-      const requested = requestedItemsById.get(String(item.id));
+      const requested = requestedItemsById.get(String(item.discountOfferId || item.id));
       const oldPrice = Number(requested?.price);
       return Number.isFinite(oldPrice) && oldPrice !== Number(item.price)
         ? [{ id: item.id, name: item.name, previousPrice: oldPrice, currentPrice: Number(item.price) }]
