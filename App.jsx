@@ -5747,7 +5747,20 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
       setWalletIdVerificationError('Enter a valid Innovation Labs Wallet ID.');
       return;
     }
-    if (!checkoutReference) {
+    let activeCheckoutReference = checkoutReference;
+    if (!activeCheckoutReference) {
+      const recovered = await requestApi('/api/checkout-attempts', {
+        method: 'POST',
+        body: JSON.stringify({
+          items: cart,
+          service: selectedService,
+          discountCode: appliedDiscount?.code || '',
+          idempotencyKey: globalThis.crypto?.randomUUID?.() || `wallet-id-recovery-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        }),
+      });
+      activeCheckoutReference = recovered?.attempt?.reference || '';
+    }
+    if (!activeCheckoutReference) {
       setWalletIdVerificationError('Checkout is not ready. Please retry.');
       return;
     }
@@ -5757,12 +5770,13 @@ function CheckoutPage({ auth, cart, cartPriceNotice, onDismissPriceNotice, selec
     try {
       const verified = await requestApi('/api/checkout/wallet-id/verify', {
         method: 'POST',
-        body: JSON.stringify({ walletId, checkoutReference }),
+        body: JSON.stringify({ walletId, checkoutReference: activeCheckoutReference }),
       });
-      if (!verified.walletId || verified.checkoutReference !== checkoutReference) {
+      const resolvedCheckoutReference = verified.checkoutReference || activeCheckoutReference;
+      if (!verified.walletId || !resolvedCheckoutReference) {
         throw new Error('Wallet ID verification could not be completed. Please try again.');
       }
-      const paymentRequest = await onWalletIdRequest(verified.walletId, verified.checkoutReference);
+      const paymentRequest = await onWalletIdRequest(verified.walletId, resolvedCheckoutReference);
       if (!paymentRequest.requestId) {
         throw new Error('The payment request could not be created. Please retry.');
       }

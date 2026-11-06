@@ -6843,26 +6843,27 @@ app.post('/api/checkout/wallet-id/verify', requireSession, requireDatabase, asyn
   const checkoutReference = typeof req.body?.checkoutReference === 'string' ? req.body.checkoutReference.trim() : '';
   if (!walletId || !checkoutReference) return res.status(400).json({ message: 'A Wallet ID and checkout reference are required.' });
   if (!validateWalletId(walletId)) return res.status(400).json({ message: 'Enter a valid Innovation Labs Wallet ID.' });
-  const [wallet, attempt, requester] = await Promise.all([
+  const requester = await User.findOne({ googleId: req.session.sub }).select('email').lean();
+  const sessionEmail = typeof req.session.email === 'string' ? req.session.email.trim().toLowerCase() : '';
+  if (!requester?.email || requester.email.trim().toLowerCase() !== sessionEmail) {
+    return res.status(403).json({ message: 'Your registered email could not be verified. Please sign in again.' });
+  }
+  const [wallet, attempt] = await Promise.all([
     Wallet.findOne({ walletId }).select('walletId userId').lean(),
-    CheckoutAttempt.findOne({ reference: checkoutReference, userId: req.session.sub, status: { $in: ['Open', 'Payment Initiated'] } }).select('reference totalPaise expiresAt').lean(),
-    User.findOne({ googleId: req.session.sub }).select('email').lean(),
+    resolveActiveCheckoutAttempt(req.session.sub, checkoutReference),
   ]);
   if (!attempt) return res.status(409).json({ message: 'This checkout is no longer active.' });
   if (attempt.expiresAt && attempt.expiresAt <= new Date()) return res.status(409).json({ message: 'This checkout payment session has expired.' });
   if (!wallet?.walletId) return res.status(404).json({ message: 'This Wallet ID does not exist. Please check and try again.' });
   if (wallet.userId === req.session.sub) return res.status(400).json({ message: 'You cannot use your own Wallet ID to pay for this checkout.' });
   const owner = await User.findOne({ googleId: wallet.userId }).select('name email').lean();
-  const sessionEmail = typeof req.session.email === 'string' ? req.session.email.trim().toLowerCase() : '';
-  if (!requester?.email || requester.email.trim().toLowerCase() !== sessionEmail) {
-    return res.status(403).json({ message: 'Your registered email could not be verified. Please sign in again.' });
-  }
   if (!owner?.email) return res.status(404).json({ message: 'This Wallet ID is not linked to a verified Innovation Labs account.' });
   return res.json({
     walletId: wallet.walletId,
     ownerName: safeRecipientName(owner?.name),
     checkoutReference: attempt.reference,
     amount: money(attempt.totalPaise),
+    recovered: attempt.reference !== checkoutReference,
   });
 });
 
@@ -6872,20 +6873,22 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
   const idempotencyKey = typeof req.body?.idempotencyKey === 'string' && /^[A-Za-z0-9:_-]{8,120}$/.test(req.body.idempotencyKey)
     ? req.body.idempotencyKey : '';
   if (!walletId || !checkoutReference || !idempotencyKey) return res.status(400).json({ message: 'A Wallet ID, checkout reference, and payment reference are required.' });
+  const activeAttempt = await resolveActiveCheckoutAttempt(req.session.sub, checkoutReference);
+  const resolvedCheckoutReference = activeAttempt?.reference || checkoutReference;
   const existing = await WalletPaymentRequest.findOne({ idempotencyKey, requesterUserId: req.session.sub }).lean();
   if (existing) return res.json({
     requestId: existing.requestId,
     status: existing.status,
     paymentStatus: existing.paymentStatus || 'PENDING',
     amount: money(existing.amountPaise),
-    checkoutReference: existing.checkoutReference,
+    checkoutReference: existing.checkoutReference || resolvedCheckoutReference,
     expiresAt: existing.expiresAt,
     serverTime: new Date().toISOString(),
     duplicate: true,
   });
   const now = new Date();
   const expiredRequests = await WalletPaymentRequest.find({
-    checkoutReference,
+    checkoutReference: resolvedCheckoutReference,
     requesterUserId: req.session.sub,
     status: { $in: ['Pending', 'Processing'] },
     expiresAt: { $lte: now },
@@ -6907,7 +6910,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
     }));
   }
   const activeRequest = await WalletPaymentRequest.findOne({
-    checkoutReference,
+    checkoutReference: resolvedCheckoutReference,
     requesterUserId: req.session.sub,
     status: { $in: ['Pending', 'Processing'] },
     expiresAt: { $gt: now },
@@ -6920,7 +6923,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
     status: activeRequest.status,
     paymentStatus: activeRequest.paymentStatus || 'PENDING',
     amount: money(activeRequest.amountPaise),
-    checkoutReference: activeRequest.checkoutReference,
+    checkoutReference: activeRequest.checkoutReference || resolvedCheckoutReference,
     payerWalletId: activeRequest.payerWalletId,
     expiresAt: activeRequest.expiresAt,
     serverTime: now.toISOString(),
@@ -6928,8 +6931,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
   });
   const [wallet, attempt] = await Promise.all([
     Wallet.findOne({ walletId }).select('walletId userId').lean(),
-    CheckoutAttempt.findOne({ reference: checkoutReference, userId: req.session.sub, status: { $in: ['Open', 'Payment Initiated'] } })
-      .select('reference totalPaise expiresAt paymentStatus').lean(),
+    resolveActiveCheckoutAttempt(req.session.sub, checkoutReference),
   ]);
   if (!attempt || attempt.paymentStatus === 'Paid') return res.status(409).json({ message: 'This checkout is no longer active.' });
   if (attempt.expiresAt && attempt.expiresAt <= now) return res.status(409).json({ message: 'This checkout payment session has expired.' });
@@ -6941,7 +6943,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
   try {
     request = await withMongoTransaction(async (session) => {
       const currentAttempt = await CheckoutAttempt.findOne({
-        reference: checkoutReference,
+        reference: resolvedCheckoutReference,
         userId: req.session.sub,
         status: { $in: ['Open', 'Payment Initiated'] },
         paymentStatus: { $ne: 'Paid' },
@@ -6952,8 +6954,8 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
       const created = await WalletPaymentRequest.create([{
         requestId,
         idempotencyKey,
-        activeCheckoutKey: `${checkoutReference}:${req.session.sub}`,
-        checkoutReference,
+        activeCheckoutKey: `${resolvedCheckoutReference}:${req.session.sub}`,
+        checkoutReference: resolvedCheckoutReference,
         requesterUserId: req.session.sub,
         payerUserId: wallet.userId,
         payerWalletId: wallet.walletId,
@@ -6974,14 +6976,14 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
         userId: wallet.userId,
         message: `A Wallet ID payment request for ${money(currentAttempt.totalPaise)} is waiting for your approval.`,
         type: 'wallet_payment_request',
-        data: { requestId, checkoutReference },
+        data: { requestId, checkoutReference: resolvedCheckoutReference },
       }], { session });
       return created[0].toObject();
     });
   } catch (error) {
     if (error.code !== 11000) throw error;
     const active = await WalletPaymentRequest.findOne({
-      checkoutReference,
+      checkoutReference: resolvedCheckoutReference,
       requesterUserId: req.session.sub,
       status: { $in: ['Pending', 'Processing'] },
       expiresAt: { $gt: new Date() },
@@ -6993,10 +6995,10 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
       request = duplicate;
     }
   }
-  broadcastSse('wallet_payment_request', { requestId: request.requestId, amount: money(request.amountPaise), checkoutReference }, wallet.userId);
+  broadcastSse('wallet_payment_request', { requestId: request.requestId, amount: money(request.amountPaise), checkoutReference: resolvedCheckoutReference }, wallet.userId);
   broadcastWalletPaymentRequestUpdate(request, {
     requestId: request.requestId,
-    checkoutReference,
+    checkoutReference: resolvedCheckoutReference,
     status: request.status,
     amount: money(request.amountPaise),
     expiresAt: request.expiresAt,
@@ -7007,7 +7009,7 @@ app.post('/api/checkout/wallet-id/request', requireSession, requireDatabase, asy
     status: request.status,
     paymentStatus: request.paymentStatus || 'PENDING',
     amount: money(request.amountPaise),
-    checkoutReference,
+    checkoutReference: resolvedCheckoutReference,
     payerWalletId: request.payerWalletId,
     expiresAt: request.expiresAt,
     serverTime: new Date().toISOString(),
@@ -7203,15 +7205,18 @@ const encodeWalletPurchaseQrPayload = (intent) => {
 };
 
 const verifyWalletPurchaseQrPayload = (payload) => {
-  const parts = String(payload || '').split('.');
-  if (parts.length !== 3 || parts[0] !== 'ILPUR1') return null;
-  const expected = crypto.createHmac('sha256', sessionSecret).update(parts[1]).digest('base64url');
-  const signature = Buffer.from(parts[2]);
-  const expectedSignature = Buffer.from(expected);
-  if (signature.length !== expectedSignature.length || !crypto.timingSafeEqual(signature, expectedSignature)) return null;
+  if (!sessionSecret) return null;
+  const raw = String(payload || '').trim();
+  if (!raw) return null;
+  const parts = raw.split('.');
+  if (parts.length !== 3 || parts[0] !== 'ILPUR1' || !parts[1] || !parts[2]) return null;
   try {
+    const expected = crypto.createHmac('sha256', sessionSecret).update(parts[1]).digest('base64url');
+    const signature = Buffer.from(parts[2], 'utf8');
+    const expectedSignature = Buffer.from(expected, 'utf8');
+    if (signature.length !== expectedSignature.length || !crypto.timingSafeEqual(signature, expectedSignature)) return null;
     const body = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-    if (body.version !== 1 || typeof body.intentId !== 'string' || !Number.isSafeInteger(body.amountPaise)) return null;
+    if (body.version !== 1 || typeof body.intentId !== 'string' || !Number.isSafeInteger(body.amountPaise) || !body.expiresAt) return null;
     return body;
   } catch {
     return null;
@@ -8014,11 +8019,16 @@ const encodeCheckoutQrPayload = ({ reference, totalPaise }) => {
 };
 
 const verifyCheckoutQrPayload = (payload) => {
-  const parts = String(payload || '').split('.');
-  if (parts.length !== 3 || parts[0] !== 'ILPAY1') return null;
-  const expected = crypto.createHmac('sha256', sessionSecret).update(parts[1]).digest('base64url');
-  if (parts[2].length !== expected.length || !crypto.timingSafeEqual(Buffer.from(parts[2]), Buffer.from(expected))) return null;
+  if (!sessionSecret) return null;
+  const raw = String(payload || '').trim();
+  if (!raw) return null;
+  const parts = raw.split('.');
+  if (parts.length !== 3 || parts[0] !== 'ILPAY1' || !parts[1] || !parts[2]) return null;
   try {
+    const expected = crypto.createHmac('sha256', sessionSecret).update(parts[1]).digest('base64url');
+    const signature = Buffer.from(parts[2], 'utf8');
+    const expectedSignature = Buffer.from(expected, 'utf8');
+    if (signature.length !== expectedSignature.length || !crypto.timingSafeEqual(signature, expectedSignature)) return null;
     const body = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
     if (body.version !== 1 || body.company !== 'Innovation Labs' || body.currency !== 'INR'
       || typeof body.reference !== 'string' || !Number.isSafeInteger(body.amountPaise) || body.amountPaise < 0) return null;
@@ -12772,6 +12782,22 @@ const checkoutAttemptMatches = (attempt, { items, service, totalPaise }) => (
   && attempt.totalPaise === totalPaise
   && JSON.stringify(attempt.items) === JSON.stringify(checkoutItemsSnapshot(items))
 );
+const resolveActiveCheckoutAttempt = async (userId, checkoutReference = '') => {
+  const activeAttempts = await CheckoutAttempt.find({
+    userId,
+    status: { $in: ['Open', 'Payment Initiated'] },
+    paymentStatus: { $ne: 'Paid' },
+  }).sort({ updatedAt: -1 }).lean();
+  const now = new Date();
+  const validAttempts = activeAttempts.filter((attempt) => !attempt.expiresAt || attempt.expiresAt > now);
+  if (checkoutReference) {
+    const exactMatch = validAttempts.find((attempt) => attempt.reference === checkoutReference);
+    if (exactMatch) return exactMatch;
+    const newestMatch = validAttempts[0] || null;
+    return newestMatch;
+  }
+  return validAttempts[0] || null;
+};
 const checkoutAttemptProductChanged = (attempt, items) => {
   const previous = new Map((attempt.items || []).map((item) => [item.id, item]));
   return checkoutItemsSnapshot(items).some((item) => {
